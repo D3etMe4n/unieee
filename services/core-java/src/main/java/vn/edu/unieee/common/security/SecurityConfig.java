@@ -13,6 +13,7 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.AuthenticationEntryPoint;
 import org.springframework.security.web.SecurityFilterChain;
 
 @Configuration
@@ -28,6 +29,15 @@ public class SecurityConfig {
 
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        AuthenticationEntryPoint unauthorizedEntryPoint = (request, response, authException) ->
+            writeProblemDetail(
+                response,
+                HttpStatus.UNAUTHORIZED,
+                "UNAUTHORIZED",
+                "Authentication is required to access this resource",
+                request.getRequestURI()
+            );
+
         return http
             .csrf(AbstractHttpConfigurer::disable)
             .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
@@ -38,26 +48,10 @@ public class SecurityConfig {
             )
             .oauth2ResourceServer(oauth2 -> oauth2
                 .jwt(jwt -> jwt.jwtAuthenticationConverter(jwtAuthenticationConverter))
-                .authenticationEntryPoint((request, response, authException) ->
-                    writeProblemDetail(
-                        response,
-                        HttpStatus.UNAUTHORIZED,
-                        "UNAUTHORIZED",
-                        "Authentication is required to access this resource",
-                        request.getRequestURI()
-                    )
-                )
+                .authenticationEntryPoint(unauthorizedEntryPoint)
             )
             .exceptionHandling(ex -> ex
-                .authenticationEntryPoint((request, response, authException) ->
-                    writeProblemDetail(
-                        response,
-                        HttpStatus.UNAUTHORIZED,
-                        "UNAUTHORIZED",
-                        "Authentication is required to access this resource",
-                        request.getRequestURI()
-                    )
-                )
+                .authenticationEntryPoint(unauthorizedEntryPoint)
                 .accessDeniedHandler((request, response, accessDeniedException) ->
                     writeProblemDetail(
                         response,

@@ -6,13 +6,16 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import jakarta.validation.ConstraintViolationException;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
@@ -73,6 +76,28 @@ class GlobalExceptionHandlerTest {
             .andExpect(jsonPath("$.errors.code").exists());
     }
 
+    @Test
+    void returns400ProblemDetailForConstraintViolation() throws Exception {
+        mockMvc.perform(get("/api/v1/test-errors/constraint").with(jwt()))
+            .andExpect(status().isBadRequest())
+            .andExpect(jsonPath("$.errorCode").value("CONSTRAINT_VIOLATION"));
+    }
+
+    @Test
+    void returns403ProblemDetailForAccessDeniedException() throws Exception {
+        mockMvc.perform(get("/api/v1/test-errors/access-denied").with(jwt()))
+            .andExpect(status().isForbidden())
+            .andExpect(jsonPath("$.errorCode").value("FORBIDDEN"));
+    }
+
+    @Test
+    void returns500ProblemDetailWithoutLeakingInternalMessage() throws Exception {
+        mockMvc.perform(get("/api/v1/test-errors/unexpected").with(jwt()))
+            .andExpect(status().isInternalServerError())
+            .andExpect(jsonPath("$.errorCode").value("INTERNAL_ERROR"))
+            .andExpect(jsonPath("$.detail").value("An unexpected internal error occurred"));
+    }
+
     @RestController
     @RequestMapping("/api/v1/test-errors")
     static class DummyTestController {
@@ -90,6 +115,21 @@ class GlobalExceptionHandlerTest {
         @PostMapping("/validate")
         String validate(@Valid @RequestBody SampleValidationRequest request) {
             return request.code();
+        }
+
+        @GetMapping("/constraint")
+        String constraint() {
+            throw new ConstraintViolationException("Invalid parameter", Set.of());
+        }
+
+        @GetMapping("/access-denied")
+        String accessDenied() {
+            throw new AccessDeniedException("Denied inside service");
+        }
+
+        @GetMapping("/unexpected")
+        String unexpected() {
+            throw new IllegalStateException("Sensitive database details");
         }
     }
 

@@ -1,27 +1,34 @@
 package vn.edu.unieee;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
 import org.springframework.context.annotation.Import;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
+import vn.edu.unieee.common.exception.AccessDeniedBusinessException;
 import vn.edu.unieee.common.exception.GlobalExceptionHandler;
 import vn.edu.unieee.common.security.AuthMeController;
+import vn.edu.unieee.common.security.CurrentUser;
 import vn.edu.unieee.common.security.KeycloakJwtAuthenticationConverter;
 import vn.edu.unieee.common.security.SecurityConfig;
+import vn.edu.unieee.common.security.SecurityContextHelper;
 
 @WebMvcTest(controllers = AuthMeController.class)
 @Import({SecurityConfig.class, KeycloakJwtAuthenticationConverter.class, GlobalExceptionHandler.class})
@@ -36,6 +43,11 @@ class SecurityJwtIntegrationTest {
 
     @MockitoBean
     private JwtDecoder jwtDecoder;
+
+    @AfterEach
+    void clearSecurityContext() {
+        SecurityContextHolder.clearContext();
+    }
 
     @Test
     void unauthenticatedRequestReturns401ProblemDetail() throws Exception {
@@ -81,6 +93,52 @@ class SecurityJwtIntegrationTest {
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.status").value("OK"))
             .andExpect(jsonPath("$.roleVerified").value("ACADEMIC_ADMIN"));
+    }
+
+    @Test
+    void keycloakJwtConverterHandlesMissingPreferredUsernameAndBlankOrMissingRoles() {
+        Jwt jwt = Jwt.withTokenValue("mock-token")
+            .header("alg", "RS256")
+            .subject("sub-fallback-user")
+            .claim("preferred_username", "  ")
+            .claim("realm_access", Map.of("roles", Arrays.asList("lecturer", "", "  ", null)))
+            .issuedAt(Instant.now())
+            .expiresAt(Instant.now().plusSeconds(300))
+            .build();
+
+        var token = converter.convert(jwt);
+        assertThat(token.getName()).isEqualTo("sub-fallback-user");
+        assertThat(token.getAuthorities()).extracting("authority").containsExactly("ROLE_LECTURER");
+
+        Jwt noRealmAccessJwt = Jwt.withTokenValue("mock-token")
+            .header("alg", "RS256")
+            .subject("sub-no-roles")
+            .issuedAt(Instant.now())
+            .expiresAt(Instant.now().plusSeconds(300))
+            .build();
+        assertThat(converter.convert(noRealmAccessJwt).getAuthorities()).isEmpty();
+    }
+
+    @Test
+    void securityContextHelperRejectsUnauthenticatedAndFallsBackToSubject() {
+        SecurityContextHolder.clearContext();
+        assertThatThrownBy(SecurityContextHelper::getCurrentUser)
+            .isInstanceOf(AccessDeniedBusinessException.class);
+
+        Jwt jwtWithoutUsername = Jwt.withTokenValue("mock-token")
+            .header("alg", "RS256")
+            .subject("sub-only-user")
+            .claim("student_id", "20220001")
+            .claim("realm_access", Map.of("roles", List.of("STUDENT")))
+            .issuedAt(Instant.now())
+            .expiresAt(Instant.now().plusSeconds(300))
+            .build();
+        SecurityContextHolder.getContext().setAuthentication(converter.convert(jwtWithoutUsername));
+
+        CurrentUser user = SecurityContextHelper.getCurrentUser();
+        assertThat(user.username()).isEqualTo("sub-only-user");
+        assertThat(user.studentId()).isEqualTo("20220001");
+        assertThat(user.roles()).containsExactly("STUDENT");
     }
 
     private static Jwt createKeycloakJwt(String username, List<String> roles) {

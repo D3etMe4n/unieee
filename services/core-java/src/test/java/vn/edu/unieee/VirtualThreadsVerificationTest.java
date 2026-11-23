@@ -48,6 +48,13 @@ class VirtualThreadsVerificationTest {
         ThreadSnapshot snapshot = snapshotFuture.get();
         assertThat(snapshot.isVirtual()).isTrue();
         assertThat(snapshot.threadName()).startsWith("unieee-vt-");
+
+        var method = VirtualThreadsVerificationTest.class.getDeclaredMethod("autoConfiguredExecutorRunsOnVirtualThreadsWithConfiguredPrefix");
+        asyncConfigurer.getAsyncUncaughtExceptionHandler().handleUncaughtException(
+            new IllegalStateException("simulated async failure"),
+            method,
+            "arg1"
+        );
     }
 
     private record ThreadSnapshot(boolean isVirtual, String threadName) {

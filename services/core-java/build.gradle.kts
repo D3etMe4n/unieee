@@ -1,5 +1,6 @@
 plugins {
     java
+    jacoco
     alias(libs.plugins.spring.boot)
     alias(libs.plugins.spring.dependency.management)
 }
@@ -71,4 +72,83 @@ tasks.withType<JavaCompile> {
 
 tasks.withType<Test> {
     useJUnitPlatform()
+    finalizedBy(tasks.jacocoTestReport)
+}
+
+jacoco {
+    toolVersion = "0.8.13"
+}
+
+val jacocoExclusions = listOf(
+    "vn/edu/unieee/UnieeeApplication.class",
+    "**/dto/**",
+    "**/mapper/**",
+    "**/common/domain/**",
+    "**/*Properties.class",
+)
+
+val criticalCorePackages = listOf(
+    "vn.edu.unieee.common.security",
+    "vn.edu.unieee.*.internal.domain",
+    "vn.edu.unieee.policy.internal.service*",
+    "vn.edu.unieee.ai_advisor.internal.guardrail*",
+    "vn.edu.unieee.ai_advisor.internal.bitmask*",
+)
+
+tasks.jacocoTestReport {
+    dependsOn(tasks.test)
+    reports {
+        xml.required = true
+        html.required = true
+    }
+    classDirectories.setFrom(
+        files(
+            classDirectories.files.map { dir ->
+                fileTree(dir) { exclude(jacocoExclusions) }
+            }
+        )
+    )
+}
+
+tasks.jacocoTestCoverageVerification {
+    dependsOn(tasks.jacocoTestReport)
+    classDirectories.setFrom(
+        files(
+            classDirectories.files.map { dir ->
+                fileTree(dir) { exclude(jacocoExclusions) }
+            }
+        )
+    )
+    violationRules {
+        rule {
+            element = "PACKAGE"
+            includes = criticalCorePackages
+            limit {
+                counter = "LINE"
+                value = "COVEREDRATIO"
+                minimum = "0.90".toBigDecimal()
+            }
+        }
+        rule {
+            element = "PACKAGE"
+            excludes = criticalCorePackages
+            limit {
+                counter = "LINE"
+                value = "COVEREDRATIO"
+                minimum = "0.65".toBigDecimal()
+            }
+        }
+        rule {
+            element = "BUNDLE"
+            limit {
+                counter = "LINE"
+                value = "COVEREDRATIO"
+                minimum = "0.65".toBigDecimal()
+            }
+        }
+    }
+}
+
+tasks.check {
+    dependsOn(tasks.jacocoTestCoverageVerification)
 }
