@@ -268,3 +268,39 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  core-java:
+    build:
+      context: ../services/core-java
+      dockerfile: Dockerfile
+    container_name: unieee-core-java
+    restart: unless-stopped
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis-master:
+        condition: service_healthy
+      redis-sentinel-1:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    environment:
+      DB_HOST: pgbouncer
+      DB_PORT: 6432
+      DB_NAME: ${POSTGRES_DB:-unieee}
+      DB_USER: ${POSTGRES_USER:-unieee}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-unieee_dev_password}
+      SPRING_DATA_REDIS_SENTINEL_MASTER: unieee-master
+      SPRING_DATA_REDIS_SENTINEL_NODES: redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:-unieee_redis_dev_password}
+      KEYCLOAK_JWK_SET_URI: http://keycloak:8080/auth/realms/unieee/protocol/openid-connect/certs
+      SERVER_PORT: 8080
+    networks:
+      - app
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/actuator/health/readiness | grep -q '\"status\":\"UP\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
