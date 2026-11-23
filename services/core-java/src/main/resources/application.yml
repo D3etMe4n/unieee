@@ -4,6 +4,12 @@ spring:
   threads:
     virtual:
       enabled: true
+  task:
+    execution:
+      thread-name-prefix: unieee-vt-
+      shutdown:
+        await-termination: true
+        await-termination-period: 30s
 
   datasource:
     url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:6432}/${DB_NAME:unieee}?prepareThreshold=0
