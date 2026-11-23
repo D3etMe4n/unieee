@@ -22,3 +22,6 @@ unieee:
     cleanup:
       enabled: true
       retention: 24h
+  keycloak:
+    admin:
+      enabled: false
