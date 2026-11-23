@@ -294,6 +294,10 @@ services:
       SPRING_DATA_REDIS_SENTINEL_NODES: redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
       SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:-unieee_redis_dev_password}
       KEYCLOAK_JWK_SET_URI: http://keycloak:8080/auth/realms/unieee/protocol/openid-connect/certs
+      KEYCLOAK_ADMIN_BASE_URL: http://keycloak:8080/auth
+      KEYCLOAK_REALM: unieee
+      KEYCLOAK_ADMIN_CLIENT_ID: unieee-admin-cli
+      KEYCLOAK_ADMIN_CLIENT_SECRET: ${KEYCLOAK_ADMIN_CLIENT_SECRET:-unieee-admin-cli-dev-secret}
       SERVER_PORT: 8080
     networks:
       - app

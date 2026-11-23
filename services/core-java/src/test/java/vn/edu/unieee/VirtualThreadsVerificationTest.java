@@ -12,21 +12,15 @@ import org.springframework.core.task.AsyncTaskExecutor;
 import org.springframework.core.task.SimpleAsyncTaskExecutor;
 import org.springframework.scheduling.annotation.AsyncConfigurer;
 import org.springframework.test.context.ActiveProfiles;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
-import org.testcontainers.utility.DockerImageName;
+import vn.edu.unieee.support.SharedPostgresContainer;
 
 @SpringBootTest
-@Testcontainers
 @ActiveProfiles("test")
 class VirtualThreadsVerificationTest {
 
-    @Container
     @ServiceConnection
-    static PostgreSQLContainer postgres = new PostgreSQLContainer(
-        DockerImageName.parse("docker.io/library/postgres:17-alpine").asCompatibleSubstituteFor("postgres")
-    );
+    static final PostgreSQLContainer POSTGRES = SharedPostgresContainer.INSTANCE;
 
     @Autowired
     @Qualifier("applicationTaskExecutor")

@@ -1,0 +1,14 @@
+package vn.edu.unieee.catalog.dto;
+
+import java.util.UUID;
+
+public record MajorResponse(
+    UUID id,
+    UUID facultyId,
+    String facultyCode,
+    String code,
+    String name,
+    int totalRequiredCredits,
+    boolean active
+) {
+}

@@ -1,7 +1,7 @@
 FROM docker.io/library/eclipse-temurin:21-jdk-alpine AS builder
 WORKDIR /workspace
 
-COPY gradlew settings.gradle.kts build.gradle.kts ./
+COPY gradlew settings.gradle.kts build.gradle.kts lombok.config ./
 COPY gradle gradle
 RUN chmod +x gradlew && ./gradlew --no-daemon dependencies || true
 

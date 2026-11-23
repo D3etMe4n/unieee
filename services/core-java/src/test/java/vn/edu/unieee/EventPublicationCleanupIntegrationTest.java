@@ -13,22 +13,16 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
-import org.testcontainers.utility.DockerImageName;
 import vn.edu.unieee.common.outbox.EventPublicationCleanupJob;
+import vn.edu.unieee.support.SharedPostgresContainer;
 
 @SpringBootTest
-@Testcontainers
 @ActiveProfiles("test")
 class EventPublicationCleanupIntegrationTest {
 
-    @Container
     @ServiceConnection
-    static PostgreSQLContainer postgres = new PostgreSQLContainer(
-        DockerImageName.parse("docker.io/library/postgres:17-alpine").asCompatibleSubstituteFor("postgres")
-    );
+    static final PostgreSQLContainer POSTGRES = SharedPostgresContainer.INSTANCE;
 
     @Autowired
     private JdbcTemplate jdbcTemplate;

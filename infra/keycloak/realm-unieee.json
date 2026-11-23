@@ -52,7 +52,37 @@
       "attributes": {
         "pkce.code.challenge.method": "S256",
         "post.logout.redirect.uris": "+"
-      }
+      },
+      "protocolMappers": [
+        {
+          "name": "student_id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "userinfo.token.claim": "true",
+            "user.attribute": "student_id",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "student_id",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "lecturer_id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "userinfo.token.claim": "true",
+            "user.attribute": "lecturer_id",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "lecturer_id",
+            "jsonType.label": "String"
+          }
+        }
+      ]
     },
     {
       "clientId": "unieee-admin-cli",
@@ -130,7 +160,8 @@
         "realm-management": [
           "manage-users",
           "view-users",
-          "query-users"
+          "query-users",
+          "view-realm"
         ]
       }
     }
