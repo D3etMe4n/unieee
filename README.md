@@ -1,47 +1,62 @@
-# unieee — Hệ thống Đăng ký Tín chỉ Đại học Hiệu năng cao
+# unieee — High-Performance University Credit Registration System
 
-**unieee** là hệ thống quản lý đào tạo và đăng ký tín chỉ đại học được thiết kế cho tải đột biến (*flash crowd*) trong các khung giờ mở cổng đăng ký, sử dụng kiến trúc lai **Hybrid CQRS + Event Sourcing & Modular Monolith**.
+**Language:** **English** | [Tiếng Việt](./README.vi.md)
+
+**unieee** is a university academic management and course credit registration system engineered for extreme flash-crowd traffic during registration windows, built on a **Hybrid CQRS + Event Sourcing & Modular Monolith** architecture.
+
+> [!WARNING]
+> **Project Scope Disclaimer:**
+> This is a **personal project** built for architectural research, design, and experimentation with high-throughput distributed systems. It has **not undergone a security audit or comprehensive production validation**, and **is not recommended for direct production deployment**.
+
+> [!CAUTION]
+> **Security Notice — Rotate All Default Secrets Before Deployment:**
+> Because this repository is hosted publicly on GitHub, all default passwords, tokens, dev certificates, and sample accounts included in the codebase are strictly for local development. Before deploying to any non-local environment, **you must rotate and replace all secrets and default credentials** in the following files:
+> - [.env.example](./.env.example): Copy to `.env` (gitignored) and replace `POSTGRES_PASSWORD`, `REDIS_PASSWORD`, `KEYCLOAK_ADMIN_PASSWORD`, and `CLOUDFLARE_TUNNEL_TOKEN`.
+> - [infra/compose.base.yml](./infra/compose.base.yml): Contains development fallback defaults when environment variables are unset.
+> - [infra/compose.letsencrypt.yml](./infra/compose.letsencrypt.yml) & [infra/compose.cloudflared.yml](./infra/compose.cloudflared.yml): Let's Encrypt ACME and Cloudflare Tunnel (`TUNNEL_TOKEN`) configurations.
+> - [infra/keycloak/realm-unieee.json](./infra/keycloak/realm-unieee.json): Contains the `unieee-admin-cli` client secret and sample user passwords (`admin01`, `lecturer01`, `student01`) — rotate secrets and remove or reset sample accounts before use.
+> - [scripts/lib/certs.sh](./scripts/lib/certs.sh): Generates self-signed TLS certificates for local development (or loads custom PEM files); use valid CA-issued certificates, Let's Encrypt, or Cloudflare Tunnel in real deployments.
 
 ---
 
-## Kiến trúc Tổng quan
+## Architecture Overview
 
 - **Warm / Cold Path — Spring Boot 4.1.2 Modular Monolith (`services/core-java/`):**
-  - Quản lý chương trình khung, môn học, điều kiện tiên quyết, học kỳ, lớp học phần, khảo sát nguyện vọng, Policy Engine đa trường, quản trị cổng đăng ký và trợ lý AI tư vấn & xếp lịch (`ai_advisor`).
-  - Dùng **Java 21 (Virtual Threads)**, **Spring Modulith** (Event Publication Registry + Cleanup Job), **Spring Data JPA**, **Flyway**, **Spring Security** (Keycloak OIDC 1.0 / OAuth 2.0 / JWT), **MapStruct**, **Spring AI** (chỉ read-only tools & guardrails).
-- **Hot Path — Cụm dịch vụ Rust (`services/rust-enrollment/`):**
-  - **Enrollment State-Machine (`enrollment-engine`, Axum + Tokio):** Giữ state đăng ký trong RAM với cấu trúc dữ liệu căn lề *cache-line* (`#[repr(align(64))]`), sharding theo sinh viên, trừ ghế nguyên tử lock-free và kiểm tra trùng lịch `O(1)` bằng **Bitmask**; đẩy sự kiện sang **Kafka (KRaft)** và hỗ trợ phục hồi qua replay/Active–Standby failover.
-  - **Writer / Commit Service (`enrollment-writer`):** Đọc batch từ Kafka, xác thực và ghi bền vững vào **PostgreSQL** (qua **PgBouncer**) bằng `UNNEST` + Atomic `UPDATE` + `CHECK` constraint; đồng bộ **Redis HA** (Read Cache & Pub/Sub) và phát sự kiện hoàn tác (**Revert**) nếu DB từ chối.
-  - **SSE Live-Update Service (`sse-gateway`, Axum + Tokio):** Đẩy biến động chỗ ngồi và kết quả đăng ký thời gian thực qua Server-Sent Events.
-- **Hạ tầng & Bảo mật (`infra/`, `scripts/`):**
-  - Đứng sau **Reverse Proxy** (TLS termination, routing, rate limiting) và **Keycloak** (tắt self-registration, tài khoản do Phòng Đào tạo cấp).
-  - Đóng gói bằng **Podman Compose** (mặc định) và **Docker Compose** (fallback), không cần Kubernetes; hỗ trợ bật/tắt cụm đăng ký nóng theo chu kỳ (`prepare-registration`, `open-registration`, `close-registration`).
+  - Manages curricula, courses, prerequisites, academic terms, course sections, wish surveys, a multi-institution Policy Engine, registration window administration, and an AI course & schedule advisor (`ai_advisor`).
+  - Built with **Java 21 (Virtual Threads)**, **Spring Modulith** (Event Publication Registry + Scheduled Cleanup Job), **Spring Data JPA**, **Flyway**, **Spring Security** (Keycloak OIDC 1.0 / OAuth 2.0 / JWT), **MapStruct**, and **Spring AI** (strictly read-only tools & guardrails).
+- **Hot Path — Rust Service Cluster (`services/rust-enrollment/`):**
+  - **Enrollment State-Machine (`enrollment-engine`, Axum + Tokio):** Holds registration state in RAM using *cache-line* aligned structures (`#[repr(align(64))]`), per-student sharding, lock-free atomic seat reservations, and `O(1)` **Bitmask** schedule conflict checks; publishes events to **Kafka (KRaft)** and supports state recovery via event replay and Active–Standby failover.
+  - **Writer / Commit Service (`enrollment-writer`):** Consumes Kafka batches, validates and commits durably to **PostgreSQL** (via **PgBouncer**) using `UNNEST` + Atomic `UPDATE` + `CHECK` constraints; updates **Redis HA** (Read Cache & Pub/Sub) and emits compensating **Revert** events if PostgreSQL rejects a record.
+  - **SSE Live-Update Service (`sse-gateway`, Axum + Tokio):** Streams real-time seat availability and registration outcomes via Server-Sent Events.
+- **Infrastructure & Security (`infra/`, `scripts/`):**
+  - Sits behind a **Reverse Proxy** (TLS termination, routing, rate limiting) and **Keycloak** (self-registration disabled; accounts are provisioned by Academic Affairs).
+  - Containerized with **Podman Compose** (default) and **Docker Compose** (fallback), without Kubernetes; supports toggling the hot-path cluster cyclically (`prepare-registration`, `open-registration`, `close-registration`).
 
 ---
 
-## Nhóm Người dùng Chính
+## User Roles
 
-1. **Sinh viên (`STUDENT`):** Khảo sát nguyện vọng (không giữ ghế), đăng ký/hủy/học lại/cải thiện môn học, theo dõi sĩ số real-time, xem thời khóa biểu, dùng trợ lý AI tư vấn & gợi ý xếp lịch.
-2. **Giảng viên (`LECTURER`):** Xem lớp học phần được phân công, lịch giảng dạy và danh sách sinh viên đã đăng ký.
-3. **Phòng Đào tạo (`ACADEMIC_ADMIN`):** Quản lý toàn bộ dữ liệu đào tạo, cấp tài khoản sinh viên/giảng viên, tạo & tổng hợp khảo sát, cấu hình quy chế đa trường, mở/đóng cổng theo đợt và can thiệp trực tiếp khi cần.
+1. **Student (`STUDENT`):** Submits pre-registration wish surveys (non-seat-reserving), registers/drops/retakes/improves courses, monitors live seat counts, views personal timetables, and consults the read-only AI schedule advisor.
+2. **Lecturer (`LECTURER`):** Views assigned course sections, teaching schedules, and enrolled student rosters.
+3. **Academic Affairs (`ACADEMIC_ADMIN`):** Manages academic data, provisions student/lecturer accounts, creates and aggregates wish surveys, configures multi-institution registration policies, opens/closes registration waves, and performs direct enrollment overrides when needed.
 
 ---
 
 ## Tech Stack
 
-| Thành phần | Công nghệ |
+| Layer / Component | Technology |
 | :--- | :--- |
 | Core Monolith & AI | Java 21 (Virtual Threads), Spring Boot 4.1.2, Spring Modulith, Gradle Kotlin DSL, JPA, Flyway, MapStruct, Spring AI |
 | Hot Path Services | Rust, Axum, Tokio (`enrollment-engine`, `enrollment-writer`, `sse-gateway`) |
-| Database & Pooling | PostgreSQL (`CHECK` + Event Sourcing), PgBouncer |
+| Database & Pooling | PostgreSQL (`CHECK` constraints + Event Sourcing), PgBouncer |
 | Cache & Pub/Sub | Redis HA (Master–Replica + Sentinel, AOF/RDB) |
 | Event Streaming | Apache Kafka (KRaft mode) |
 | Auth & Edge | Keycloak (OIDC / OAuth 2.0 / JWT), Reverse Proxy |
-| Container & Ops | Podman Compose (ưu tiên), Docker Compose (fallback), Lifecycle CLI (`scripts/unieee.sh`) |
+| Container & Ops | Podman Compose (preferred), Docker Compose (fallback), Lifecycle CLI (`scripts/unieee.sh`) |
 
 ---
 
-## Cấu trúc Thư mục Monorepo
+## Monorepo Layout
 
 ```text
 unieee/
@@ -49,49 +64,98 @@ unieee/
 │   ├── core-java/               # Spring Boot 4.1.2 Modular Monolith
 │   └── rust-enrollment/         # Rust Cargo Workspace (crates/ + services/)
 ├── infra/
-│   ├── reverse-proxy/           # TLS, routing, rate limit, active-standby failover
+│   ├── compose.base.yml         # Base stack (core profile)
+│   ├── compose.hotpath.yml      # High-throughput registration stack (hot-path)
+│   ├── compose.letsencrypt.yml  # Let's Encrypt auto-issuance & renewal overlay
+│   ├── compose.cloudflared.yml  # Cloudflare Tunnel overlay (Quick & Named)
+│   ├── letsencrypt/             # Certbot ACME HTTP-01 entrypoint
+│   ├── reverse-proxy/           # TLS, routing, rate limiting, active-standby failover
 │   ├── keycloak/                # Realm, roles, OIDC clients (no self-registration)
 │   ├── pgbouncer/               # Transaction pooling config
 │   └── redis/                   # Master-Replica & Sentinel configs
 ├── scripts/
-│   └── lib/                     # Lifecycle CLI scripts (Podman/Docker)
+│   ├── unieee.sh                # Lifecycle CLI & Edge/TLS mode switcher
+│   └── lib/                     # Helpers (runtime, certs, healthcheck)
 ├── tests/
 │   ├── e2e/                     # Integration & Regression test suites
 │   └── load/                    # Flash-crowd load/stress tests
 ├── .editorconfig
+├── .env.example
 ├── .gitignore
 ├── LICENSE
-└── README.md
+├── README.md
+└── README.vi.md
 ```
 
 ---
 
-## Lộ trình Triển khai (12 Phases)
+## Startup Configuration & Reverse Proxy / TLS Modes
 
-1. **Phase 1 (`feat/monorepo-docs-and-agents`):** Khởi tạo monorepo, cấu hình chuẩn repo & tài liệu nền tảng.
-2. **Phase 2 (`feat/container-infra-and-ops-cli`):** Hạ tầng Compose (PostgreSQL, PgBouncer, Redis HA, Kafka, Keycloak, Reverse Proxy) & CLI skeleton.
-3. **Phase 3 (`feat/spring-boot-modulith-foundation`):** Nền tảng Spring Boot 4.1.2, `common`, Keycloak JWT, Flyway, Event Publication Registry + Cleanup Job.
-4. **Phase 4 (`feat/core-academic-crud-modules`):** Các domain modules CRUD cốt lõi (`academic`, `course`, `student`, `lecturer`, `enrollment_admin`).
-5. **Phase 5 (`feat/wish-survey-and-policy-engine`):** Khảo sát nguyện vọng (`survey`) & Policy Engine đa trường (`policy`).
-6. **Phase 6 (`feat/rust-workspace-bitmask-cacheline`):** Rust Cargo Workspace, `unieee-domain` (Bitmask Engine), `unieee-events`, `unieee-cacheline` (`#[repr(align(64))]`).
-7. **Phase 7 (`feat/rust-enrollment-state-machine`):** Rust Enrollment State-Machine Service, Preloader, Replay/HA.
-8. **Phase 8 (`feat/rust-writer-batch-and-revert`):** Rust Writer / Commit Service & cơ chế hoàn tác Revert.
-9. **Phase 9 (`feat/rust-sse-live-updates`):** Rust SSE Live-Update Service & tối ưu kết nối đồng thời.
-10. **Phase 10 (`feat/spring-ai-schedule-advisor`):** Trợ lý AI tư vấn & xếp lịch (`ai_advisor`) với Read-Only Guardrails.
-11. **Phase 11 (`feat/ops-lifecycle-and-failover-drill`):** Hoàn thiện Lifecycle CLI (`prepare-registration`, `open-registration`, `close-registration`) & diễn tập failover.
-12. **Phase 12 (`feat/e2e-regression-and-load-testing`):** Kiểm thử E2E, Regression Suite & Flash-Crowd Load Testing.
+The [scripts/unieee.sh](./scripts/unieee.sh) CLI lets you switch effortlessly between **3 Edge / TLS modes** via `--tls-mode` (or by setting `UNIEEE_TLS_MODE` in `.env` copied from [.env.example](./.env.example)):
+
+| Mode (`--tls-mode`) | When to Use | Requirements | Quick Command |
+| :--- | :--- | :--- | :--- |
+| **`custom`** *(default)* | Local development or loading your own PEM certificate/key pair | No domain needed (auto self-signed) or pass `--cert` & `--key` | `./scripts/unieee.sh up` |
+| **`letsencrypt`** | Public server with a domain pointing directly to the Reverse Proxy | Public DNS pointing to host, ports `80`/`443` open for ACME HTTP-01 | `./scripts/unieee.sh up --tls-mode letsencrypt --domain reg.example.edu.vn --email admin@example.edu.vn` |
+| **`cloudflared`** | Exposing without opening inbound router/firewall ports or using Cloudflare Edge | Outbound HTTPS access to Cloudflare Edge | `./scripts/unieee.sh up --tls-mode cloudflared` |
+
+### 1. Custom Certificate or Local Self-Signed (`custom`)
+```bash
+# Default local dev (auto-generates self-signed cert in infra/reverse-proxy/certs/)
+./scripts/unieee.sh up
+
+# Load an existing PEM certificate & key (CLI verifies public-key match)
+./scripts/unieee.sh up --tls-mode custom \
+  --cert /path/to/fullchain.pem \
+  --key /path/to/privkey.pem
+```
+
+### 2. Automated Let's Encrypt Registration & Renewal (`letsencrypt`)
+```bash
+# Test against Let's Encrypt Staging CA (default --staging)
+./scripts/unieee.sh up --tls-mode letsencrypt \
+  --domain reg.example.edu.vn \
+  --email admin@example.edu.vn
+
+# Issue a production certificate (Production CA)
+./scripts/unieee.sh up --tls-mode letsencrypt \
+  --domain reg.example.edu.vn \
+  --email admin@example.edu.vn \
+  --no-staging
+
+# Manually trigger renewal and reload Nginx without downtime (auto-runs every 12h inside container)
+./scripts/unieee.sh tls-renew
+```
+
+### 3. Cloudflare Tunnel Deployment (`cloudflared`)
+Nginx listens on an internal-only port `8088` (not published to the host) so `cloudflared` forwards traffic securely with `X-Forwarded-Proto: https` and `X-Forwarded-Port: 443`:
+- **Quick experimentation without a domain (Quick Tunnel `*.trycloudflare.com`):**
+  ```bash
+  ./scripts/unieee.sh up --tls-mode cloudflared
+  ./scripts/unieee.sh logs cloudflared-quick
+  ```
+- **Using a Custom Domain (Named Tunnel):**
+  1. Create a Tunnel in the Cloudflare Zero Trust Dashboard and map a **Public Hostname** (e.g., `reg.example.edu.vn`) with Service Type `HTTP` pointing to `reverse-proxy:8088`.
+  2. Start with your tunnel token and custom domain:
+     ```bash
+     ./scripts/unieee.sh up --tls-mode cloudflared \
+       --cf-token "<CLOUDFLARE_TUNNEL_TOKEN>" \
+       --domain reg.example.edu.vn
+     ```
+
+> While running in any mode, you can re-run `./scripts/unieee.sh up --tls-mode <other_mode>` to automatically remove the previous TLS overlay container and switch modes without losing database state.
 
 ---
 
-## Quy trình Đóng góp (Git Workflow)
+## Contributing (Git Workflow)
 
-1. Bắt đầu mọi phase từ nhánh `dev` mới nhất: `git checkout dev && git pull`.
-2. Tạo nhánh tính năng riêng cho từng phase theo quy ước `feat/<ten-tinh-nang>`.
-3. Thực hiện các **atomic commits** theo chuẩn **Conventional Commits** (`feat`, `fix`, `perf`, `refactor`, `test`, `chore`, `docs`).
-4. Khi hoàn thành deliverables và pass toàn bộ kiểm thử của phase, mở **Pull Request vào `dev`** để review; **không tự duyệt hoặc tự merge PR** trước khi được chấp thuận.
+1. Always start each phase from the latest `dev` branch: `git checkout dev && git pull`.
+2. Create a dedicated feature branch per phase following `feat/<feature-name>`.
+3. Make clean **atomic commits** using **Conventional Commits** (`feat`, `fix`, `perf`, `refactor`, `test`, `chore`, `docs`).
+4. Once deliverables and tests pass, open a **Pull Request into `dev`** for review; **never self-approve or self-merge a PR** without explicit approval.
 
 ---
 
-## Giấy phép
+## License
 
-Phát hành theo [LICENSE](./LICENSE).
+Released under [LICENSE](./LICENSE).

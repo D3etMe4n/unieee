@@ -1,0 +1,61 @@
+server {
+    listen 80;
+    server_name _;
+
+    location = /proxy-health {
+        access_log off;
+        default_type text/plain;
+        return 200 "OK\n";
+    }
+
+    # ACME HTTP-01 challenge for Let's Encrypt (must stay on port 80 without HTTPS redirect)
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+        default_type text/plain;
+        allow all;
+    }
+
+    location / {
+        return 301 https://$host:${UNIEEE_HTTPS_PORT}$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name _;
+
+    ssl_certificate     /etc/nginx/certs/server.crt;
+    ssl_certificate_key /etc/nginx/certs/server.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    resolver ${NGINX_DNS_RESOLVER} valid=10s ipv6=off;
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+    set $edge_forwarded_proto $scheme;
+    set $edge_forwarded_port ${UNIEEE_HTTPS_PORT};
+
+    include /etc/nginx/snippets/unieee-routes.conf;
+}
+
+# Internal listener for Cloudflare Tunnel (cloudflared) — NOT published to host
+server {
+    listen 8088;
+    server_name _;
+
+    resolver ${NGINX_DNS_RESOLVER} valid=10s ipv6=off;
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+    set $edge_forwarded_proto https;
+    set $edge_forwarded_port 443;
+
+    include /etc/nginx/snippets/unieee-routes.conf;
+}
