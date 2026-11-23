@@ -2,6 +2,18 @@
 
 **unieee** là hệ thống quản lý đào tạo và đăng ký tín chỉ đại học được thiết kế cho tải đột biến (*flash crowd*) trong các khung giờ mở cổng đăng ký, sử dụng kiến trúc lai **Hybrid CQRS + Event Sourcing & Modular Monolith**.
 
+> [!WARNING]
+> **Lưu ý về Phạm vi Dự án:**
+> Đây là một **dự án cá nhân** phục vụ mục đích nghiên cứu, thiết kế và thử nghiệm kiến trúc hệ thống phân tán/hiệu năng cao. Dự án **chưa được kiểm toán bảo mật (security audit), chưa được kiểm thử đầy đủ cho môi trường vận hành thực tế** và **không khuyến khích triển khai trực tiếp vào production**.
+
+> [!CAUTION]
+> **Cảnh báo Bảo mật & Thay đổi Secrets trước khi Triển khai:**
+> Repository này được công khai trên GitHub public nên toàn bộ mật khẩu, secret, chứng chỉ dev và tài khoản mẫu trong mã nguồn chỉ nhằm mục đích chạy thử nghiệm cục bộ. Nếu bạn tham khảo hoặc triển khai ở bất kỳ môi trường nào ngoài local dev, **bắt buộc phải thay đổi toàn bộ các secret và thông tin xác thực mặc định** trong các tệp sau:
+> - [.env.example](./.env.example): Sao chép thành `.env` (gitignored) và thay toàn bộ `POSTGRES_PASSWORD`, `REDIS_PASSWORD`, `KEYCLOAK_ADMIN_PASSWORD`.
+> - [infra/compose.base.yml](./infra/compose.base.yml): Chứa giá trị fallback mặc định cho dev khi không truyền biến môi trường.
+> - [infra/keycloak/realm-unieee.json](./infra/keycloak/realm-unieee.json): Chứa client secret của `unieee-admin-cli` và mật khẩu tài khoản mẫu (`admin01`, `lecturer01`, `student01`) — cần đổi secret và xóa/thay đổi các tài khoản mẫu trước khi sử dụng.
+> - [scripts/lib/certs.sh](./scripts/lib/certs.sh): Tự động sinh chứng chỉ TLS self-signed cho dev; cần thay thế bằng chứng chỉ hợp lệ từ CA uy tín khi triển khai thực tế.
+
 ---
 
 ## Kiến trúc Tổng quan
@@ -63,23 +75,6 @@ unieee/
 ├── LICENSE
 └── README.md
 ```
-
----
-
-## Lộ trình Triển khai (12 Phases)
-
-1. **Phase 1 (`feat/monorepo-docs-and-agents`):** Khởi tạo monorepo, cấu hình chuẩn repo & tài liệu nền tảng.
-2. **Phase 2 (`feat/container-infra-and-ops-cli`):** Hạ tầng Compose (PostgreSQL, PgBouncer, Redis HA, Kafka, Keycloak, Reverse Proxy) & CLI skeleton.
-3. **Phase 3 (`feat/spring-boot-modulith-foundation`):** Nền tảng Spring Boot 4.1.2, `common`, Keycloak JWT, Flyway, Event Publication Registry + Cleanup Job.
-4. **Phase 4 (`feat/core-academic-crud-modules`):** Các domain modules CRUD cốt lõi (`academic`, `course`, `student`, `lecturer`, `enrollment_admin`).
-5. **Phase 5 (`feat/wish-survey-and-policy-engine`):** Khảo sát nguyện vọng (`survey`) & Policy Engine đa trường (`policy`).
-6. **Phase 6 (`feat/rust-workspace-bitmask-cacheline`):** Rust Cargo Workspace, `unieee-domain` (Bitmask Engine), `unieee-events`, `unieee-cacheline` (`#[repr(align(64))]`).
-7. **Phase 7 (`feat/rust-enrollment-state-machine`):** Rust Enrollment State-Machine Service, Preloader, Replay/HA.
-8. **Phase 8 (`feat/rust-writer-batch-and-revert`):** Rust Writer / Commit Service & cơ chế hoàn tác Revert.
-9. **Phase 9 (`feat/rust-sse-live-updates`):** Rust SSE Live-Update Service & tối ưu kết nối đồng thời.
-10. **Phase 10 (`feat/spring-ai-schedule-advisor`):** Trợ lý AI tư vấn & xếp lịch (`ai_advisor`) với Read-Only Guardrails.
-11. **Phase 11 (`feat/ops-lifecycle-and-failover-drill`):** Hoàn thiện Lifecycle CLI (`prepare-registration`, `open-registration`, `close-registration`) & diễn tập failover.
-12. **Phase 12 (`feat/e2e-regression-and-load-testing`):** Kiểm thử E2E, Regression Suite & Flash-Crowd Load Testing.
 
 ---
 
