@@ -1,2 +1,41 @@
+# Local-only docs & agent instructions (DO NOT REMOVE)
 docs/
 AGENTS.md
+
+# Java / Gradle / Kotlin
+.gradle/
+build/
+out/
+*.jar
+*.war
+*.ear
+*.class
+.kotlin/
+
+# Rust / Cargo
+target/
+**/*.rs.bk
+
+# Environment & Secrets / Certificates
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+
+# Container runtime data & logs
+infra/data/
+*.log
+logs/
+
+# IDE & OS
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
