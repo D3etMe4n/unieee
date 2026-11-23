@@ -89,8 +89,8 @@ val jacocoExclusions = listOf(
 
 val criticalCorePackages = listOf(
     "vn.edu.unieee.common.security",
-    "vn.edu.unieee.*.internal.domain",
-    "vn.edu.unieee.policy.internal.service*",
+    "vn.edu.unieee.*.internal.domain*",
+    "vn.edu.unieee.registration.internal.service.policy*",
     "vn.edu.unieee.ai_advisor.internal.guardrail*",
     "vn.edu.unieee.ai_advisor.internal.bitmask*",
 )
