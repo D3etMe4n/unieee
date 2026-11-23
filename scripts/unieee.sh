@@ -19,14 +19,30 @@ Usage:
   ./scripts/unieee.sh [--runtime podman|docker] <command> [options]
 
 Commands:
-  up [--hot-path]                       Start core stack (or core + hot-path)
+  up [options]                          Start core stack (optionally with hot-path & TLS mode)
+     --hot-path                         Include Kafka & Hot Path registration cluster
+     --tls-mode <mode>                  Edge/TLS mode: custom (default) | letsencrypt | cloudflared
+     --domain <domain>                  Domain name (for letsencrypt or named cloudflared tunnel)
+     --email <email>                    Contact email (for Let's Encrypt ACME registration)
+     --staging / --no-staging           Use Let's Encrypt staging CA (default: true) or production CA
+     --cert <path> --key <path>         Load custom PEM certificate & private key (for --tls-mode custom)
+     --cf-token <token>                 Cloudflare Tunnel token for custom domain (omit for Quick Tunnel)
+
   down [--hot-path-only] [--volumes]    Stop stack (or only hot-path containers)
-  health                                Check health of all active services
-  logs [service] [--tail N] [-f]        View service logs
+  tls-renew                             Renew Let's Encrypt certificate & reload Reverse Proxy
+  health                                Check health of all active services & edge TLS mode
+  logs [service] [--tail N] [-f]        View service logs (including certbot / cloudflared)
   prepare-registration --term <CODE>    Start hot-path & preload registration data (Phase 11 hook)
   open-registration --term <CODE>       Open registration gate (Phase 11 hook)
   close-registration --term <CODE>      Close gate, drain Kafka, reconcile & stop hot-path (Phase 11 hook)
   help                                  Show this help message
+
+Examples:
+  ./scripts/unieee.sh up
+  ./scripts/unieee.sh up --tls-mode custom --cert /path/to/fullchain.pem --key /path/to/privkey.pem
+  ./scripts/unieee.sh up --tls-mode letsencrypt --domain reg.example.edu.vn --email admin@example.edu.vn --no-staging
+  ./scripts/unieee.sh up --tls-mode cloudflared
+  ./scripts/unieee.sh up --tls-mode cloudflared --cf-token "<TOKEN>" --domain reg.example.edu.vn
 EOF
 }
 
@@ -68,11 +84,55 @@ detect_runtime "$RUNTIME_ARG"
 
 cmd_up() {
     local profile="core"
+    local tls_mode="${UNIEEE_TLS_MODE:-custom}"
+    local domain="${UNIEEE_DOMAIN:-localhost}"
+    local le_email="${UNIEEE_LETSENCRYPT_EMAIL:-}"
+    local le_staging="${UNIEEE_LETSENCRYPT_STAGING:-true}"
+    local cert_file="${UNIEEE_TLS_CERT_FILE:-}"
+    local key_file="${UNIEEE_TLS_KEY_FILE:-}"
+    local cf_token="${CLOUDFLARE_TUNNEL_TOKEN:-}"
+
     while [ $# -gt 0 ]; do
         case "$1" in
             --hot-path)
                 profile="hot-path"
                 shift
+                ;;
+            --tls-mode)
+                tls_mode="${2:?--tls-mode requires custom, letsencrypt, or cloudflared}"
+                shift 2
+                ;;
+            --tls-mode=*)
+                tls_mode="${1#*=}"
+                shift
+                ;;
+            --domain)
+                domain="${2:?--domain requires a domain name}"
+                shift 2
+                ;;
+            --email)
+                le_email="${2:?--email requires an email address}"
+                shift 2
+                ;;
+            --staging)
+                le_staging="true"
+                shift
+                ;;
+            --no-staging)
+                le_staging="false"
+                shift
+                ;;
+            --cert)
+                cert_file="${2:?--cert requires a file path}"
+                shift 2
+                ;;
+            --key)
+                key_file="${2:?--key requires a file path}"
+                shift 2
+                ;;
+            --cf-token)
+                cf_token="${2:?--cf-token requires a tunnel token}"
+                shift 2
                 ;;
             *)
                 log_err "Unknown option for 'up': $1"
@@ -81,10 +141,45 @@ cmd_up() {
         esac
     done
 
-    ensure_dev_tls_certs
-    log_info "Starting unieee stack (runtime=$CTR_RUNTIME, profile=$profile)..."
-    run_compose "$profile" up -d --wait
-    log_ok "unieee stack ($profile) is up and healthy."
+    case "$tls_mode" in
+        custom|letsencrypt|cloudflared)
+            ;;
+        *)
+            log_err "Invalid --tls-mode '$tls_mode'. Expected: custom | letsencrypt | cloudflared"
+            return 1
+            ;;
+    esac
+
+    export UNIEEE_TLS_MODE="$tls_mode"
+    export UNIEEE_DOMAIN="$domain"
+    export UNIEEE_LETSENCRYPT_EMAIL="$le_email"
+    export UNIEEE_LETSENCRYPT_STAGING="$le_staging"
+    export CLOUDFLARE_TUNNEL_TOKEN="$cf_token"
+
+    local cf_submode=""
+    if [ "$tls_mode" = "cloudflared" ]; then
+        if [ -n "$cf_token" ]; then
+            cf_submode="cf-named"
+            log_info "Cloudflare Tunnel mode: Named Tunnel (custom domain: ${domain})"
+        else
+            cf_submode="cf-quick"
+            log_info "Cloudflare Tunnel mode: Quick Tunnel (*.trycloudflare.com, no custom domain)"
+        fi
+    fi
+
+    prepare_tls_certs "$tls_mode" "$domain" "$cert_file" "$key_file"
+    cleanup_conflicting_edge_containers "$tls_mode" "$cf_submode"
+
+    log_info "Starting unieee stack (runtime=$CTR_RUNTIME, profile=$profile, tls_mode=$tls_mode)..."
+    run_compose_with_tls "$profile" "$tls_mode" "$cf_submode" up -d --wait --remove-orphans
+
+    if [ "$tls_mode" = "letsencrypt" ]; then
+        reload_reverse_proxy
+    elif [ "$tls_mode" = "cloudflared" ] && [ "$cf_submode" = "cf-quick" ]; then
+        log_info "To inspect your temporary Quick Tunnel URL, run: ./scripts/unieee.sh logs cloudflared-quick"
+    fi
+
+    log_ok "unieee stack (profile=$profile, tls_mode=$tls_mode) is up and healthy."
 }
 
 cmd_down() {
@@ -125,8 +220,29 @@ cmd_down() {
         down_args+=(-v)
     fi
     log_info "Stopping unieee stack (runtime=$CTR_RUNTIME)..."
-    run_compose "hot-path" "${down_args[@]}"
+    run_compose_with_tls "all" "all" "all" "${down_args[@]}"
     log_ok "unieee stack stopped."
+}
+
+cmd_tls_renew() {
+    if ! container_running "unieee-certbot"; then
+        log_err "unieee-certbot is not running. Start stack with '--tls-mode letsencrypt' first."
+        return 1
+    fi
+    local domain="${UNIEEE_DOMAIN:-}"
+    log_info "Running certbot renew..."
+    "$CTR_CLI" exec unieee-certbot certbot renew --webroot -w /var/www/certbot --non-interactive
+    if [ -n "$domain" ]; then
+        "$CTR_CLI" exec unieee-certbot /bin/sh -c "
+            if [ -f '/etc/letsencrypt/live/${domain}/fullchain.pem' ] && [ -f '/etc/letsencrypt/live/${domain}/privkey.pem' ]; then
+                cp '/etc/letsencrypt/live/${domain}/fullchain.pem' /etc/nginx/certs/server.crt &&
+                cp '/etc/letsencrypt/live/${domain}/privkey.pem' /etc/nginx/certs/server.key &&
+                chmod 644 /etc/nginx/certs/server.crt &&
+                chmod 600 /etc/nginx/certs/server.key
+            fi
+        "
+    fi
+    reload_reverse_proxy
 }
 
 cmd_logs() {
@@ -158,12 +274,12 @@ cmd_logs() {
     if [ -n "$service" ]; then
         log_args+=("$service")
     fi
-    run_compose "hot-path" "${log_args[@]}"
+    run_compose_with_tls "all" "all" "all" "${log_args[@]}"
 }
 
 cmd_prepare_registration() {
     log_info "prepare-registration: starting hot-path infrastructure..."
-    cmd_up --hot-path
+    cmd_up --hot-path "$@"
     log_warn "Preload & Policy Snapshot sync into core-java / Rust Engine will be wired in Phases 7 & 11."
 }
 
@@ -182,6 +298,9 @@ case "$COMMAND" in
         ;;
     down)
         cmd_down "$@"
+        ;;
+    tls-renew)
+        cmd_tls_renew
         ;;
     health)
         check_health

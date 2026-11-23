@@ -56,11 +56,66 @@ detect_runtime() {
 run_compose() {
     local profile="$1"
     shift
+    run_compose_with_tls "$profile" "custom" "" "$@"
+}
+
+run_compose_with_tls() {
+    local profile="$1"
+    local tls_mode="$2"
+    local cf_submode="$3"
+    shift 3
+
     local files=(-f "$ROOT_DIR/infra/compose.base.yml")
-    if [ "$profile" = "hot-path" ]; then
+    local profile_flags=()
+
+    if [ "$profile" = "hot-path" ] || [ "$profile" = "all" ]; then
         files+=(-f "$ROOT_DIR/infra/compose.hotpath.yml")
     fi
-    "${COMPOSE_CMD[@]}" --env-file "$ENV_FILE_ARG" "${files[@]}" "$@"
+
+    if [ "$tls_mode" = "letsencrypt" ] || [ "$tls_mode" = "all" ]; then
+        files+=(-f "$ROOT_DIR/infra/compose.letsencrypt.yml")
+    fi
+
+    if [ "$tls_mode" = "cloudflared" ] || [ "$tls_mode" = "all" ]; then
+        files+=(-f "$ROOT_DIR/infra/compose.cloudflared.yml")
+        if [ "$cf_submode" = "all" ]; then
+            profile_flags+=(--profile cf-quick --profile cf-named)
+        elif [ -n "$cf_submode" ]; then
+            profile_flags+=(--profile "$cf_submode")
+        fi
+    fi
+
+    "${COMPOSE_CMD[@]}" --env-file "$ENV_FILE_ARG" "${files[@]}" "${profile_flags[@]}" "$@"
+}
+
+cleanup_conflicting_edge_containers() {
+    local target_tls_mode="$1"
+    local target_cf_submode="${2:-}"
+
+    if [ "$target_tls_mode" != "letsencrypt" ]; then
+        if "$CTR_CLI" ps -a --format "{{.Names}}" 2>/dev/null | grep -qx "unieee-certbot"; then
+            log_info "Removing previous Let's Encrypt container (switching to tls-mode=$target_tls_mode)..."
+            "$CTR_CLI" rm -f unieee-certbot >/dev/null
+        fi
+    fi
+
+    if "$CTR_CLI" ps -a --format "{{.Names}}" 2>/dev/null | grep -qx "unieee-cloudflared"; then
+        if [ "$target_tls_mode" != "cloudflared" ]; then
+            log_info "Removing previous Cloudflare Tunnel container (switching to tls-mode=$target_tls_mode)..."
+            "$CTR_CLI" rm -f unieee-cloudflared >/dev/null
+        else
+            local expected_svc="cloudflared-quick"
+            if [ "$target_cf_submode" = "cf-named" ]; then
+                expected_svc="cloudflared-named"
+            fi
+            local current_svc
+            current_svc=$("$CTR_CLI" inspect --format '{{index .Config.Labels "com.docker.compose.service"}}' unieee-cloudflared 2>/dev/null || true)
+            if [ -n "$current_svc" ] && [ "$current_svc" != "$expected_svc" ]; then
+                log_info "Switching Cloudflare Tunnel mode ($current_svc -> $expected_svc)..."
+                "$CTR_CLI" rm -f unieee-cloudflared >/dev/null
+            fi
+        fi
+    fi
 }
 
 container_running() {
