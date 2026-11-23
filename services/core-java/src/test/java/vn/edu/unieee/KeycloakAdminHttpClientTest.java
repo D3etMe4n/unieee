@@ -17,12 +17,16 @@ import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.mock.env.MockEnvironment;
 import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestClient;
+import vn.edu.unieee.common.keycloak.KeycloakAccountProvisioner;
+import vn.edu.unieee.common.keycloak.KeycloakAdminConfig;
 import vn.edu.unieee.common.keycloak.KeycloakAdminHttpClient;
 import vn.edu.unieee.common.keycloak.KeycloakAdminProperties;
 import vn.edu.unieee.common.keycloak.KeycloakProvisioningException;
@@ -173,5 +177,23 @@ class KeycloakAdminHttpClientTest {
         noOp.deleteUser(sub);
 
         mockServer.verify();
+    }
+
+    @Test
+    void springConfigWiresKeycloakAdminHttpClientWhenEnabled() {
+        MockEnvironment env = new MockEnvironment()
+            .withProperty("unieee.keycloak.admin.enabled", "true")
+            .withProperty("unieee.keycloak.admin.base-url", "http://keycloak:8080/auth")
+            .withProperty("unieee.keycloak.admin.realm", "unieee")
+            .withProperty("unieee.keycloak.admin.client-id", "unieee-admin-cli")
+            .withProperty("unieee.keycloak.admin.client-secret", "secret");
+
+        try (AnnotationConfigApplicationContext ctx = new AnnotationConfigApplicationContext()) {
+            ctx.setEnvironment(env);
+            ctx.register(KeycloakAdminConfig.class, KeycloakAdminHttpClient.class);
+            ctx.refresh();
+            assertThat(ctx.getBean(KeycloakAccountProvisioner.class))
+                .isInstanceOf(KeycloakAdminHttpClient.class);
+        }
     }
 }
