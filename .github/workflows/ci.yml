@@ -91,13 +91,36 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Run Spring Boot & Modulith regression tests
+      - name: Run Spring Boot, Modulith & JaCoCo coverage checks
         working-directory: services/core-java
-        run: ./gradlew test --no-daemon
+        run: ./gradlew check --no-daemon
 
-      - name: Upload test report on failure
+      - name: Summarize JaCoCo coverage
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import os, xml.etree.ElementTree as ET
+          report = "services/core-java/build/reports/jacoco/test/jacocoTestReport.xml"
+          if not os.path.isfile(report):
+              print("No JaCoCo XML report generated.")
+              raise SystemExit(0)
+          root = ET.parse(report).getroot()
+          print("=== JaCoCo Line Coverage by Package ===")
+          for pkg in root.findall("package"):
+              name = pkg.attrib["name"].replace("/", ".")
+              for c in pkg.findall("counter"):
+                  if c.attrib["type"] == "LINE":
+                      cov = int(c.attrib["covered"])
+                      mis = int(c.attrib["missed"])
+                      pct = (cov / (cov + mis) * 100.0) if (cov + mis) else 100.0
+                      print(f"  {name}: {pct:.1f}% ({cov}/{cov + mis} lines)")
+          EOF
+
+      - name: Upload test & JaCoCo reports on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: core-java-test-report
-          path: services/core-java/build/reports/tests/test
+          name: core-java-test-and-coverage-report
+          path: |
+            services/core-java/build/reports/tests/test
+            services/core-java/build/reports/jacoco/test
