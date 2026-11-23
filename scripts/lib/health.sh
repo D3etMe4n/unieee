@@ -143,13 +143,29 @@ check_health() {
         log_info "kafka: inactive (core profile mode)"
     fi
 
-    # 9. Application services (scheduled for Phases 3 & 7-9)
+    # 9. Spring Boot Core Service (Phase 3+)
+    if container_running "unieee-core-java" && \
+       "$CTR_CLI" exec unieee-core-java wget -qO- http://127.0.0.1:8080/actuator/health 2>/dev/null | grep -q '"status":"UP"'; then
+        local auth_code
+        auth_code=$(curl -sk -o /dev/null -w "%{http_code}" "https://127.0.0.1:${https_port}/api/v1/auth/me" 2>/dev/null || true)
+        if [ "$auth_code" = "401" ]; then
+            log_ok "core-java: /actuator/health UP & Reverse Proxy /api/v1/auth/me enforces JWT (401)"
+        else
+            log_err "core-java: Reverse Proxy routing check expected HTTP 401, got '$auth_code'"
+            failures=$((failures + 1))
+        fi
+    else
+        log_err "core-java: health check FAILED"
+        failures=$((failures + 1))
+    fi
+
+    # 10. Rust Hot Path services (scheduled for Phases 7-9)
     local app_svc
-    for app_svc in unieee-core-java unieee-enrollment-engine-active unieee-enrollment-engine-standby unieee-enrollment-writer unieee-sse-gateway; do
+    for app_svc in unieee-enrollment-engine-active unieee-enrollment-engine-standby unieee-enrollment-writer unieee-sse-gateway; do
         if container_running "$app_svc"; then
             log_ok "$app_svc: running"
         else
-            log_info "$app_svc: not deployed yet (planned in Phases 3/7-9)"
+            log_info "$app_svc: not deployed yet (planned in Phases 7-9)"
         fi
     done
 

@@ -1,0 +1,126 @@
+name: unieee CI
+
+on:
+  pull_request:
+    branches:
+      - dev
+      - main
+  push:
+    branches:
+      - dev
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  infra-and-scripts:
+    name: Infra, Scripts & Guardrails
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify local-only files and secrets are not tracked
+        run: |
+          if git ls-files | grep -E '^(docs/|AGENTS\.md|\.env$|.*\.(crt|key|pem|p12))$'; then
+            echo "ERROR: Local-only files or private keys/certs must NOT be committed."
+            exit 1
+          fi
+          if git ls-files | grep -E '^\.env\.' | grep -v '^\.env\.example$'; then
+            echo "ERROR: Environment secret file must NOT be committed."
+            exit 1
+          fi
+
+      - name: Validate shell script syntax
+        run: |
+          bash -n scripts/unieee.sh scripts/lib/*.sh
+          sh -n infra/pgbouncer/entrypoint.sh infra/redis/entrypoint-sentinel.sh infra/letsencrypt/entrypoint.sh infra/reverse-proxy/10-detect-resolver.envsh
+
+      - name: Validate Keycloak realm configuration
+        run: |
+          python3 - <<'EOF'
+          import json
+          with open("infra/keycloak/realm-unieee.json", "r", encoding="utf-8") as f:
+              realm = json.load(f)
+          assert realm["realm"] == "unieee"
+          assert realm["registrationAllowed"] is False, "Self-registration must remain disabled"
+          role_names = {r["name"] for r in realm["roles"]["realm"]}
+          assert {"STUDENT", "LECTURER", "ACADEMIC_ADMIN"}.issubset(role_names)
+          print("Keycloak realm validation OK")
+          EOF
+
+      - name: Validate Compose configurations
+        run: |
+          docker compose --env-file .env.example -f infra/compose.base.yml config --quiet
+          docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.hotpath.yml config --quiet
+          docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.letsencrypt.yml config --quiet
+          docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.cloudflared.yml --profile cf-quick config --quiet
+          docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.cloudflared.yml --profile cf-named config --quiet
+
+      - name: Verify relative links in README files
+        run: |
+          python3 - <<'EOF'
+          import os, re
+          for fname in ("README.md", "README.vi.md"):
+              with open(fname, "r", encoding="utf-8") as f:
+                  text = f.read()
+              for m in re.finditer(r"\]\((\./[^)]+)\)", text):
+                  rel = m.group(1)
+                  assert os.path.isfile(rel), f"{fname}: broken link {rel}"
+                  assert not rel.startswith("./docs") and rel != "./AGENTS.md", f"{fname}: links to local-only {rel}"
+              print(f"{fname}: links OK")
+          EOF
+
+  core-java:
+    name: Spring Boot 4.1.2 Core & Modulith
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run Spring Boot, Modulith & JaCoCo coverage checks
+        working-directory: services/core-java
+        run: ./gradlew check --no-daemon
+
+      - name: Summarize JaCoCo coverage
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import os, xml.etree.ElementTree as ET
+          report = "services/core-java/build/reports/jacoco/test/jacocoTestReport.xml"
+          if not os.path.isfile(report):
+              print("No JaCoCo XML report generated.")
+              raise SystemExit(0)
+          root = ET.parse(report).getroot()
+          print("=== JaCoCo Line Coverage by Package ===")
+          for pkg in root.findall("package"):
+              name = pkg.attrib["name"].replace("/", ".")
+              for c in pkg.findall("counter"):
+                  if c.attrib["type"] == "LINE":
+                      cov = int(c.attrib["covered"])
+                      mis = int(c.attrib["missed"])
+                      pct = (cov / (cov + mis) * 100.0) if (cov + mis) else 100.0
+                      print(f"  {name}: {pct:.1f}% ({cov}/{cov + mis} lines)")
+          EOF
+
+      - name: Upload test & JaCoCo reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-java-test-and-coverage-report
+          path: |
+            services/core-java/build/reports/tests/test
+            services/core-java/build/reports/jacoco/test
