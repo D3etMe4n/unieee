@@ -6,6 +6,7 @@ members = [
   "crates/unieee-cacheline",
   "services/enrollment-engine",
   "services/enrollment-writer",
+  "services/sse-gateway",
 ]
 
 [workspace.package]
