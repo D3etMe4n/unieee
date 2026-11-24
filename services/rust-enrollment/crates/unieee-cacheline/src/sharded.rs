@@ -138,6 +138,15 @@ where
             shard.write().clear();
         }
     }
+
+    pub fn for_each_read(&self, mut f: impl FnMut(&K, &V)) {
+        for shard in self.shards.iter() {
+            let guard = shard.read();
+            for (k, v) in guard.iter() {
+                f(k, v);
+            }
+        }
+    }
 }
 
 struct FnvHasher(u64);

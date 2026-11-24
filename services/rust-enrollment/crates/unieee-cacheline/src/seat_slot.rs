@@ -288,6 +288,41 @@ impl SectionSeatSlot {
         }
     }
 
+    pub fn adjust_capacity(
+        &self,
+        new_max_capacity: i32,
+        new_status: Option<SectionSlotState>,
+    ) -> Result<SeatSnapshot, SeatOpError> {
+        if new_max_capacity < 0 {
+            return Err(SeatOpError::InvalidCapacity {
+                max_capacity: new_max_capacity,
+                value: 0,
+            });
+        }
+        let old_max = self.max_capacity.swap(new_max_capacity, Ordering::AcqRel);
+        let delta = new_max_capacity - old_max;
+        if delta != 0 {
+            let mut cur = self.available_seats.load(Ordering::Acquire);
+            loop {
+                let cap_ceiling = self.max_capacity.load(Ordering::Acquire);
+                let next = cur.saturating_add(delta).clamp(0, cap_ceiling);
+                match self.available_seats.compare_exchange_weak(
+                    cur,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => cur = actual,
+                }
+            }
+        }
+        if let Some(state) = new_status {
+            self.set_status(state);
+        }
+        Ok(self.snapshot())
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> SeatSnapshot {
         let max_capacity = self.max_capacity();

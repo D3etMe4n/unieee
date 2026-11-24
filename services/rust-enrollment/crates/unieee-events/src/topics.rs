@@ -1,6 +1,7 @@
 use unieee_domain::{EventId, SectionId, StudentId, TermId};
 
 pub const KAFKA_TOPIC_ENROLLMENT_COMMANDS: &str = "unieee.enrollment.commands";
+pub const KAFKA_TOPIC_ENROLLMENT_DELTAS: &str = "unieee.enrollment.deltas";
 pub const KAFKA_TOPIC_ENROLLMENT_DLQ: &str = "unieee.enrollment.dlq";
 
 pub const REDIS_CHANNEL_SEAT_TENTATIVE: &str = "unieee:seat:tentative";
