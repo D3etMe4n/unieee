@@ -29,6 +29,7 @@ unieee-events.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 enrollment-engine = { path = "../enrollment-engine" }
 enrollment-writer = { path = "../enrollment-writer" }
 http-body-util.workspace = true

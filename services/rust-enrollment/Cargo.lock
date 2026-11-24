@@ -2479,6 +2479,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "enrollment-engine",
  "enrollment-writer",
