@@ -1,0 +1,58 @@
+use crate::core::models::{PreloadDataset, ReplayEventRecord};
+use async_trait::async_trait;
+use unieee_domain::{EventId, TermId};
+use unieee_events::{EnrollmentCommandEvent, EnrollmentDeltaEvent, SeatTentativeEvent};
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KafkaReplayBatch {
+    pub commands: Vec<EnrollmentCommandEvent>,
+    pub deltas: Vec<EnrollmentDeltaEvent>,
+}
+
+#[async_trait]
+pub trait CommandPublisher: Send + Sync {
+    async fn publish_command(&self, event: &EnrollmentCommandEvent) -> Result<(), String>;
+}
+
+#[async_trait]
+pub trait TentativeSeatSink: Send + Sync {
+    async fn publish_tentative_batch(&self, events: &[SeatTentativeEvent]) -> Result<(), String>;
+}
+
+#[async_trait]
+pub trait RevertDedupStore: Send + Sync {
+    async fn mark_reverted(&self, event_id: EventId, ttl_secs: u64) -> Result<(), String>;
+}
+
+#[async_trait]
+pub trait PreloadSource: Send + Sync {
+    async fn load_term_dataset(
+        &self,
+        term_id: Option<TermId>,
+        term_code: Option<&str>,
+    ) -> Result<PreloadDataset, String>;
+}
+
+#[async_trait]
+pub trait KafkaReplaySource: Send + Sync {
+    async fn replay_since(
+        &self,
+        term_id: TermId,
+        from_timestamp_ms: i64,
+    ) -> Result<KafkaReplayBatch, String>;
+}
+
+#[async_trait]
+pub trait FallbackEventLogSource: Send + Sync {
+    async fn fetch_events_page(
+        &self,
+        term_id: TermId,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<ReplayEventRecord>, String>;
+}
+
+#[async_trait]
+pub trait JwksFetcher: Send + Sync {
+    async fn fetch_jwks_json(&self) -> Result<String, String>;
+}

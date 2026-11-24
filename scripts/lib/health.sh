@@ -133,8 +133,9 @@ check_health() {
         local topics
         if topics=$("$CTR_CLI" exec unieee-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list 2>/dev/null) && \
            echo "$topics" | grep -qx "unieee.enrollment.commands" && \
+           echo "$topics" | grep -qx "unieee.enrollment.deltas" && \
            echo "$topics" | grep -qx "unieee.enrollment.dlq"; then
-            log_ok "kafka: broker ready & topics (commands, dlq) verified"
+            log_ok "kafka: broker ready & topics (commands, deltas, dlq) verified"
         else
             log_err "kafka: broker or required topics check FAILED"
             failures=$((failures + 1))
@@ -159,13 +160,28 @@ check_health() {
         failures=$((failures + 1))
     fi
 
-    # 10. Rust Hot Path services (scheduled for Phases 7-9)
+    # 10. Rust Hot Path services (Phases 7-9)
+    local engine_svc
+    for engine_svc in unieee-enrollment-engine-active unieee-enrollment-engine-standby; do
+        if container_running "$engine_svc"; then
+            if "$CTR_CLI" exec "$engine_svc" curl -fsS http://127.0.0.1:8081/healthz >/dev/null 2>&1 && \
+               "$CTR_CLI" exec "$engine_svc" curl -fsS http://127.0.0.1:8081/readyz >/dev/null 2>&1; then
+                log_ok "$engine_svc: /healthz & /readyz OK"
+            else
+                log_err "$engine_svc: /healthz or /readyz FAILED"
+                failures=$((failures + 1))
+            fi
+        else
+            log_info "$engine_svc: inactive (core profile mode)"
+        fi
+    done
+
     local app_svc
-    for app_svc in unieee-enrollment-engine-active unieee-enrollment-engine-standby unieee-enrollment-writer unieee-sse-gateway; do
+    for app_svc in unieee-enrollment-writer unieee-sse-gateway; do
         if container_running "$app_svc"; then
             log_ok "$app_svc: running"
         else
-            log_info "$app_svc: not deployed yet (planned in Phases 7-9)"
+            log_info "$app_svc: not deployed yet (planned in Phases 8-9)"
         fi
     done
 

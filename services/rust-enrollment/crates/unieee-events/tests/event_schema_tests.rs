@@ -1,16 +1,18 @@
 use chrono::Utc;
+use rust_decimal::Decimal;
 use unieee_domain::{
     CourseId, EnrollmentAction, EnrollmentEventStatus, EventId, GateState, RuleErrorCode,
-    SectionId, StudentId, TermId, WindowId,
+    SectionId, SectionStatus, StudentId, TermId, WindowId,
 };
 use unieee_events::{
     decode_json, decode_json_slice, encode_json, encode_json_bytes, policy_snapshot_cache_key,
     revert_dedup_key, section_seats_cache_key, student_timetable_cache_key,
-    term_sections_cache_key, DeadLetterEvent, EnrollmentCommandEvent, EventCodecError,
-    GateControlEvent, HotPathPubSubMessage, RevertEvent, SeatConfirmedEvent, SeatTentativeEvent,
-    EVENT_SCHEMA_VERSION_V1, KAFKA_TOPIC_ENROLLMENT_COMMANDS, KAFKA_TOPIC_ENROLLMENT_DLQ,
-    REDIS_CHANNEL_ENROLLMENT_REVERT, REDIS_CHANNEL_GATE_CONTROL, REDIS_CHANNEL_SEAT_CONFIRMED,
-    REDIS_CHANNEL_SEAT_TENTATIVE,
+    term_sections_cache_key, DeadLetterEvent, EnrollmentCommandEvent, EnrollmentDeltaEvent,
+    EventCodecError, GateControlEvent, HotPathPubSubMessage, RevertEvent, SeatConfirmedEvent,
+    SeatTentativeEvent, SectionCapacityUpdatedEvent, StudentStandingUpdatedEvent,
+    EVENT_SCHEMA_VERSION_V1, KAFKA_TOPIC_ENROLLMENT_COMMANDS, KAFKA_TOPIC_ENROLLMENT_DELTAS,
+    KAFKA_TOPIC_ENROLLMENT_DLQ, REDIS_CHANNEL_ENROLLMENT_REVERT, REDIS_CHANNEL_GATE_CONTROL,
+    REDIS_CHANNEL_SEAT_CONFIRMED, REDIS_CHANNEL_SEAT_TENTATIVE,
 };
 
 #[test]
@@ -209,5 +211,84 @@ fn codec_rejects_unsupported_schema_version_and_malformed_json() {
     assert!(matches!(
         decode_json::<GateControlEvent>("{not-json"),
         Err(EventCodecError::Deserialize(_))
+    ));
+}
+
+#[test]
+fn hot_delta_sync_events_roundtrip_and_validate_schema_version() {
+    assert_eq!(KAFKA_TOPIC_ENROLLMENT_DELTAS, "unieee.enrollment.deltas");
+
+    let now = Utc::now();
+    let term_id = TermId::new_v4();
+    let student_id = StudentId::new_v4();
+    let standing_event_id = EventId::new_v7();
+    let standing = StudentStandingUpdatedEvent::new(
+        standing_event_id,
+        term_id,
+        student_id,
+        "ACTIVE",
+        Decimal::new(0, 2),
+        false,
+        false,
+        Some(Decimal::new(355, 2)),
+        now,
+    );
+    assert_eq!(standing.partition_key(), student_id.to_string());
+    let delta_standing = EnrollmentDeltaEvent::StudentStandingUpdated(standing.clone());
+    assert_eq!(delta_standing.event_id(), standing_event_id);
+    assert_eq!(delta_standing.term_id(), term_id);
+    assert_eq!(delta_standing.occurred_at(), now);
+    assert_eq!(delta_standing.partition_key(), student_id.to_string());
+
+    let standing_json = encode_json(&delta_standing).unwrap();
+    assert!(standing_json.contains("\"deltaType\":\"STUDENT_STANDING_UPDATED\""));
+    assert!(standing_json.contains("\"tuitionDebt\":\"0.00\""));
+    assert_eq!(
+        decode_json::<EnrollmentDeltaEvent>(&standing_json).unwrap(),
+        delta_standing
+    );
+
+    let cap_event_id = EventId::new_v7();
+    let cap = SectionCapacityUpdatedEvent::new(
+        cap_event_id,
+        term_id,
+        SectionId::new(888),
+        120,
+        Some(SectionStatus::Open),
+        now,
+    );
+    assert_eq!(cap.partition_key(), "888");
+    let delta_cap = EnrollmentDeltaEvent::SectionCapacityUpdated(cap.clone());
+    assert_eq!(delta_cap.event_id(), cap_event_id);
+    assert_eq!(delta_cap.term_id(), term_id);
+    assert_eq!(delta_cap.occurred_at(), now);
+    assert_eq!(delta_cap.partition_key(), "888");
+
+    let cap_bytes = encode_json_bytes(&delta_cap).unwrap();
+    assert_eq!(
+        decode_json_slice::<EnrollmentDeltaEvent>(&cap_bytes).unwrap(),
+        delta_cap
+    );
+
+    let mut bad_standing = standing;
+    bad_standing.schema_version = EVENT_SCHEMA_VERSION_V1 + 1;
+    let bad_delta = EnrollmentDeltaEvent::StudentStandingUpdated(bad_standing);
+    assert!(matches!(
+        encode_json(&bad_delta),
+        Err(EventCodecError::UnsupportedSchemaVersion {
+            expected: 1,
+            actual: 2
+        })
+    ));
+
+    let mut bad_cap = cap;
+    bad_cap.schema_version = EVENT_SCHEMA_VERSION_V1 + 1;
+    let bad_cap_delta = EnrollmentDeltaEvent::SectionCapacityUpdated(bad_cap);
+    assert!(matches!(
+        encode_json(&bad_cap_delta),
+        Err(EventCodecError::UnsupportedSchemaVersion {
+            expected: 1,
+            actual: 2
+        })
     ));
 }

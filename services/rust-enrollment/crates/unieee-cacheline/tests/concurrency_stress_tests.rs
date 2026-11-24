@@ -455,3 +455,86 @@ fn multithread_64_students_racing_for_10_seats_zero_overbooking() {
         .count();
     assert_eq!(persisted_winners, CAPACITY as usize);
 }
+
+#[test]
+fn section_seat_slot_adjust_capacity_and_sharded_for_each_read() {
+    let slot =
+        SectionSeatSlot::from_enrolled(SectionId::new(202), 30, 20, SectionStatus::Frozen, 4)
+            .unwrap();
+    assert!(matches!(
+        slot.adjust_capacity(-1, None),
+        Err(SeatOpError::InvalidCapacity {
+            max_capacity: -1,
+            value: 0
+        })
+    ));
+
+    // Grow capacity 30 -> 45 and reopen
+    let grown = slot
+        .adjust_capacity(45, Some(SectionSlotState::Open))
+        .unwrap();
+    assert_eq!(grown.max_capacity, 45);
+    assert_eq!(grown.available_seats, 25);
+    assert_eq!(grown.enrolled_count, 20);
+    assert_eq!(grown.status, SectionSlotState::Open);
+
+    // Shrink capacity below current enrolled count (20 enrolled -> max 15) clamps available to 0
+    let shrunk = slot.adjust_capacity(15, None).unwrap();
+    assert_eq!(shrunk.max_capacity, 15);
+    assert_eq!(shrunk.available_seats, 0);
+
+    // Grow back by +5 (15 -> 20) restores 5 open seats
+    let grown_again = slot.adjust_capacity(20, None).unwrap();
+    assert_eq!(grown_again.available_seats, 5);
+
+    // Verify ShardedMap::for_each_read visits every entry
+    let map = ShardedMap::<StudentId, i32>::with_shard_count(8).unwrap();
+    let expected: Vec<(StudentId, i32)> = (1..=12).map(|v| (StudentId::new_v4(), v)).collect();
+    for (k, v) in &expected {
+        map.insert(*k, *v);
+    }
+    let mut sum = 0;
+    let mut visited = 0;
+    map.for_each_read(|_, v| {
+        sum += *v;
+        visited += 1;
+    });
+    assert_eq!(visited, 12);
+    assert_eq!(sum, 78);
+}
+
+#[test]
+fn multithread_concurrent_reserve_and_capacity_adjust_keeps_invariants() {
+    let slot = Arc::new(
+        SectionSeatSlot::new(SectionId::new(303), 10, 10, SectionSlotState::Open, 1).unwrap(),
+    );
+    let barrier = Arc::new(Barrier::new(33));
+
+    let mut handles = Vec::new();
+    for _ in 0..32 {
+        let slot = Arc::clone(&slot);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            usize::from(slot.try_reserve().is_ok())
+        }));
+    }
+    let slot_grow = Arc::clone(&slot);
+    let barrier_grow = Arc::clone(&barrier);
+    let grow_handle = thread::spawn(move || {
+        barrier_grow.wait();
+        slot_grow.adjust_capacity(25, None).unwrap();
+        0usize
+    });
+
+    let total_reserved: usize = handles
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .sum::<usize>()
+        + grow_handle.join().unwrap();
+
+    let snap = slot.snapshot();
+    assert_eq!(snap.max_capacity, 25);
+    assert_eq!(snap.enrolled_count as usize, total_reserved);
+    assert_eq!(snap.available_seats, 25 - total_reserved as i32);
+}
