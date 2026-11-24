@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/unieee-domain",
+  "crates/unieee-events",
+  "crates/unieee-cacheline",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+rust_decimal = { version = "1", features = ["serde"] }
+parking_lot = "0.12"
+proptest = "1"
+
+unieee-domain = { path = "crates/unieee-domain" }
+unieee-events = { path = "crates/unieee-events" }
+unieee-cacheline = { path = "crates/unieee-cacheline" }
