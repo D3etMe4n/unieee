@@ -100,10 +100,23 @@ pub fn build_commit_tpl(offsets: &[PartitionOffset]) -> Result<TopicPartitionLis
     Ok(tpl)
 }
 
-async fn flush_batch_with_retry(
-    consumer: &StreamConsumer,
+pub trait OffsetCommitter: Send + Sync {
+    fn commit_offsets(&self, offsets: &[PartitionOffset]) -> Result<(), String>;
+}
+
+impl OffsetCommitter for StreamConsumer {
+    fn commit_offsets(&self, offsets: &[PartitionOffset]) -> Result<(), String> {
+        let tpl = build_commit_tpl(offsets)?;
+        self.commit(&tpl, CommitMode::Sync)
+            .map_err(|e| format!("Kafka manual offset commit failed: {e}"))
+    }
+}
+
+pub async fn flush_batch_with_retry(
+    committer: &dyn OffsetCommitter,
     processor: &WriterProcessor,
     batch: &[IncomingKafkaRecord],
+    retry_delay: Duration,
     shutdown: &mut watch::Receiver<bool>,
 ) -> bool {
     if batch.is_empty() {
@@ -115,13 +128,8 @@ async fn flush_batch_with_retry(
             Ok(_report) => {
                 processor.set_readiness(WriterReadiness::Ready);
                 let offsets = compute_commit_offsets(batch);
-                match build_commit_tpl(&offsets) {
-                    Ok(tpl) => {
-                        if let Err(err) = consumer.commit(&tpl, CommitMode::Sync) {
-                            warn!(error = %err, "Kafka manual offset commit failed after DB commit");
-                        }
-                    }
-                    Err(err) => warn!(error = %err, "failed building TopicPartitionList"),
+                if let Err(err) = committer.commit_offsets(&offsets) {
+                    warn!(error = %err, "Kafka manual offset commit failed after DB commit");
                 }
                 return true;
             }
@@ -138,7 +146,7 @@ async fn flush_batch_with_retry(
                             return false;
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    _ = tokio::time::sleep(retry_delay) => {}
                 }
             }
         }
@@ -172,79 +180,55 @@ pub fn spawn_writer_consumer_loop(
 
         let mut acc = BatchAccumulator::new(batch_size);
         let mut deadline: Option<tokio::time::Instant> = None;
+        let retry_delay = Duration::from_millis(500);
 
         loop {
             if *shutdown.borrow() {
                 break;
             }
 
-            if let Some(dl) = deadline {
-                tokio::select! {
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            break;
-                        }
-                    }
-                    _ = tokio::time::sleep_until(dl) => {
-                        let batch = acc.take_batch();
-                        deadline = None;
-                        if !flush_batch_with_retry(&consumer, &processor, &batch, &mut shutdown).await {
-                            break;
-                        }
-                    }
-                    recv = consumer.recv() => {
-                        match recv {
-                            Ok(msg) => {
-                                acc.push(extract_incoming_record(
-                                    msg.topic(),
-                                    msg.partition(),
-                                    msg.offset(),
-                                    msg.payload(),
-                                ));
-                                if acc.is_full() {
-                                    let batch = acc.take_batch();
-                                    deadline = None;
-                                    if !flush_batch_with_retry(&consumer, &processor, &batch, &mut shutdown).await {
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                warn!(error = %err, "Kafka writer consumer recv error");
-                                tokio::time::sleep(Duration::from_millis(200)).await;
-                            }
-                        }
+            let wait_deadline = async {
+                match deadline {
+                    Some(dl) => tokio::time::sleep_until(dl).await,
+                    None => std::future::pending().await,
+                }
+            };
+
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
                     }
                 }
-            } else {
-                tokio::select! {
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            break;
-                        }
+                _ = wait_deadline => {
+                    let batch = acc.take_batch();
+                    deadline = None;
+                    if !flush_batch_with_retry(&consumer, &processor, &batch, retry_delay, &mut shutdown).await {
+                        break;
                     }
-                    recv = consumer.recv() => {
-                        match recv {
-                            Ok(msg) => {
-                                acc.push(extract_incoming_record(
-                                    msg.topic(),
-                                    msg.partition(),
-                                    msg.offset(),
-                                    msg.payload(),
-                                ));
-                                if acc.is_full() {
-                                    let batch = acc.take_batch();
-                                    if !flush_batch_with_retry(&consumer, &processor, &batch, &mut shutdown).await {
-                                        break;
-                                    }
-                                } else {
-                                    deadline = Some(tokio::time::Instant::now() + batch_timeout);
+                }
+                recv = consumer.recv() => {
+                    match recv {
+                        Ok(msg) => {
+                            acc.push(extract_incoming_record(
+                                msg.topic(),
+                                msg.partition(),
+                                msg.offset(),
+                                msg.payload(),
+                            ));
+                            if acc.is_full() {
+                                let batch = acc.take_batch();
+                                deadline = None;
+                                if !flush_batch_with_retry(&consumer, &processor, &batch, retry_delay, &mut shutdown).await {
+                                    break;
                                 }
+                            } else if deadline.is_none() {
+                                deadline = Some(tokio::time::Instant::now() + batch_timeout);
                             }
-                            Err(err) => {
-                                warn!(error = %err, "Kafka writer consumer recv error");
-                                tokio::time::sleep(Duration::from_millis(200)).await;
-                            }
+                        }
+                        Err(err) => {
+                            warn!(error = %err, "Kafka writer consumer recv error");
+                            tokio::time::sleep(Duration::from_millis(200)).await;
                         }
                     }
                 }
@@ -255,9 +239,7 @@ pub fn spawn_writer_consumer_loop(
             let batch = acc.take_batch();
             if let Ok(_report) = processor.process_kafka_records(&batch, Utc::now()).await {
                 let offsets = compute_commit_offsets(&batch);
-                if let Ok(tpl) = build_commit_tpl(&offsets) {
-                    let _ = consumer.commit(&tpl, CommitMode::Sync);
-                }
+                let _ = consumer.commit_offsets(&offsets);
             }
         }
     })
