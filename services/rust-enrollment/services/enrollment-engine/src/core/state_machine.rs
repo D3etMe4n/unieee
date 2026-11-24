@@ -414,6 +414,10 @@ impl EnrollmentEngine {
         sub: &str,
         claimed_student_id: Option<StudentId>,
     ) -> Result<StudentId, EngineError> {
+        let readiness = self.readiness();
+        if readiness != EngineReadiness::Ready {
+            return Err(EngineError::NotReady(readiness));
+        }
         let catalog = self.catalog.load();
         if let Some(&mapped_id) = catalog.sub_to_student.get(sub) {
             if let Some(claimed) = claimed_student_id {

@@ -15,12 +15,17 @@ CORE_CRATES = {"unieee-domain", "unieee-events", "unieee-cacheline"}
 
 def classify_component(filename: str) -> tuple[str, str] | None:
     norm = filename.replace("\\", "/")
-    if "/crates/" in norm and "/src/" in norm:
-        crate = norm.split("/crates/", 1)[1].split("/", 1)[0]
+    if "/rust-enrollment/" in norm:
+        norm = norm.split("/rust-enrollment/", 1)[1]
+    if "crates/" in norm and "/src/" in norm:
+        crate = norm.split("crates/", 1)[1].split("/", 1)[0]
         return ("core", crate)
-    if "/services/" in norm and "/src/" in norm:
-        service = norm.split("/services/", 1)[1].split("/", 1)[0]
-        return ("service", service)
+    if "services/" in norm and "/src/" in norm:
+        after = norm.split("services/", 1)[1]
+        service, rel_src = after.split("/src/", 1)
+        if rel_src.startswith("core/"):
+            return ("core", f"{service}::core")
+        return ("service", f"{service}::edge")
     return None
 
 

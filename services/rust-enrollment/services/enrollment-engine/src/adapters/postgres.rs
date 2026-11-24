@@ -101,6 +101,119 @@ pub struct RawCourseRow {
     pub credits: i32,
 }
 
+#[derive(Debug, Clone)]
+pub struct RawPrerequisiteRow {
+    pub course_id: Uuid,
+    pub required_course_id: Uuid,
+    pub relation_type: String,
+    pub min_grade: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RawEventRow {
+    pub seq: i64,
+    pub event_id: Uuid,
+    pub term_id: Uuid,
+    pub student_id: Uuid,
+    pub section_id: i64,
+    pub event_type: String,
+    pub status: String,
+    pub reason_code: Option<String>,
+    pub engine_epoch: i64,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+pub fn build_prerequisites(
+    raw_prereqs: &[RawPrerequisiteRow],
+) -> Result<Vec<CoursePrerequisiteEdge>, String> {
+    let mut out = Vec::with_capacity(raw_prereqs.len());
+    for r in raw_prereqs {
+        let rel = parse_prereq_relation(&r.relation_type)?;
+        let min_grade = match r.min_grade.as_deref() {
+            Some(g) if !g.trim().is_empty() => {
+                Some(GradeRank::from_code(g).map_err(|e| e.to_string())?)
+            }
+            _ => None,
+        };
+        out.push(CoursePrerequisiteEdge {
+            course_id: CourseId::from_uuid(r.course_id),
+            required_course_id: CourseId::from_uuid(r.required_course_id),
+            relation_type: rel,
+            min_grade,
+        });
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_preload_dataset(
+    term_id: TermId,
+    term_code: String,
+    term_status: &str,
+    checkpoint_seq: i64,
+    max_epoch: i64,
+    policy: PolicySnapshotPayload,
+    raw_courses: &[RawCourseRow],
+    raw_sections: &[RawSectionRow],
+    raw_prereqs: &[RawPrerequisiteRow],
+    raw_students: &[RawStudentRow],
+    raw_results: &[RawCourseResultRow],
+    raw_enrollments: &[RawEnrollmentRow],
+) -> Result<PreloadDataset, String> {
+    let sections = build_section_metas(raw_sections, raw_courses)?;
+    let prerequisites = build_prerequisites(raw_prereqs)?;
+    let students = build_student_states_from_rows(
+        raw_students,
+        raw_results,
+        raw_enrollments,
+        &sections,
+        &policy,
+    )?;
+    let gate_state = if term_status.eq_ignore_ascii_case("REGISTRATION_OPEN") {
+        GateState::Open
+    } else {
+        GateState::ReadyPreloaded
+    };
+    let active_window_id = policy
+        .windows
+        .iter()
+        .find(|w| w.status == WindowStatus::Active)
+        .and_then(|w| w.id);
+
+    Ok(PreloadDataset {
+        term_id,
+        term_code,
+        checkpoint_seq,
+        engine_epoch: u64::try_from(max_epoch.max(1)).unwrap_or(1),
+        gate_state,
+        active_window_id,
+        policy,
+        sections,
+        prerequisites,
+        students,
+        created_at: Utc::now(),
+    })
+}
+
+pub fn build_replay_records(raw_rows: &[RawEventRow]) -> Result<Vec<ReplayEventRecord>, String> {
+    let mut records = Vec::with_capacity(raw_rows.len());
+    for r in raw_rows {
+        records.push(ReplayEventRecord {
+            seq: r.seq,
+            event_id: EventId::from_uuid(r.event_id),
+            term_id: TermId::from_uuid(r.term_id),
+            student_id: StudentId::from_uuid(r.student_id),
+            section_id: SectionId::try_from_pg(r.section_id).map_err(|e| e.to_string())?,
+            event_type: parse_event_type(&r.event_type)?,
+            status: parse_event_status(&r.status)?,
+            reason_code: r.reason_code.clone(),
+            engine_epoch: u64::try_from(r.engine_epoch.max(0)).unwrap_or(0),
+            created_at: r.created_at,
+        });
+    }
+    Ok(records)
+}
+
 #[async_trait]
 impl PreloadSource for PgPreloadAndReplayAdapter {
     async fn load_term_dataset(
@@ -190,23 +303,15 @@ impl PreloadSource for PgPreloadAndReplayAdapter {
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| format!("query catalog.course_prerequisites failed: {e}"))?;
-        let mut prerequisites = Vec::with_capacity(prereq_rows.len());
-        for r in prereq_rows {
-            let rel = parse_prereq_relation(r.get::<String, _>("relation_type").as_str())?;
-            let min_grade_raw: Option<String> = r.try_get("min_grade").ok();
-            let min_grade = match min_grade_raw {
-                Some(ref g) if !g.trim().is_empty() => {
-                    Some(GradeRank::from_code(g).map_err(|e| e.to_string())?)
-                }
-                _ => None,
-            };
-            prerequisites.push(CoursePrerequisiteEdge {
-                course_id: CourseId::from_uuid(r.get("course_id")),
-                required_course_id: CourseId::from_uuid(r.get("required_course_id")),
-                relation_type: rel,
-                min_grade,
-            });
-        }
+        let raw_prereqs: Vec<RawPrerequisiteRow> = prereq_rows
+            .into_iter()
+            .map(|r| RawPrerequisiteRow {
+                course_id: r.get("course_id"),
+                required_course_id: r.get("required_course_id"),
+                relation_type: r.get("relation_type"),
+                min_grade: r.try_get("min_grade").ok(),
+            })
+            .collect();
 
         let student_rows = sqlx::query(
             "SELECT id, student_code, keycloak_sub, cohort_code, faculty_code, academic_status, \
@@ -302,38 +407,20 @@ impl PreloadSource for PgPreloadAndReplayAdapter {
             .await
             .map_err(|e| format!("commit preload tx failed: {e}"))?;
 
-        let sections = build_section_metas(&raw_sections, &raw_courses)?;
-        let students = build_student_states_from_rows(
+        assemble_preload_dataset(
+            resolved_term_id,
+            resolved_term_code,
+            &term_status,
+            checkpoint_seq,
+            max_epoch,
+            policy,
+            &raw_courses,
+            &raw_sections,
+            &raw_prereqs,
             &raw_students,
             &raw_results,
             &raw_enrollments,
-            &sections,
-            &policy,
-        )?;
-        let gate_state = if term_status.eq_ignore_ascii_case("REGISTRATION_OPEN") {
-            GateState::Open
-        } else {
-            GateState::ReadyPreloaded
-        };
-        let active_window_id = policy
-            .windows
-            .iter()
-            .find(|w| w.status == WindowStatus::Active)
-            .and_then(|w| w.id);
-
-        Ok(PreloadDataset {
-            term_id: resolved_term_id,
-            term_code: resolved_term_code,
-            checkpoint_seq,
-            engine_epoch: u64::try_from(max_epoch.max(1)).unwrap_or(1),
-            gate_state,
-            active_window_id,
-            policy,
-            sections,
-            prerequisites,
-            students,
-            created_at: Utc::now(),
-        })
+        )
     }
 }
 
@@ -360,23 +447,22 @@ impl FallbackEventLogSource for PgPreloadAndReplayAdapter {
         .await
         .map_err(|e| format!("fallback keyset replay query failed: {e}"))?;
 
-        let mut records = Vec::with_capacity(rows.len());
-        for r in rows {
-            records.push(ReplayEventRecord {
+        let raw_rows: Vec<RawEventRow> = rows
+            .into_iter()
+            .map(|r| RawEventRow {
                 seq: r.get("seq"),
-                event_id: EventId::from_uuid(r.get("event_id")),
-                term_id: TermId::from_uuid(r.get("term_id")),
-                student_id: StudentId::from_uuid(r.get("student_id")),
-                section_id: SectionId::try_from_pg(r.get::<i64, _>("section_id"))
-                    .map_err(|e| e.to_string())?,
-                event_type: parse_event_type(r.get::<String, _>("event_type").as_str())?,
-                status: parse_event_status(r.get::<String, _>("status").as_str())?,
+                event_id: r.get("event_id"),
+                term_id: r.get("term_id"),
+                student_id: r.get("student_id"),
+                section_id: r.get("section_id"),
+                event_type: r.get("event_type"),
+                status: r.get("status"),
                 reason_code: r.get("reason_code"),
-                engine_epoch: u64::try_from(r.get::<i64, _>("engine_epoch").max(0)).unwrap_or(0),
+                engine_epoch: r.get("engine_epoch"),
                 created_at: r.get("created_at"),
-            });
-        }
-        Ok(records)
+            })
+            .collect();
+        build_replay_records(&raw_rows)
     }
 }
 
