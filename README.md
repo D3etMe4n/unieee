@@ -19,18 +19,37 @@
 
 ---
 
+## Documentation
+
+Public guides for repository visitors, operators, and contributors live under `guides/` (in both **English** and **Tiếng Việt**):
+
+- **[Public Documentation Hub (English)](./guides/README.md)** | [Trung tâm Tài liệu (Tiếng Việt)](./guides/README.vi.md)
+- [Getting Started & Local Ops](./guides/en/getting-started.md) — prerequisites, `scripts/unieee.sh` usage, Keycloak dev tokens, and running `./gradlew check`.
+- [System Architecture & Database Design](./guides/en/architecture.md) — Hybrid Warm/Hot Path, 4 Bounded Contexts + `common` DAG, PostgreSQL schemas (`V001`–`V005`), Single-Writer Gate Guard, and Multi-University Policy Engine.
+- [REST API Reference](./guides/en/api-reference.md) — RBAC roles, RFC 7807 errors, and all implemented endpoints across `common`, `catalog`, `account`, and `registration`.
+- [Implementation Roadmap & Testing](./guides/en/roadmap-and-testing.md) — 12-phase delivery status (Phases 1–5 completed), tiered coverage policy (`>= 90%` core, `>= 65%` edge), and CI guardrails.
+
+---
+
 ## Architecture Overview
 
 - **Warm / Cold Path — Spring Boot 4.1.2 Modular Monolith (`services/core-java/`):**
-  - Manages curricula, courses, prerequisites, academic terms, course sections, wish surveys, a multi-institution Policy Engine, registration window administration, and an AI course & schedule advisor (`ai_advisor`).
-  - Built with **Java 21 (Virtual Threads)**, **Spring Modulith** (Event Publication Registry + Scheduled Cleanup Job), **Spring Data JPA**, **Flyway**, **Spring Security** (Keycloak OIDC 1.0 / OAuth 2.0 / JWT), **MapStruct**, and **Spring AI** (strictly read-only tools & guardrails).
-- **Hot Path — Rust Service Cluster (`services/rust-enrollment/`):**
+  - Organized as **4 Bounded Contexts** (`catalog`, `account`, `registration`, and planned Phase 10 `ai_advisor`) over an open shared kernel (`common`) with a strict 1-way linear dependency DAG verified by Spring Modulith and schema-per-bounded-context PostgreSQL isolation (`V001`–`V005`).
+  - Manages academic terms, faculties/majors/curricula, courses & DAG prerequisites, course sections with 20-week bitmask schedules, Keycloak account provisioning, credit-weighted GPA, admin enrollment overrides protected by a **Single-Writer Gate Guard** (`409 REGISTRATION_GATE_OPEN` when `REGISTRATION_OPEN`), non-seat-reserving wish surveys, registration wave windows, and a configurable **Multi-University Policy Engine** with SHA-256 snapshot export (`unieee:cache:policy:{termId}:snapshot`).
+  - Built with **Java 21 (Virtual Threads)**, **Spring Modulith** (Event Publication Registry + Cleanup Job), **Spring Data JPA**, **Flyway**, **Spring Security** (Keycloak OIDC 1.0 / OAuth 2.0 / JWT), **MapStruct**, and upcoming **Spring AI** (`ai_advisor`).
+- **Hot Path — Rust Service Cluster (`services/rust-enrollment/` — Planned Phases 6–9):**
   - **Enrollment State-Machine (`enrollment-engine`, Axum + Tokio):** Holds registration state in RAM using *cache-line* aligned structures (`#[repr(align(64))]`), per-student sharding, lock-free atomic seat reservations, and `O(1)` **Bitmask** schedule conflict checks; publishes events to **Kafka (KRaft)** and supports state recovery via event replay and Active–Standby failover.
   - **Writer / Commit Service (`enrollment-writer`):** Consumes Kafka batches, validates and commits durably to **PostgreSQL** (via **PgBouncer**) using `UNNEST` + Atomic `UPDATE` + `CHECK` constraints; updates **Redis HA** (Read Cache & Pub/Sub) and emits compensating **Revert** events if PostgreSQL rejects a record.
   - **SSE Live-Update Service (`sse-gateway`, Axum + Tokio):** Streams real-time seat availability and registration outcomes via Server-Sent Events.
 - **Infrastructure & Security (`infra/`, `scripts/`):**
   - Sits behind a **Reverse Proxy** (TLS termination, routing, rate limiting) and **Keycloak** (self-registration disabled; accounts are provisioned by Academic Affairs).
   - Containerized with **Podman Compose** (default) and **Docker Compose** (fallback), without Kubernetes; supports toggling the hot-path cluster cyclically (`prepare-registration`, `open-registration`, `close-registration`).
+
+---
+
+## Implementation Progress
+
+**Phases 1–5 are completed and merged into `dev`** (monorepo & container infrastructure, Spring Boot 4.1.2 Modulith core, `catalog`/`account`/`registration` bounded contexts with `V001`–`V005`, wish surveys, registration windows, and multi-university Policy Engine + snapshot export). **Phases 6–12** (Rust Hot Path cluster, Spring AI advisor, HA failover drills, and k6 load testing) follow next — see [Implementation Roadmap & Testing](./guides/en/roadmap-and-testing.md).
 
 ---
 
@@ -60,9 +79,14 @@
 
 ```text
 unieee/
+├── guides/                      # Public bilingual reader documentation (EN & VI)
+│   ├── README.md                # English documentation hub
+│   ├── README.vi.md             # Vietnamese documentation hub
+│   ├── en/                      # English guides (setup, architecture, API, roadmap)
+│   └── vi/                      # Vietnamese guides
 ├── services/
-│   ├── core-java/               # Spring Boot 4.1.2 Modular Monolith
-│   └── rust-enrollment/         # Rust Cargo Workspace (crates/ + services/)
+│   ├── core-java/               # Spring Boot 4.1.2 Modular Monolith (common, catalog, account, registration)
+│   └── rust-enrollment/         # Rust Cargo Workspace (crates/ + services/) [Phases 6-9]
 ├── infra/
 │   ├── compose.base.yml         # Base stack (core profile)
 │   ├── compose.hotpath.yml      # High-throughput registration stack (hot-path)

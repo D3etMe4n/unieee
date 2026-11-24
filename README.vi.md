@@ -19,18 +19,37 @@
 
 ---
 
+## Tài liệu Hướng dẫn
+
+Bộ tài liệu công khai dành cho người xem repository và cộng tác viên được đặt trong thư mục `guides/` (hỗ trợ song ngữ **Tiếng Việt** và **English**):
+
+- **[Trung tâm Tài liệu (Tiếng Việt)](./guides/README.vi.md)** | [Public Documentation Hub (English)](./guides/README.md)
+- [Hướng dẫn Khởi chạy & Vận hành Cục bộ](./guides/vi/getting-started.md) — yêu cầu môi trường, dùng `scripts/unieee.sh`, lấy JWT Keycloak dev và chạy `./gradlew check`.
+- [Kiến trúc Hệ thống & Thiết kế CSDL](./guides/vi/architecture.md) — kiến trúc lai Warm/Hot Path, 4 Bounded Contexts + `common` (DAG 1 chiều), PostgreSQL Schema-per-Bounded-Context (`V001`–`V005`), Single-Writer Gate Guard và Policy Engine đa trường.
+- [Tài liệu REST API](./guides/vi/api-reference.md) — phân quyền RBAC, chuẩn lỗi RFC 7807 và toàn bộ endpoint đã triển khai trên `common`, `catalog`, `account`, `registration`.
+- [Lộ trình 12 Phases & Chiến lược Kiểm thử](./guides/vi/roadmap-and-testing.md) — tiến độ 12 phases (Phases 1–5 hoàn thành), chính sách coverage phân tầng (`>= 90%` core, `>= 65%` tầng biên) và CI guardrails.
+
+---
+
 ## Kiến trúc Tổng quan
 
 - **Warm / Cold Path — Spring Boot 4.1.2 Modular Monolith (`services/core-java/`):**
-  - Quản lý chương trình khung, môn học, điều kiện tiên quyết, học kỳ, lớp học phần, khảo sát nguyện vọng, Policy Engine đa trường, quản trị cổng đăng ký và trợ lý AI tư vấn & xếp lịch (`ai_advisor`).
-  - Dùng **Java 21 (Virtual Threads)**, **Spring Modulith** (Event Publication Registry + Cleanup Job), **Spring Data JPA**, **Flyway**, **Spring Security** (Keycloak OIDC 1.0 / OAuth 2.0 / JWT), **MapStruct**, **Spring AI** (chỉ read-only tools & guardrails).
-- **Hot Path — Cụm dịch vụ Rust (`services/rust-enrollment/`):**
+  - Tổ chức thành **4 Bounded Contexts** (`catalog`, `account`, `registration` và `ai_advisor` dự kiến ở Phase 10) trên shared kernel `common` với đồ thị phụ thuộc tuyến tính 1 chiều (Spring Modulith verify) và phân tách PostgreSQL Schema-per-Bounded-Context (`V001`–`V005`).
+  - Quản lý học kỳ, khoa/ngành/chương trình khung, môn học & tiên quyết DFS, lớp học phần với lịch Bitmask 20 tuần, cấp phát tài khoản Keycloak, GPA trọng số tín chỉ, Admin Override có **Single-Writer Gate Guard** (`409 REGISTRATION_GATE_OPEN` khi `REGISTRATION_OPEN`), khảo sát nguyện vọng không giữ ghế, đợt mở cổng và **Policy Engine đa trường** kèm SHA-256 snapshot exporter (`unieee:cache:policy:{termId}:snapshot`).
+  - Dùng **Java 21 (Virtual Threads)**, **Spring Modulith** (Event Publication Registry + Cleanup Job), **Spring Data JPA**, **Flyway**, **Spring Security** (Keycloak OIDC 1.0 / OAuth 2.0 / JWT), **MapStruct** và **Spring AI** dự kiến (`ai_advisor`).
+- **Hot Path — Cụm dịch vụ Rust (`services/rust-enrollment/` — Dự kiến Phases 6–9):**
   - **Enrollment State-Machine (`enrollment-engine`, Axum + Tokio):** Giữ state đăng ký trong RAM với cấu trúc dữ liệu căn lề *cache-line* (`#[repr(align(64))]`), sharding theo sinh viên, trừ ghế nguyên tử lock-free và kiểm tra trùng lịch `O(1)` bằng **Bitmask**; đẩy sự kiện sang **Kafka (KRaft)** và hỗ trợ phục hồi qua replay/Active–Standby failover.
   - **Writer / Commit Service (`enrollment-writer`):** Đọc batch từ Kafka, xác thực và ghi bền vững vào **PostgreSQL** (qua **PgBouncer**) bằng `UNNEST` + Atomic `UPDATE` + `CHECK` constraint; đồng bộ **Redis HA** (Read Cache & Pub/Sub) và phát sự kiện hoàn tác (**Revert**) nếu DB từ chối.
   - **SSE Live-Update Service (`sse-gateway`, Axum + Tokio):** Đẩy biến động chỗ ngồi và kết quả đăng ký thời gian thực qua Server-Sent Events.
 - **Hạ tầng & Bảo mật (`infra/`, `scripts/`):**
   - Đứng sau **Reverse Proxy** (TLS termination, routing, rate limiting) và **Keycloak** (tắt self-registration, tài khoản do Phòng Đào tạo cấp).
   - Đóng gói bằng **Podman Compose** (mặc định) và **Docker Compose** (fallback), không cần Kubernetes; hỗ trợ bật/tắt cụm đăng ký nóng theo chu kỳ (`prepare-registration`, `open-registration`, `close-registration`).
+
+---
+
+## Tiến độ Triển khai
+
+**Phases 1–5 đã hoàn thành và merge vào `dev`** (monorepo & hạ tầng container, nền tảng Spring Boot 4.1.2 Modulith, các Bounded Contexts `catalog`/`account`/`registration` cùng migrations `V001`–`V005`, khảo sát nguyện vọng, đợt mở cổng và Policy Engine đa trường + snapshot export). **Phases 6–12** (cụm Rust Hot Path, trợ lý Spring AI, diễn tập failover HA và load test k6) đang ở các bước tiếp theo — xem chi tiết tại [Lộ trình 12 Phases & Chiến lược Kiểm thử](./guides/vi/roadmap-and-testing.md).
 
 ---
 
@@ -60,9 +79,14 @@
 
 ```text
 unieee/
+├── guides/                      # Tài liệu hướng dẫn công khai song ngữ (EN & VI)
+│   ├── README.md                # Trung tâm tài liệu Tiếng Anh
+│   ├── README.vi.md             # Trung tâm tài liệu Tiếng Việt
+│   ├── en/                      # Tài liệu Tiếng Anh (cài đặt, kiến trúc, API, lộ trình)
+│   └── vi/                      # Tài liệu Tiếng Việt
 ├── services/
-│   ├── core-java/               # Spring Boot 4.1.2 Modular Monolith
-│   └── rust-enrollment/         # Rust Cargo Workspace (crates/ + services/)
+│   ├── core-java/               # Spring Boot 4.1.2 Modular Monolith (common, catalog, account, registration)
+│   └── rust-enrollment/         # Rust Cargo Workspace (crates/ + services/) [Phases 6-9]
 ├── infra/
 │   ├── compose.base.yml         # Stack cơ bản (core profile)
 │   ├── compose.hotpath.yml      # Stack đăng ký hiệu năng cao (hot-path)
