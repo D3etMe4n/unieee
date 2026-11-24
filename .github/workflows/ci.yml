@@ -124,3 +124,39 @@ jobs:
           path: |
             services/core-java/build/reports/tests/test
             services/core-java/build/reports/jacoco/test
+
+  rust-enrollment:
+    name: Rust Hot Path Workspace
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+
+      - name: Cache Cargo workspace
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services/rust-enrollment
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Check formatting and Clippy lints
+        working-directory: services/rust-enrollment
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run workspace unit, property, and concurrency tests
+        working-directory: services/rust-enrollment
+        run: cargo test --workspace
+
+      - name: Enforce tiered Rust line coverage
+        working-directory: services/rust-enrollment
+        run: |
+          cargo llvm-cov --workspace --json --output-path target/llvm-cov.json
+          python3 ci/check_coverage.py target/llvm-cov.json
