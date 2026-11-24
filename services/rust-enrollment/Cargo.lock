@@ -723,6 +723,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "unieee-events"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "unieee-domain",
+ "uuid",
+]
+
+[[package]]
 name = "uuid"
 version = "1.29.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
