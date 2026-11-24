@@ -13,7 +13,40 @@ All HTTP endpoints are served behind the **Reverse Proxy** (`https://localhost:8
   - `STUDENT`
   - `LECTURER`
   - `ACADEMIC_ADMIN`
-- **Error Responses (RFC 7807 `ProblemDetail`):** Business and validation failures return `application/problem+json` containing `title`, `status`, `detail`, `instance`, `errorCode`, and `timestamp` (plus field errors on `400 Bad Request`).
+- **Error Responses (Unified RFC 9457 `ProblemDetail` — `application/problem+json`):** Both **Warm Path (`core-java`)** and **Hot Path (`rust-enrollment`: `enrollment-engine`, planned `sse-gateway`)** standardize all HTTP failures (auth/JWT, RBAC/IDOR, JSON/validation, gate guard, rule rejections, 404/405, and internal errors) to **RFC 9457**:
+  - `Content-Type: application/problem+json`
+  - Standard fields: `type` (`"urn:unieee:error:<ERROR_CODE>"`), `title`, `status`, `detail`, `instance` (request URI path), `errorCode`, `timestamp` (ISO-8601 UTC), plus `errors` (field map on `400 VALIDATION_FAILED` / `CONSTRAINT_VIOLATION`).
+
+  **Warm Path Example (`core-java` — `400 Bad Request`):**
+
+  ```json
+  {
+    "type": "urn:unieee:error:VALIDATION_FAILED",
+    "title": "Validation Error",
+    "status": 400,
+    "detail": "Request validation failed",
+    "instance": "/api/v1/courses",
+    "errorCode": "VALIDATION_FAILED",
+    "errors": {
+      "code": "code must not be blank"
+    },
+    "timestamp": "2026-11-25T00:15:00.123456Z"
+  }
+  ```
+
+  **Hot Path Example (`enrollment-engine` — `409 Conflict`):**
+
+  ```json
+  {
+    "type": "urn:unieee:error:SECTION_FULL",
+    "title": "Conflict",
+    "status": 409,
+    "detail": "Section 701 has no available seats remaining",
+    "instance": "/api/v1/enrollments/register",
+    "errorCode": "SECTION_FULL",
+    "timestamp": "2026-11-25T00:15:01.456789Z"
+  }
+  ```
 
 ---
 
@@ -111,7 +144,7 @@ All HTTP endpoints are served behind the **Reverse Proxy** (`https://localhost:8
 
 ## 3. Reserved Edge Routes (Upcoming Phases 7–10)
 
-The Reverse Proxy ([unieee-routes.conf](../../infra/reverse-proxy/snippets/unieee-routes.conf)) already reserves these prefixes outside `core-java` CRUD:
-- `/api/v1/enrollments/*` -> **Rust `enrollment-engine`** (Active/Standby failover, Phases 7–8)
+The Reverse Proxy ([unieee-routes.conf](../../infra/reverse-proxy/snippets/unieee-routes.conf)) already reserves these prefixes outside `core-java` CRUD (all returning the same RFC 9457 `application/problem+json` error format):
+- `/api/v1/enrollments/*` -> **Rust `enrollment-engine`** (Active/Standby failover, Phase 7+)
 - `/api/v1/sse/*` -> **Rust `sse-gateway`** (buffering disabled, Phase 9)
 - `/api/v1/ai/*` -> **`core-java` `ai_advisor`** (strict rate limit, Phase 10)

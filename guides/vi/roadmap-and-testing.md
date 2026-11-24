@@ -12,7 +12,7 @@
 | :--- | :--- | :--- |
 | **Phase 1** | Cấu trúc monorepo, `.gitignore`, `.editorconfig`, tài liệu gốc | **Hoàn thành** (`dev`) |
 | **Phase 2** | Hạ tầng Podman/Docker Compose, PostgreSQL, PgBouncer, Redis HA (Sentinel), Keycloak, Reverse Proxy (3 chế độ TLS), CLI `scripts/unieee.sh` | **Hoàn thành** (`dev`) |
-| **Phase 3** | Nền tảng Spring Boot 4.1.2 + Java 21 Virtual Threads, Spring Modulith Outbox & Cleanup Job, JWT Security, RFC 7807 `ProblemDetail`, JaCoCo CI | **Hoàn thành** (`dev`) |
+| **Phase 3** | Nền tảng Spring Boot 4.1.2 + Java 21 Virtual Threads, Spring Modulith Outbox & Cleanup Job, JWT Security, RFC 9457 `ProblemDetail`, JaCoCo CI | **Hoàn thành** (`dev`) |
 | **Phase 4** | Tổ chức 4 Bounded Contexts (`common`, `catalog`, `account`, `registration`), PostgreSQL schemas (`V002`–`V004`), cấp phát Keycloak, GPA trọng số tín chỉ, Admin Override + Single-Writer Gate Guard | **Hoàn thành** (`dev`) |
 | **Phase 5** | Khảo sát nguyện vọng (không giữ ghế), quản lý đợt đăng ký (`RegistrationWindow`), Policy Engine đa trường (6 rules), SHA-256 Policy Snapshot Exporter + Redis Read Cache (`V005`) | **Hoàn thành** (`dev`) |
 | **Phase 6** | Rust Cargo Workspace (`services/rust-enrollment/`), `unieee-domain` (Bitmask Engine + `proptest`), `unieee-events`, `unieee-cacheline` (`#[repr(align(64))]`) | *Kế hoạch* |
@@ -32,7 +32,7 @@ Thay vì áp một ngưỡng coverage đồng nhất lên mọi file (dễ dẫn
 | Tầng Kiến trúc | Ngưỡng Line Coverage Tối thiểu | Phạm vi Áp dụng | Trọng tâm Kiểm thử |
 | :--- | :--- | :--- | :--- |
 | **Nghiệp vụ Cốt lõi & Bảo mật** | **`>= 90%`** *(mục tiêu 90%–95%)* | Java: `common.security`, `*.internal.domain*` (Rich Entities & `@Embeddable` VOs), `registration.internal.service.policy*`, `ai_advisor` guardrails/bitmask (Phase 10).<br>Rust *(Phases 6–8)*: `unieee-domain`, `unieee-cacheline`, logic CAS/replay/revert. | Unit test JUnit 5 chuyên sâu và property-based testing (`proptest`) cho mọi giá trị biên, chuyển trạng thái, biến thể quy chế đa trường và bảo mật. |
-| **Tầng Biên, Hạ tầng & Tích hợp** | **`>= 65%`** *(mục tiêu 65%–75%)* | Java: `controller`, `config`, `exception`, `outbox`, `cache`, repositories, CRUD services.<br>Rust *(Phases 7–9)*: Axum handlers, Kafka/PgBouncer/Redis adapters. | Integration test đầu cuối qua `@ApplicationModuleTest` + `MockMvc` + Testcontainers PostgreSQL kiểm chứng migration, SQL constraints, RBAC và chuẩn lỗi HTTP. |
+| **Tầng Biên, Hạ tầng & Tích hợp** | **`>= 65%`** *(mục tiêu 65%–75%)* | Java: `controller`, `config`, `exception`, `outbox`, `cache`, repositories, CRUD services.<br>Rust *(Phases 7–9)*: Axum handlers, Kafka/PgBouncer/Redis adapters. | Integration test đầu cuối qua `@ApplicationModuleTest` + `MockMvc` + Testcontainers PostgreSQL và Axum kiểm chứng migration, SQL constraints, RBAC và chuẩn lỗi HTTP RFC 9457 (`application/problem+json`). |
 
 *(Các record DTO, MapStruct mapper tự sinh, `@MappedSuperclass` nền và `UnieeeApplication` được loại trừ khỏi phép đo JaCoCo.)*
 

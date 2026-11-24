@@ -26,7 +26,7 @@ Public guides for repository visitors, operators, and contributors live under `g
 - **[Public Documentation Hub (English)](./guides/README.md)** | [Trung tâm Tài liệu (Tiếng Việt)](./guides/README.vi.md)
 - [Getting Started & Local Ops](./guides/en/getting-started.md) — prerequisites, `scripts/unieee.sh` usage, Keycloak dev tokens, and running `./gradlew check`.
 - [System Architecture & Database Design](./guides/en/architecture.md) — Hybrid Warm/Hot Path, 4 Bounded Contexts + `common` DAG, PostgreSQL schemas (`V001`–`V005`), Single-Writer Gate Guard, and Multi-University Policy Engine.
-- [REST API Reference](./guides/en/api-reference.md) — RBAC roles, RFC 7807 errors, and all implemented endpoints across `common`, `catalog`, `account`, and `registration`.
+- [REST API Reference](./guides/en/api-reference.md) — RBAC roles, RFC 9457 Problem Details (`application/problem+json`), and all implemented endpoints across `common`, `catalog`, `account`, and `registration`.
 - [Implementation Roadmap & Testing](./guides/en/roadmap-and-testing.md) — 12-phase delivery status (Phases 1–5 completed), tiered coverage policy (`>= 90%` core, `>= 65%` edge), and CI guardrails.
 
 ---
