@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/unieee-domain",
   "crates/unieee-events",
+  "crates/unieee-cacheline",
 ]
 
 [workspace.package]
