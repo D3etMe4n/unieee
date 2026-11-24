@@ -75,3 +75,38 @@ async fn flushes_immediately_when_available_seats_hits_zero() {
     drop(handle);
     join.await.unwrap();
 }
+
+#[tokio::test]
+async fn coalescer_logs_sink_errors_and_handles_zero_window_gracefully() {
+    use std::sync::atomic::Ordering;
+    let sink = Arc::new(MockTentativeSink::default());
+    sink.fail.store(true, Ordering::Release);
+
+    let (handle, join) = spawn_coalescer(
+        Arc::clone(&sink) as Arc<dyn TentativeSeatSink>,
+        Duration::ZERO,
+        8, // below min 16 -> clamped cleanly to 16
+    );
+    let term_id = TermId::new_v4();
+    let now = Utc::now();
+
+    assert!(handle.enqueue_nonblocking(SeatTentativeEvent::new(
+        term_id,
+        SectionId::new(10),
+        0,
+        20,
+        1,
+        now
+    )));
+    assert!(handle.enqueue_nonblocking(SeatTentativeEvent::new(
+        term_id,
+        SectionId::new(11),
+        5,
+        20,
+        1,
+        now
+    )));
+    tokio::time::sleep(Duration::from_millis(70)).await;
+    drop(handle);
+    join.await.unwrap();
+}

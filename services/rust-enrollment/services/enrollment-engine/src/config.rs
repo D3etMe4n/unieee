@@ -1,7 +1,8 @@
-use crate::core::NodeRole;
+use crate::core::{BootstrapOptions, NodeRole, OidcVerifierConfig};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 use thiserror::Error;
 use unieee_domain::TermId;
 
@@ -174,6 +175,28 @@ impl EngineConfig {
             replay_throttle_ms,
             internal_ops_token,
         })
+    }
+
+    #[must_use]
+    pub fn to_verifier_config(&self) -> OidcVerifierConfig {
+        OidcVerifierConfig {
+            issuers: self.oidc_issuers.clone(),
+            audience: self.oidc_audience.clone(),
+            cache_ttl_secs: self.jwt_cache_ttl_secs,
+            max_cached_tokens_per_shard: 256,
+        }
+    }
+
+    #[must_use]
+    pub fn to_bootstrap_options(&self) -> BootstrapOptions {
+        BootstrapOptions {
+            term_id: self.term_id,
+            term_code: self.term_code.clone(),
+            configured_role: self.node_role,
+            rejoin_as_standby_on_recovery: self.rejoin_as_standby_on_recovery,
+            replay_batch_size: self.replay_batch_size,
+            replay_throttle: Duration::from_millis(self.replay_throttle_ms),
+        }
     }
 }
 

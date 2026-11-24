@@ -723,7 +723,12 @@ async fn covers_config_error_branches_api_errors_and_redis_kafka_adapter_helpers
 
     let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
     let ps_handle = spawn_pubsub_listener(backend, Arc::clone(&engine), sd_rx);
-    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    for _ in 0..40 {
+        if engine.epoch() == 9 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    }
     assert_eq!(engine.epoch(), 9);
     let _ = sd_tx.send(true);
     let _ = tokio::time::timeout(std::time::Duration::from_millis(200), ps_handle).await;
@@ -1119,4 +1124,105 @@ async fn adapters_pure_helpers_and_dispatchers_work_deterministically() {
     ))
     .unwrap();
     dispatch_pubsub_payload(&engine, REDIS_CHANNEL_SEAT_CONFIRMED, &conf_json).await;
+
+    // Cover EngineConfig::to_verifier_config / to_bootstrap_options, build_policy_from_fallback_rows, and Kafka replay helpers
+    let mut cfg_env = HashMap::new();
+    cfg_env.insert(
+        "DATABASE_URL",
+        "postgres://u:p@pgbouncer:6432/unieee".to_owned(),
+    );
+    cfg_env.insert("OIDC_JWKS_URI", "http://keycloak:8080/certs".to_owned());
+    cfg_env.insert("OIDC_ISSUER", "https://iss.test".to_owned());
+    cfg_env.insert("OIDC_AUDIENCE", "unieee-web".to_owned());
+    cfg_env.insert("TERM_ID", term_id.to_string());
+    let full_cfg = EngineConfig::from_lookup(|k| cfg_env.get(k).cloned()).unwrap();
+    let v_cfg = full_cfg.to_verifier_config();
+    assert_eq!(v_cfg.cache_ttl_secs, 30);
+    assert_eq!(v_cfg.audience.as_deref(), Some("unieee-web"));
+    let b_opts = full_cfg.to_bootstrap_options();
+    assert_eq!(b_opts.term_id, Some(term_id));
+    assert!(b_opts.rejoin_as_standby_on_recovery);
+
+    use enrollment_engine::adapters::kafka::{
+        collect_replay_payload, compute_partition_replay_ranges,
+    };
+    use enrollment_engine::adapters::postgres::{
+        build_policy_from_fallback_rows, RawPolicyRow, RawWindowRow,
+    };
+
+    let raw_pol = RawPolicyRow {
+        id: Uuid::new_v4(),
+        policy_code: "UNI_A".to_owned(),
+        min_credits: 0,
+        max_credits: 20,
+        gpa_bonus_threshold: Some(Decimal::new(350, 2)),
+        max_credits_with_bonus: Some(24),
+        enforce_credit_limit: true,
+        block_on_tuition_debt: true,
+        max_allowed_debt: Decimal::ZERO,
+        enforce_prerequisite: true,
+        min_passing_grade: "D".to_owned(),
+        allow_concurrent_for_retake: false,
+        allow_improve_passed_course: true,
+        max_grade_to_improve: "C".to_owned(),
+        max_improve_attempts: 2,
+        count_retake_in_credit_limit: true,
+        strict_no_overlap: true,
+        allow_buffer_gap_periods: 0,
+        extended_rules: serde_json::json!({}),
+    };
+    let raw_wins = vec![RawWindowRow {
+        id: Uuid::new_v4(),
+        name: "Wave 1".to_owned(),
+        status: "ACTIVE".to_owned(),
+        allowed_cohorts: serde_json::json!(["K24"]),
+        allowed_faculties: serde_json::json!([]),
+        allowed_actions: serde_json::json!(["REGISTER"]),
+        start_at: now - chrono::Duration::hours(1),
+        end_at: now + chrono::Duration::hours(4),
+    }];
+    let fb_pol = build_policy_from_fallback_rows(term_id, "2026-1", &raw_pol, &raw_wins).unwrap();
+    assert_eq!(fb_pol.policy_code, "UNI_A");
+    assert_eq!(fb_pol.windows.len(), 1);
+
+    let mut bad_pol = raw_pol.clone();
+    bad_pol.min_passing_grade = "Z".to_owned();
+    assert!(build_policy_from_fallback_rows(term_id, "2026-1", &bad_pol, &raw_wins).is_err());
+
+    let mut hw = HashMap::new();
+    hw.insert(0, 10i64);
+    hw.insert(1, 5i64);
+    hw.insert(2, 8i64);
+    let ranges = compute_partition_replay_ranges(
+        &hw,
+        &[
+            (0, rdkafka::Offset::Offset(3)),
+            (1, rdkafka::Offset::End),
+            (2, rdkafka::Offset::Beginning),
+            (99, rdkafka::Offset::Offset(0)),
+        ],
+    );
+    assert_eq!(ranges, vec![(0, 3, 10), (2, 0, 8)]);
+
+    let mut replay_batch = enrollment_engine::core::KafkaReplayBatch::default();
+    collect_replay_payload(
+        unieee_events::KAFKA_TOPIC_ENROLLMENT_COMMANDS,
+        cmd_json.as_bytes(),
+        term_id,
+        &mut replay_batch,
+    );
+    collect_replay_payload(
+        unieee_events::KAFKA_TOPIC_ENROLLMENT_DELTAS,
+        delta_json.as_bytes(),
+        term_id,
+        &mut replay_batch,
+    );
+    collect_replay_payload(
+        unieee_events::KAFKA_TOPIC_ENROLLMENT_COMMANDS,
+        b"{bad",
+        term_id,
+        &mut replay_batch,
+    );
+    assert_eq!(replay_batch.commands.len(), 1);
+    assert_eq!(replay_batch.deltas.len(), 1);
 }

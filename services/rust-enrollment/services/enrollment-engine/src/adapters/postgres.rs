@@ -466,6 +466,116 @@ impl FallbackEventLogSource for PgPreloadAndReplayAdapter {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct RawPolicyRow {
+    pub id: Uuid,
+    pub policy_code: String,
+    pub min_credits: i32,
+    pub max_credits: i32,
+    pub gpa_bonus_threshold: Option<Decimal>,
+    pub max_credits_with_bonus: Option<i32>,
+    pub enforce_credit_limit: bool,
+    pub block_on_tuition_debt: bool,
+    pub max_allowed_debt: Decimal,
+    pub enforce_prerequisite: bool,
+    pub min_passing_grade: String,
+    pub allow_concurrent_for_retake: bool,
+    pub allow_improve_passed_course: bool,
+    pub max_grade_to_improve: String,
+    pub max_improve_attempts: i32,
+    pub count_retake_in_credit_limit: bool,
+    pub strict_no_overlap: bool,
+    pub allow_buffer_gap_periods: i16,
+    pub extended_rules: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct RawWindowRow {
+    pub id: Uuid,
+    pub name: String,
+    pub status: String,
+    pub allowed_cohorts: Value,
+    pub allowed_faculties: Value,
+    pub allowed_actions: Value,
+    pub start_at: chrono::DateTime<Utc>,
+    pub end_at: chrono::DateTime<Utc>,
+}
+
+pub fn build_policy_from_fallback_rows(
+    term_id: TermId,
+    term_code: &str,
+    policy_row: &RawPolicyRow,
+    window_rows: &[RawWindowRow],
+) -> Result<PolicySnapshotPayload, String> {
+    let mut windows = Vec::with_capacity(window_rows.len());
+    for w in window_rows {
+        let allowed_cohorts: Vec<String> = serde_json::from_value(w.allowed_cohorts.clone())
+            .map_err(|e| format!("invalid allowed_cohorts JSON: {e}"))?;
+        let allowed_faculties: Vec<String> = serde_json::from_value(w.allowed_faculties.clone())
+            .map_err(|e| format!("invalid allowed_faculties JSON: {e}"))?;
+        let allowed_actions: Vec<EnrollmentAction> =
+            serde_json::from_value(w.allowed_actions.clone())
+                .map_err(|e| format!("invalid allowed_actions JSON: {e}"))?;
+        windows.push(RegistrationWindowSnapshot {
+            id: Some(WindowId::from_uuid(w.id)),
+            name: w.name.clone(),
+            status: parse_window_status(&w.status)?,
+            allowed_cohorts,
+            allowed_faculties,
+            allowed_actions,
+            start_at: w.start_at,
+            end_at: w.end_at,
+        });
+    }
+
+    let extended_rules: BTreeMap<String, Value> =
+        serde_json::from_value(policy_row.extended_rules.clone()).unwrap_or_default();
+
+    Ok(PolicySnapshotPayload {
+        schema_version: 1,
+        term_id,
+        term_code: term_code.to_owned(),
+        policy_id: Some(PolicyId::from_uuid(policy_row.id)),
+        policy_code: policy_row.policy_code.clone(),
+        snapshot_version: 0,
+        exported_at: Utc::now(),
+        credit_limit: CreditLimitPolicy {
+            enforce_credit_limit: policy_row.enforce_credit_limit,
+            min_credits: policy_row.min_credits,
+            max_credits: policy_row.max_credits,
+            gpa_bonus_threshold: policy_row.gpa_bonus_threshold,
+            max_credits_with_bonus: policy_row.max_credits_with_bonus,
+            count_retake_in_credit_limit: policy_row.count_retake_in_credit_limit,
+        },
+        tuition_hold: TuitionHoldPolicy {
+            block_on_tuition_debt: policy_row.block_on_tuition_debt,
+            max_allowed_debt: policy_row.max_allowed_debt,
+            exempt_cohorts: Vec::new(),
+            exempt_faculties: Vec::new(),
+        },
+        prerequisite: PrerequisitePolicy {
+            enforce_prerequisite: policy_row.enforce_prerequisite,
+            min_passing_grade: GradeRank::from_code(&policy_row.min_passing_grade)
+                .map_err(|e| e.to_string())?,
+            allow_concurrent_for_retake: policy_row.allow_concurrent_for_retake,
+            exempt_cohorts: Vec::new(),
+        },
+        retake_improve: RetakeImprovePolicy {
+            allow_improve_passed_course: policy_row.allow_improve_passed_course,
+            max_grade_to_improve: GradeRank::from_code(&policy_row.max_grade_to_improve)
+                .map_err(|e| e.to_string())?,
+            max_improve_attempts: policy_row.max_improve_attempts,
+        },
+        schedule_conflict: ScheduleConflictPolicy {
+            strict_no_overlap: policy_row.strict_no_overlap,
+            allow_buffer_gap_periods: u8::try_from(policy_row.allow_buffer_gap_periods.max(0))
+                .unwrap_or(0),
+        },
+        extended_rules,
+        windows,
+    })
+}
+
 async fn load_policy_fallback(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     term_id: TermId,
@@ -486,6 +596,28 @@ async fn load_policy_fallback(
     .map_err(|e| format!("query active enrollment_policy failed: {e}"))?
     .ok_or_else(|| format!("no active policy or policy snapshot for term {term_code}"))?;
 
+    let raw_policy = RawPolicyRow {
+        id: policy_row.get("id"),
+        policy_code: policy_row.get("policy_code"),
+        min_credits: policy_row.get("min_credits"),
+        max_credits: policy_row.get("max_credits"),
+        gpa_bonus_threshold: policy_row.get("gpa_bonus_threshold"),
+        max_credits_with_bonus: policy_row.get("max_credits_with_bonus"),
+        enforce_credit_limit: policy_row.get("enforce_credit_limit"),
+        block_on_tuition_debt: policy_row.get("block_on_tuition_debt"),
+        max_allowed_debt: policy_row.get("max_allowed_debt"),
+        enforce_prerequisite: policy_row.get("enforce_prerequisite"),
+        min_passing_grade: policy_row.get("min_passing_grade"),
+        allow_concurrent_for_retake: policy_row.get("allow_concurrent_for_retake"),
+        allow_improve_passed_course: policy_row.get("allow_improve_passed_course"),
+        max_grade_to_improve: policy_row.get("max_grade_to_improve"),
+        max_improve_attempts: policy_row.get("max_improve_attempts"),
+        count_retake_in_credit_limit: policy_row.get("count_retake_in_credit_limit"),
+        strict_no_overlap: policy_row.get("strict_no_overlap"),
+        allow_buffer_gap_periods: policy_row.get("allow_buffer_gap_periods"),
+        extended_rules: policy_row.get("extended_rules"),
+    };
+
     let window_rows = sqlx::query(
         "SELECT id, name, status, allowed_cohorts, allowed_faculties, allowed_actions, start_at, end_at \
          FROM registration.registration_windows WHERE term_id = $1 AND status <> 'CLOSED' \
@@ -496,80 +628,21 @@ async fn load_policy_fallback(
     .await
     .map_err(|e| format!("query registration_windows failed: {e}"))?;
 
-    let mut windows = Vec::with_capacity(window_rows.len());
-    for w in window_rows {
-        let allowed_cohorts: Vec<String> = serde_json::from_value(w.get("allowed_cohorts"))
-            .map_err(|e| format!("invalid allowed_cohorts JSON: {e}"))?;
-        let allowed_faculties: Vec<String> = serde_json::from_value(w.get("allowed_faculties"))
-            .map_err(|e| format!("invalid allowed_faculties JSON: {e}"))?;
-        let allowed_actions: Vec<EnrollmentAction> =
-            serde_json::from_value(w.get("allowed_actions"))
-                .map_err(|e| format!("invalid allowed_actions JSON: {e}"))?;
-        windows.push(RegistrationWindowSnapshot {
-            id: Some(WindowId::from_uuid(w.get("id"))),
+    let raw_windows: Vec<RawWindowRow> = window_rows
+        .into_iter()
+        .map(|w| RawWindowRow {
+            id: w.get("id"),
             name: w.get("name"),
-            status: parse_window_status(w.get::<String, _>("status").as_str())?,
-            allowed_cohorts,
-            allowed_faculties,
-            allowed_actions,
+            status: w.get("status"),
+            allowed_cohorts: w.get("allowed_cohorts"),
+            allowed_faculties: w.get("allowed_faculties"),
+            allowed_actions: w.get("allowed_actions"),
             start_at: w.get("start_at"),
             end_at: w.get("end_at"),
-        });
-    }
+        })
+        .collect();
 
-    let extended_val: Value = policy_row.get("extended_rules");
-    let extended_rules: BTreeMap<String, Value> =
-        serde_json::from_value(extended_val).unwrap_or_default();
-
-    Ok(PolicySnapshotPayload {
-        schema_version: 1,
-        term_id,
-        term_code: term_code.to_owned(),
-        policy_id: Some(PolicyId::from_uuid(policy_row.get("id"))),
-        policy_code: policy_row.get("policy_code"),
-        snapshot_version: 0,
-        exported_at: Utc::now(),
-        credit_limit: CreditLimitPolicy {
-            enforce_credit_limit: policy_row.get("enforce_credit_limit"),
-            min_credits: policy_row.get("min_credits"),
-            max_credits: policy_row.get("max_credits"),
-            gpa_bonus_threshold: policy_row.get("gpa_bonus_threshold"),
-            max_credits_with_bonus: policy_row.get("max_credits_with_bonus"),
-            count_retake_in_credit_limit: policy_row.get("count_retake_in_credit_limit"),
-        },
-        tuition_hold: TuitionHoldPolicy {
-            block_on_tuition_debt: policy_row.get("block_on_tuition_debt"),
-            max_allowed_debt: policy_row.get("max_allowed_debt"),
-            exempt_cohorts: Vec::new(),
-            exempt_faculties: Vec::new(),
-        },
-        prerequisite: PrerequisitePolicy {
-            enforce_prerequisite: policy_row.get("enforce_prerequisite"),
-            min_passing_grade: GradeRank::from_code(
-                policy_row.get::<String, _>("min_passing_grade").as_str(),
-            )
-            .map_err(|e| e.to_string())?,
-            allow_concurrent_for_retake: policy_row.get("allow_concurrent_for_retake"),
-            exempt_cohorts: Vec::new(),
-        },
-        retake_improve: RetakeImprovePolicy {
-            allow_improve_passed_course: policy_row.get("allow_improve_passed_course"),
-            max_grade_to_improve: GradeRank::from_code(
-                policy_row.get::<String, _>("max_grade_to_improve").as_str(),
-            )
-            .map_err(|e| e.to_string())?,
-            max_improve_attempts: policy_row.get("max_improve_attempts"),
-        },
-        schedule_conflict: ScheduleConflictPolicy {
-            strict_no_overlap: policy_row.get("strict_no_overlap"),
-            allow_buffer_gap_periods: u8::try_from(
-                policy_row.get::<i16, _>("allow_buffer_gap_periods").max(0),
-            )
-            .unwrap_or(0),
-        },
-        extended_rules,
-        windows,
-    })
+    build_policy_from_fallback_rows(term_id, term_code, &raw_policy, &raw_windows)
 }
 
 pub fn build_section_metas(

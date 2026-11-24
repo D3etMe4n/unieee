@@ -385,4 +385,37 @@ async fn fallback_keyset_paginated_replay_and_fresh_preload_when_snapshot_absent
     assert_eq!(engine2.student_snapshot(s1).unwrap().current_credits, 3);
     assert_eq!(engine2.student_snapshot(s2).unwrap().current_credits, 0);
     assert!(engine2.export_preload_dataset(now).students.len() == 3);
+
+    // SnapshotStore::dir(), non-existent directory, and find_latest_verified recovery with term_id=None & rejoin_as_standby=false
+    assert_eq!(store.dir(), dir.path());
+    let missing_store = SnapshotStore::new(dir.path().join("does-not-exist"));
+    assert!(missing_store.find_latest_verified().unwrap().is_none());
+    std::fs::write(dir.path().join("unrelated.txt"), b"ignore").unwrap();
+
+    kafka_replay.fail.store(false, Ordering::Release);
+    let eng3 = EnrollmentEngine::new_awaiting_preload(
+        NodeRole::Active,
+        Arc::new(MockCommandPublisher::default()) as Arc<dyn CommandPublisher>,
+        SeatTentativeCoalescerHandle::disconnected(),
+        Arc::new(MockRevertDedupStore::default()) as Arc<dyn RevertDedupStore>,
+    );
+    let rep3 = eng3
+        .bootstrap_or_recover(
+            &store,
+            pg_preload.as_ref(),
+            kafka_replay.as_ref(),
+            pg_fallback.as_ref(),
+            BootstrapOptions {
+                term_id: None,
+                term_code: None,
+                configured_role: NodeRole::Active,
+                rejoin_as_standby_on_recovery: false,
+                replay_batch_size: 5000,
+                replay_throttle: Duration::ZERO,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(rep3.source, BootstrapSourceKind::DiskSnapshotKafkaReplay);
+    assert_eq!(rep3.final_role, NodeRole::Active);
 }

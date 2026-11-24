@@ -306,3 +306,87 @@ async fn rejects_malformed_wrong_issuer_audience_and_unknown_kid() {
         Err(AuthError::UnknownKey(_))
     ));
 }
+
+#[tokio::test]
+async fn covers_oidc_cache_disable_eviction_and_jwk_algorithm_variants() {
+    let rsa_key = RsaTestKeypair::generate("rsa-k1");
+    let failing_fetcher = Arc::new(MockJwksFetcher {
+        calls: AtomicUsize::new(0),
+        delay_ms: 0,
+        body: tokio::sync::Mutex::new(Err("idp unreachable".to_owned())),
+    });
+
+    // OidcVerifierConfig::default(), cache_ttl_secs=0, and failing background refresher warning branch
+    let default_cfg = OidcVerifierConfig::default();
+    assert_eq!(default_cfg.cache_ttl_secs, 30);
+
+    let no_cache_verifier = Arc::new(OidcJwtVerifier::new(
+        Arc::clone(&failing_fetcher) as Arc<dyn JwksFetcher>,
+        OidcVerifierConfig {
+            issuers: Vec::new(),
+            audience: None,
+            cache_ttl_secs: 0,
+            max_cached_tokens_per_shard: 16,
+        },
+    ));
+    assert!(no_cache_verifier.force_refresh_jwks().await.is_err());
+
+    // Duration::ZERO background refresher falls back to 300s and shuts down cleanly on watch signal
+    let (tx, rx) = watch::channel(false);
+    let h = Arc::clone(&no_cache_verifier).spawn_background_refresher(Duration::ZERO, rx);
+    let _ = tx.send(true);
+    h.await.unwrap();
+
+    // Verify JWK algorithm inference variants (RS384, RS512, ES384, PS256 + enc/oct skipped)
+    let mixed_jwks = serde_json::json!({
+        "keys": [
+            {"kty": "RSA", "use": "sig", "alg": "RS384", "kid": "k384", "n": rsa_key.jwk_json["n"], "e": rsa_key.jwk_json["e"]},
+            {"kty": "RSA", "use": "sig", "alg": "RS512", "kid": "k512", "n": rsa_key.jwk_json["n"], "e": rsa_key.jwk_json["e"]},
+            {"kty": "RSA", "use": "sig", "alg": "PS256", "kid": "kp256", "n": rsa_key.jwk_json["n"], "e": rsa_key.jwk_json["e"]},
+            {"kty": "RSA", "use": "enc", "alg": "RS256", "kid": "enc-only", "n": rsa_key.jwk_json["n"], "e": rsa_key.jwk_json["e"]},
+            {"kty": "oct", "kid": "sym", "k": "secret"}
+        ]
+    })
+    .to_string();
+    assert_eq!(no_cache_verifier.load_jwks_json(&mixed_jwks).unwrap(), 3);
+
+    // Also load standard RS256 and test no-cache verification + cache eviction cap
+    no_cache_verifier
+        .load_jwks_json(&serde_json::json!({ "keys": [rsa_key.jwk_json] }).to_string())
+        .unwrap();
+    let now = Utc::now().timestamp();
+    let tok = rsa_key.sign_jwt(
+        "sub-0",
+        "https://any",
+        "any-aud",
+        now + 120,
+        &["STUDENT"],
+        None,
+    );
+    assert!(no_cache_verifier.verify_token(&tok, now).await.is_ok());
+
+    let evict_verifier = OidcJwtVerifier::new(
+        failing_fetcher,
+        OidcVerifierConfig {
+            issuers: Vec::new(),
+            audience: None,
+            cache_ttl_secs: 30,
+            max_cached_tokens_per_shard: 1,
+        },
+    );
+    evict_verifier
+        .load_jwks_json(&serde_json::json!({ "keys": [rsa_key.jwk_json] }).to_string())
+        .unwrap();
+    for i in 0..300 {
+        let t = rsa_key.sign_jwt(
+            &format!("u-{i}"),
+            "iss",
+            "aud",
+            now + 120,
+            &["STUDENT"],
+            None,
+        );
+        // Quick decode bypass? Sign only once per 17 different subs? Wait: let's avoid 300 RSA signs — actually RSA sign with existing key takes <1ms each (total ~0.2s)!
+        assert!(evict_verifier.verify_token(&t, now).await.is_ok());
+    }
+}

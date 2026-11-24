@@ -1175,4 +1175,284 @@ async fn covers_remaining_rule_error_branches_and_idempotent_replays() {
             .enrolled_count,
         0
     );
+
+    // Additional coverage: enums, multi-window fallback, PriorStudy None, register/drop missing IDs, Reverted DB event & GateStates
+    use enrollment_engine::core::rules::evaluate_tuition_and_standing;
+    assert!(NodeRole::from_u8(99).is_none());
+    assert!(EngineReadiness::from_u8(99).is_none());
+    assert_eq!(EngineReadiness::Ready.as_str(), "READY");
+
+    let mut multi_policy = make_default_policy(term_id, now);
+    multi_policy.windows = vec![
+        RegistrationWindowSnapshot {
+            id: Some(WindowId::new_v4()),
+            name: "Cohort A".to_owned(),
+            status: WindowStatus::Active,
+            allowed_cohorts: vec!["K99".to_owned()],
+            allowed_faculties: Vec::new(),
+            allowed_actions: vec![EnrollmentAction::Register],
+            start_at: now - ChronoDuration::hours(1),
+            end_at: now + ChronoDuration::hours(2),
+        },
+        RegistrationWindowSnapshot {
+            id: Some(WindowId::new_v4()),
+            name: "Cohort K24".to_owned(),
+            status: WindowStatus::Active,
+            allowed_cohorts: vec!["K24".to_owned()],
+            allowed_faculties: Vec::new(),
+            allowed_actions: vec![EnrollmentAction::Register],
+            start_at: now - ChronoDuration::hours(1),
+            end_at: now + ChronoDuration::hours(2),
+        },
+    ];
+    let mut s_match = make_student(StudentId::new_v4(), "S_M", None, "K24", "CSE");
+    assert!(evaluate_wave_eligibility(
+        &multi_policy,
+        None,
+        &s_match,
+        EnrollmentAction::Register,
+        now
+    )
+    .is_ok());
+    s_match.cohort_code = "K18".to_owned();
+    assert!(evaluate_wave_eligibility(
+        &multi_policy,
+        None,
+        &s_match,
+        EnrollmentAction::Register,
+        now
+    )
+    .is_err());
+    assert!(evaluate_tuition_and_standing(&multi_policy, &s_match, EnrollmentAction::Drop).is_ok());
+    assert!(evaluate_retake_improve(
+        &multi_policy,
+        &s_match,
+        c_target,
+        "T",
+        EnrollmentAction::Drop
+    )
+    .is_ok());
+
+    multi_policy.prerequisite.allow_concurrent_for_retake = true;
+    assert!(evaluate_prerequisites(
+        &multi_policy,
+        &s_match,
+        &coreq_only,
+        EnrollmentAction::Retake
+    )
+    .is_ok());
+    multi_policy.prerequisite.enforce_prerequisite = false;
+    assert!(evaluate_prerequisites(
+        &multi_policy,
+        &s_match,
+        &coreq_only,
+        EnrollmentAction::Register
+    )
+    .is_ok());
+
+    multi_policy.prerequisite.enforce_prerequisite = true;
+    s_match.course_results.push(StudentCourseAttempt {
+        course_id: c_prior,
+        letter_grade: GradeRank::F,
+        passed: false,
+        attempt_number: 1,
+    });
+    assert!(evaluate_prerequisites(
+        &multi_policy,
+        &s_match,
+        &[CoursePrerequisiteEdge {
+            course_id: c_target,
+            required_course_id: c_prior,
+            relation_type: PrerequisiteRelationType::PriorStudy,
+            min_grade: None,
+        }],
+        EnrollmentAction::Register
+    )
+    .is_ok());
+
+    // resolve_student_id fallback with claimed_student_id when keycloak_sub is None
+    assert_eq!(eng2.resolve_student_id("sub-s2", Some(sid2)).unwrap(), sid2);
+    let sid_nosub = StudentId::new_v4();
+    let ds3 = make_dataset(
+        term_id,
+        vec![make_section(
+            term_id, 77, c_target, "T77", 3, 10, 0, 1, 1, 2,
+        )],
+        Vec::new(),
+        vec![make_student(sid_nosub, "S_NS", None, "K24", "CSE")],
+        now,
+    );
+    let (eng3, _, _) = make_ready_engine(ds3, NodeRole::Active);
+    assert_eq!(
+        eng3.resolve_student_id("any-sub", Some(sid_nosub)).unwrap(),
+        sid_nosub
+    );
+
+    // register missing student, drop missing section/student, all GateStates, revert edge cases, replay Reserved -> Confirmed & Rejected
+    assert!(matches!(
+        eng3.register(
+            StudentId::new_v4(),
+            SectionId::new(77),
+            EnrollmentAction::Register,
+            now
+        )
+        .await,
+        Err(EngineError::RuleViolation {
+            code: RuleErrorCode::StudentNotFound,
+            ..
+        })
+    ));
+    assert!(matches!(
+        eng3.drop_section(sid_nosub, SectionId::new(999), now).await,
+        Err(EngineError::RuleViolation {
+            code: RuleErrorCode::SectionNotFound,
+            ..
+        })
+    ));
+    assert!(matches!(
+        eng3.drop_section(StudentId::new_v4(), SectionId::new(77), now)
+            .await,
+        Err(EngineError::RuleViolation {
+            code: RuleErrorCode::StudentNotFound,
+            ..
+        })
+    ));
+
+    for gs in [
+        GateState::Preloading,
+        GateState::ReadyPreloaded,
+        GateState::Paused,
+        GateState::Draining,
+        GateState::Closed,
+        GateState::Open,
+    ] {
+        eng3.apply_gate_control(&GateControlEvent::new(
+            term_id,
+            gs,
+            None,
+            eng3.epoch() + 1,
+            now,
+        ))
+        .unwrap();
+        assert_eq!(eng3.gate_state(), gs);
+    }
+
+    assert_eq!(
+        eng3.apply_revert_event(&RevertEvent::new(
+            EventId::new_v7(),
+            TermId::new_v4(),
+            sid_nosub,
+            SectionId::new(77),
+            c_target,
+            EnrollmentAction::Register,
+            RuleErrorCode::StaleEpoch,
+            "wrong term",
+            1,
+            now
+        ))
+        .await,
+        RevertOutcome::UnknownSectionOrStudent
+    );
+    assert_eq!(
+        eng3.apply_revert_event(&RevertEvent::new(
+            EventId::new_v7(),
+            term_id,
+            StudentId::new_v4(),
+            SectionId::new(77),
+            c_target,
+            EnrollmentAction::Register,
+            RuleErrorCode::StaleEpoch,
+            "unknown student",
+            1,
+            now
+        ))
+        .await,
+        RevertOutcome::UnknownSectionOrStudent
+    );
+
+    assert_eq!(
+        eng3.apply_delta_event(&EnrollmentDeltaEvent::StudentStandingUpdated(
+            StudentStandingUpdatedEvent::new(
+                EventId::new_v7(),
+                term_id,
+                StudentId::new_v4(),
+                "ACTIVE",
+                Decimal::ZERO,
+                false,
+                false,
+                None,
+                now
+            )
+        )),
+        DeltaOutcome::TargetNotFound
+    );
+    assert_eq!(
+        eng3.apply_delta_event(&EnrollmentDeltaEvent::SectionCapacityUpdated(
+            SectionCapacityUpdatedEvent::new(
+                EventId::new_v7(),
+                TermId::new_v4(),
+                SectionId::new(77),
+                10,
+                None,
+                now
+            )
+        )),
+        DeltaOutcome::WrongTerm
+    );
+    assert_eq!(
+        eng3.apply_delta_event(&EnrollmentDeltaEvent::SectionCapacityUpdated(
+            SectionCapacityUpdatedEvent::new(
+                EventId::new_v7(),
+                term_id,
+                SectionId::new(77),
+                -5,
+                None,
+                now
+            )
+        )),
+        DeltaOutcome::DuplicateOrStale
+    );
+
+    let cmd_ev = EventId::new_v7();
+    eng3.apply_replayed_command(&unieee_events::EnrollmentCommandEvent::new(
+        cmd_ev,
+        term_id,
+        sid_nosub,
+        SectionId::new(77),
+        c_target,
+        EnrollmentAction::Register,
+        eng3.epoch() + 1,
+        now,
+    ));
+    // Replaying same event_id as Confirmed upgrades Reserved -> Confirmed, then Reverted DB event removes it
+    eng3.apply_replayed_db_event(&enrollment_engine::core::ReplayEventRecord {
+        seq: 1,
+        event_id: cmd_ev,
+        term_id,
+        student_id: sid_nosub,
+        section_id: SectionId::new(77),
+        event_type: unieee_domain::EnrollmentEventType::Register,
+        status: EnrollmentEventStatus::Confirmed,
+        reason_code: None,
+        engine_epoch: eng3.epoch(),
+        created_at: now,
+    });
+    eng3.apply_replayed_db_event(&enrollment_engine::core::ReplayEventRecord {
+        seq: 2,
+        event_id: cmd_ev,
+        term_id,
+        student_id: sid_nosub,
+        section_id: SectionId::new(77),
+        event_type: unieee_domain::EnrollmentEventType::Register,
+        status: EnrollmentEventStatus::Reverted,
+        reason_code: Some("REVERT".to_owned()),
+        engine_epoch: eng3.epoch(),
+        created_at: now,
+    });
+    assert_eq!(
+        eng3.seat_snapshot(SectionId::new(77))
+            .unwrap()
+            .enrolled_count,
+        0
+    );
 }

@@ -155,25 +155,20 @@ fn replay_topics_blocking(
         let resolved_tpl = consumer
             .offsets_for_times(query_tpl, Duration::from_secs(3))
             .map_err(|e| format!("offsets_for_times failed on {topic}: {e}"))?;
+        let resolved_offsets: Vec<(i32, Offset)> = resolved_tpl
+            .elements()
+            .into_iter()
+            .map(|e| (e.partition(), e.offset()))
+            .collect();
+        let ranges = compute_partition_replay_ranges(&high_watermarks, &resolved_offsets);
+        if ranges.is_empty() {
+            continue;
+        }
         let mut assign_tpl = TopicPartitionList::new();
         let mut remaining: std::collections::HashMap<i32, i64> = std::collections::HashMap::new();
-        for elem in resolved_tpl.elements() {
-            let pid = elem.partition();
-            let Some(&high) = high_watermarks.get(&pid) else {
-                continue;
-            };
-            let start_off = match elem.offset() {
-                Offset::Offset(off) => off,
-                Offset::End => high,
-                _ => 0,
-            };
-            if start_off < high {
-                let _ = assign_tpl.add_partition_offset(topic, pid, Offset::Offset(start_off));
-                remaining.insert(pid, high);
-            }
-        }
-        if remaining.is_empty() {
-            continue;
+        for (pid, start_off, high) in ranges {
+            let _ = assign_tpl.add_partition_offset(topic, pid, Offset::Offset(start_off));
+            remaining.insert(pid, high);
         }
         consumer
             .assign(&assign_tpl)
@@ -186,18 +181,7 @@ fn replay_topics_blocking(
                     idle_polls = 0;
                     let pid = msg.partition();
                     if let Some(payload) = msg.payload() {
-                        if topic == KAFKA_TOPIC_ENROLLMENT_COMMANDS {
-                            if let Ok(cmd) = decode_json_slice::<EnrollmentCommandEvent>(payload) {
-                                if cmd.term_id == term_id {
-                                    batch.commands.push(cmd);
-                                }
-                            }
-                        } else if let Ok(delta) = decode_json_slice::<EnrollmentDeltaEvent>(payload)
-                        {
-                            if delta.term_id() == term_id {
-                                batch.deltas.push(delta);
-                            }
-                        }
+                        collect_replay_payload(topic, payload, term_id, &mut batch);
                     }
                     if let Some(&high) = remaining.get(&pid) {
                         if msg.offset() + 1 >= high {
@@ -212,6 +196,49 @@ fn replay_topics_blocking(
     }
 
     Ok(batch)
+}
+
+#[must_use]
+pub fn compute_partition_replay_ranges(
+    high_watermarks: &std::collections::HashMap<i32, i64>,
+    resolved_offsets: &[(i32, Offset)],
+) -> Vec<(i32, i64, i64)> {
+    let mut ranges = Vec::new();
+    for &(pid, offset) in resolved_offsets {
+        let Some(&high) = high_watermarks.get(&pid) else {
+            continue;
+        };
+        let start_off = match offset {
+            Offset::Offset(off) => off,
+            Offset::End => high,
+            _ => 0,
+        };
+        if start_off < high {
+            ranges.push((pid, start_off, high));
+        }
+    }
+    ranges
+}
+
+pub fn collect_replay_payload(
+    topic: &str,
+    payload: &[u8],
+    term_id: TermId,
+    batch: &mut KafkaReplayBatch,
+) {
+    if topic == KAFKA_TOPIC_ENROLLMENT_COMMANDS {
+        if let Ok(cmd) = decode_json_slice::<EnrollmentCommandEvent>(payload) {
+            if cmd.term_id == term_id {
+                batch.commands.push(cmd);
+            }
+        }
+    } else if topic == KAFKA_TOPIC_ENROLLMENT_DELTAS {
+        if let Ok(delta) = decode_json_slice::<EnrollmentDeltaEvent>(payload) {
+            if delta.term_id() == term_id {
+                batch.deltas.push(delta);
+            }
+        }
+    }
 }
 
 pub fn decode_and_apply_kafka_message(

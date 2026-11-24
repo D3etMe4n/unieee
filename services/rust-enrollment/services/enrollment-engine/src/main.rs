@@ -13,10 +13,7 @@ use enrollment_engine::adapters::redis_io::{
     connect_redis_backend, spawn_pubsub_listener, RedisRevertDedupStore, RedisTentativeSink,
 };
 use enrollment_engine::config::EngineConfig;
-use enrollment_engine::core::{
-    spawn_coalescer, BootstrapOptions, EnrollmentEngine, OidcJwtVerifier, OidcVerifierConfig,
-    SnapshotStore,
-};
+use enrollment_engine::core::{spawn_coalescer, EnrollmentEngine, OidcJwtVerifier, SnapshotStore};
 use enrollment_engine::http::build_router;
 use enrollment_engine::http::handlers::AppState;
 use std::sync::Arc;
@@ -63,15 +60,7 @@ async fn main() -> anyhow::Result<()> {
         ReqwestJwksFetcher::new(cfg.oidc_jwks_uri.clone(), Duration::from_secs(5))
             .map_err(anyhow::Error::msg)?,
     );
-    let verifier = Arc::new(OidcJwtVerifier::new(
-        jwks_fetcher,
-        OidcVerifierConfig {
-            issuers: cfg.oidc_issuers.clone(),
-            audience: cfg.oidc_audience.clone(),
-            cache_ttl_secs: cfg.jwt_cache_ttl_secs,
-            max_cached_tokens_per_shard: 256,
-        },
-    ));
+    let verifier = Arc::new(OidcJwtVerifier::new(jwks_fetcher, cfg.to_verifier_config()));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let jwks_handle = Arc::clone(&verifier).spawn_background_refresher(
@@ -81,14 +70,7 @@ async fn main() -> anyhow::Result<()> {
 
     let snapshot_store = SnapshotStore::new(cfg.snapshot_dir.clone());
     let engine_bootstrap = Arc::clone(&engine);
-    let bootstrap_opts = BootstrapOptions {
-        term_id: cfg.term_id,
-        term_code: cfg.term_code.clone(),
-        configured_role: cfg.node_role,
-        rejoin_as_standby_on_recovery: cfg.rejoin_as_standby_on_recovery,
-        replay_batch_size: cfg.replay_batch_size,
-        replay_throttle: Duration::from_millis(cfg.replay_throttle_ms),
-    };
+    let bootstrap_opts = cfg.to_bootstrap_options();
     tokio::spawn(async move {
         match engine_bootstrap
             .bootstrap_or_recover(
