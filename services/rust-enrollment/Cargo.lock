@@ -533,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "enrollment-engine"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2858,7 +2858,7 @@ checksum = "993ad287eb20e8ba755312801cfe1413e0f25d604075863acaddca10b04c1833"
 
 [[package]]
 name = "unieee-cacheline"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "parking_lot",
  "thiserror",
@@ -2867,7 +2867,7 @@ dependencies = [
 
 [[package]]
 name = "unieee-domain"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "proptest",
@@ -2880,7 +2880,7 @@ dependencies = [
 
 [[package]]
 name = "unieee-events"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "rust_decimal",
