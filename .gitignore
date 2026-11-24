@@ -41,3 +41,8 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+
+# Agent rules and MCP tool folder
+graphify-out/
+.agents
