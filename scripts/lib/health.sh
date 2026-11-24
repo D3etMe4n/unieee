@@ -176,14 +176,23 @@ check_health() {
         fi
     done
 
-    local app_svc
-    for app_svc in unieee-enrollment-writer unieee-sse-gateway; do
-        if container_running "$app_svc"; then
-            log_ok "$app_svc: running"
+    if container_running "unieee-enrollment-writer"; then
+        if "$CTR_CLI" exec unieee-enrollment-writer curl -fsS http://127.0.0.1:8082/healthz >/dev/null 2>&1 && \
+           "$CTR_CLI" exec unieee-enrollment-writer curl -fsS http://127.0.0.1:8082/readyz >/dev/null 2>&1; then
+            log_ok "unieee-enrollment-writer: /healthz & /readyz OK"
         else
-            log_info "$app_svc: not deployed yet (planned in Phases 8-9)"
+            log_err "unieee-enrollment-writer: /healthz or /readyz FAILED"
+            failures=$((failures + 1))
         fi
-    done
+    else
+        log_info "unieee-enrollment-writer: inactive (core profile mode)"
+    fi
+
+    if container_running "unieee-sse-gateway"; then
+        log_ok "unieee-sse-gateway: running"
+    else
+        log_info "unieee-sse-gateway: not deployed yet (planned in Phase 9)"
+    fi
 
     if [ "$failures" -gt 0 ]; then
         log_err "Health check completed with $failures failure(s)."
