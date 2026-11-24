@@ -82,3 +82,8 @@ unieee:
       client-secret: ${KEYCLOAK_ADMIN_CLIENT_SECRET:unieee-admin-cli-dev-secret}
       connect-timeout: 5s
       read-timeout: 10s
+  policy:
+    cache:
+      redis:
+        enabled: ${POLICY_CACHE_REDIS_ENABLED:true}
+        ttl: ${POLICY_CACHE_REDIS_TTL:1h}

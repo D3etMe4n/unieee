@@ -77,6 +77,8 @@ public interface CatalogFacade {
 
     List<CourseSectionSummaryResponse> getSectionsByIds(Collection<Long> sectionIds);
 
+    List<CourseSectionDetailResponse> getSectionDetailsByIds(Collection<Long> sectionIds);
+
     List<CourseSectionSummaryResponse> listSectionsByTerm(UUID termId);
 
     List<CourseSectionDetailResponse> listTeachingSections(UUID termId, UUID lecturerId);
