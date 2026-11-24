@@ -25,3 +25,7 @@ unieee:
   keycloak:
     admin:
       enabled: false
+  policy:
+    cache:
+      redis:
+        enabled: false

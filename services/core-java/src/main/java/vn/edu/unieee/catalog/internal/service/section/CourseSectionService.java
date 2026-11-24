@@ -93,6 +93,16 @@ public class CourseSectionService {
     }
 
     @Transactional(readOnly = true)
+    public List<CourseSectionDetailResponse> getSectionDetailsByIds(Collection<Long> sectionIds) {
+        if (sectionIds == null || sectionIds.isEmpty()) {
+            return List.of();
+        }
+        return sectionRepository.findWithDetailsByIdIn(sectionIds).stream()
+            .map(mapper::toSectionDetailResponse)
+            .toList();
+    }
+
+    @Transactional(readOnly = true)
     public List<CourseSectionSummaryResponse> listSectionsByTerm(UUID termId) {
         return sectionRepository.findByTermIdOrderBySectionCodeAsc(termId).stream()
             .map(mapper::toSectionSummaryResponse)

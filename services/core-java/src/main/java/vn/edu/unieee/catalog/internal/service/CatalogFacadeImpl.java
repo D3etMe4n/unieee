@@ -172,6 +172,11 @@ public class CatalogFacadeImpl implements CatalogFacade {
     }
 
     @Override
+    public List<CourseSectionDetailResponse> getSectionDetailsByIds(Collection<Long> sectionIds) {
+        return sectionService.getSectionDetailsByIds(sectionIds);
+    }
+
+    @Override
     public List<CourseSectionSummaryResponse> listSectionsByTerm(UUID termId) {
         return sectionService.listSectionsByTerm(termId);
     }

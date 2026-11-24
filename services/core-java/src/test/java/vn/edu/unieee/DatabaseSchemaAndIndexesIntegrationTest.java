@@ -3,7 +3,10 @@ package vn.edu.unieee;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.sql.Timestamp;
+import java.time.Instant;
 import java.time.LocalDate;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
@@ -59,7 +62,17 @@ class DatabaseSchemaAndIndexesIntegrationTest {
             "uq_enrollment_events_event_id",
             "idx_events_term_seq",
             "idx_events_student_created",
-            "idx_writer_revert_outbox_unpublished"
+            "idx_writer_revert_outbox_unpublished",
+            "idx_wish_survey_campaigns_term_status",
+            "uq_survey_student_course",
+            "idx_survey_campaign_course",
+            "idx_survey_student_campaign",
+            "uq_enrollment_policies_term_code",
+            "uq_enrollment_policies_active_term",
+            "idx_enrollment_policies_term",
+            "uq_policy_snapshots_term_version",
+            "idx_policy_snapshots_term_latest",
+            "idx_registration_windows_term_status"
         );
     }
 
@@ -170,5 +183,73 @@ class DatabaseSchemaAndIndexesIntegrationTest {
             """,
             UUID.randomUUID(), termId, studentId, section2, courseId
         );
+
+        // 6. V005 survey, policy & window constraints
+        Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+        Timestamp openTs = Timestamp.from(now.minusSeconds(3600));
+        Timestamp closeTs = Timestamp.from(now.plusSeconds(3600));
+
+        assertThatThrownBy(() ->
+            jdbcTemplate.update(
+                """
+                INSERT INTO registration.wish_survey_campaigns (id, term_id, title, open_at, close_at, status)
+                VALUES (?, ?, 'Bad Status', ?, ?, 'INVALID_STATUS')
+                """,
+                UUID.randomUUID(), termId, openTs, closeTs
+            )
+        ).isInstanceOf(DataIntegrityViolationException.class);
+
+        UUID campaignId = UUID.randomUUID();
+        jdbcTemplate.update(
+            """
+            INSERT INTO registration.wish_survey_campaigns (id, term_id, title, open_at, close_at, status)
+            VALUES (?, ?, 'Pre-reg Survey', ?, ?, 'OPEN')
+            """,
+            campaignId, termId, openTs, closeTs
+        );
+        jdbcTemplate.update(
+            """
+            INSERT INTO registration.wish_survey_entries (id, campaign_id, student_id, course_id, priority)
+            VALUES (?, ?, ?, ?, 1)
+            """,
+            UUID.randomUUID(), campaignId, studentId, courseId
+        );
+        assertThatThrownBy(() ->
+            jdbcTemplate.update(
+                """
+                INSERT INTO registration.wish_survey_entries (id, campaign_id, student_id, course_id, priority)
+                VALUES (?, ?, ?, ?, 2)
+                """,
+                UUID.randomUUID(), campaignId, studentId, courseId
+            )
+        ).isInstanceOf(DataIntegrityViolationException.class);
+
+        UUID policy1 = UUID.randomUUID();
+        jdbcTemplate.update(
+            """
+            INSERT INTO registration.enrollment_policies (id, term_id, policy_code, name, active)
+            VALUES (?, ?, 'POL-A', 'Policy A', TRUE)
+            """,
+            policy1, termId
+        );
+        assertThatThrownBy(() ->
+            jdbcTemplate.update(
+                """
+                INSERT INTO registration.enrollment_policies (id, term_id, policy_code, name, active)
+                VALUES (?, ?, 'POL-B', 'Policy B', TRUE)
+                """,
+                UUID.randomUUID(), termId
+            )
+        ).isInstanceOf(DataIntegrityViolationException.class);
+
+        assertThatThrownBy(() ->
+            jdbcTemplate.update(
+                """
+                INSERT INTO registration.registration_windows (id, term_id, name, start_at, end_at, status)
+                VALUES (?, ?, 'Bad Window', ?, ?, 'SCHEDULED')
+                """,
+                UUID.randomUUID(), termId, closeTs, openTs
+            )
+        ).isInstanceOf(DataIntegrityViolationException.class);
     }
 }
