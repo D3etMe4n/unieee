@@ -80,10 +80,4 @@ pub struct PromoteResponse {
     pub epoch: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ErrorResponse {
-    pub status: u16,
-    pub error_code: String,
-    pub message: String,
-}
+pub use unieee_domain::{ProblemDetail, APPLICATION_PROBLEM_JSON};
