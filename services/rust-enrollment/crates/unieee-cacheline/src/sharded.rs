@@ -83,6 +83,17 @@ where
         guard.remove(key)
     }
 
+    /// Atomically removes `key` only when `predicate` returns `true` for the stored value.
+    pub fn remove_if(&self, key: &K, predicate: impl FnOnce(&V) -> bool) -> Option<V> {
+        let idx = self.shard_index(key);
+        let mut guard = self.shards[idx].write();
+        if guard.get(key).is_some_and(predicate) {
+            guard.remove(key)
+        } else {
+            None
+        }
+    }
+
     #[must_use]
     pub fn contains_key(&self, key: &K) -> bool {
         let idx = self.shard_index(key);

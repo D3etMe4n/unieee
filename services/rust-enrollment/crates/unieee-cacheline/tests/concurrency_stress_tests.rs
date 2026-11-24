@@ -538,3 +538,18 @@ fn multithread_concurrent_reserve_and_capacity_adjust_keeps_invariants() {
     assert_eq!(snap.enrolled_count as usize, total_reserved);
     assert_eq!(snap.available_seats, 25 - total_reserved as i32);
 }
+
+#[test]
+fn sharded_map_remove_if_is_atomic_and_conditional() {
+    let map = ShardedMap::<StudentId, usize>::with_shard_count(4).unwrap();
+    let s1 = StudentId::new_v4();
+    let s2 = StudentId::new_v4();
+    map.insert(s1, 3);
+    map.insert(s2, 0);
+
+    assert!(map.remove_if(&s1, |count| *count == 0).is_none());
+    assert!(map.contains_key(&s1));
+    assert_eq!(map.remove_if(&s2, |count| *count == 0), Some(0));
+    assert!(!map.contains_key(&s2));
+    assert!(map.remove_if(&StudentId::new_v4(), |_| true).is_none());
+}

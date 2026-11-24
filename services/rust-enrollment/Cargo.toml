@@ -6,10 +6,11 @@ members = [
   "crates/unieee-cacheline",
   "services/enrollment-engine",
   "services/enrollment-writer",
+  "services/sse-gateway",
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 publish = false

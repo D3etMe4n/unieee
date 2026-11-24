@@ -533,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "enrollment-engine"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "enrollment-writer"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2473,6 +2473,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "sse-gateway"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "enrollment-engine",
+ "enrollment-writer",
+ "futures-util",
+ "http-body-util",
+ "jsonwebtoken",
+ "p256",
+ "parking_lot",
+ "rand 0.8.8",
+ "redis",
+ "reqwest",
+ "rsa",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "unieee-cacheline",
+ "unieee-domain",
+ "unieee-events",
+ "uuid",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2887,7 +2923,7 @@ checksum = "993ad287eb20e8ba755312801cfe1413e0f25d604075863acaddca10b04c1833"
 
 [[package]]
 name = "unieee-cacheline"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "parking_lot",
  "thiserror",
@@ -2896,7 +2932,7 @@ dependencies = [
 
 [[package]]
 name = "unieee-domain"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "proptest",
@@ -2909,7 +2945,7 @@ dependencies = [
 
 [[package]]
 name = "unieee-events"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "rust_decimal",

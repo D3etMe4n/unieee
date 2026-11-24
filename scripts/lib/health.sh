@@ -189,9 +189,15 @@ check_health() {
     fi
 
     if container_running "unieee-sse-gateway"; then
-        log_ok "unieee-sse-gateway: running"
+        if "$CTR_CLI" exec unieee-sse-gateway curl -fsS http://127.0.0.1:8083/healthz >/dev/null 2>&1 && \
+           "$CTR_CLI" exec unieee-sse-gateway curl -fsS http://127.0.0.1:8083/readyz >/dev/null 2>&1; then
+            log_ok "unieee-sse-gateway: /healthz & /readyz OK"
+        else
+            log_err "unieee-sse-gateway: /healthz or /readyz FAILED"
+            failures=$((failures + 1))
+        fi
     else
-        log_info "unieee-sse-gateway: not deployed yet (planned in Phase 9)"
+        log_info "unieee-sse-gateway: inactive (core profile mode)"
     fi
 
     if [ "$failures" -gt 0 ]; then
