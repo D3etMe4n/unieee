@@ -25,7 +25,7 @@ The Core Monolith is organized into **4 Business-Capability Bounded Contexts** a
 
 ```mermaid
 flowchart TB
-    common["common (OPEN: Virtual Threads, JWT Security, ProblemDetail, Keycloak Client, Outbox Cleanup)"]
+    common["common (OPEN: Virtual Threads, JWT Security, RFC 9457 ProblemDetail, Keycloak Client, Outbox Cleanup)"]
     catalog["catalog (Terms, Faculties/Majors/Curricula, Courses, Prerequisites DAG, Sections & 20-week Bitmask)"]
     account["account (Lecturers, Students with Embeddable Standing, Weighted GPA, Keycloak Provisioning)"]
     registration["registration (Overrides + Single-Writer Gate, Reconciliation, Wish Survey, Windows, Policy Engine)"]

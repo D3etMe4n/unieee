@@ -13,7 +13,40 @@ Toàn bộ HTTP API đi qua **Reverse Proxy** (`https://localhost:8443` ở ch�
   - `STUDENT` (Sinh viên)
   - `LECTURER` (Giảng viên)
   - `ACADEMIC_ADMIN` (Phòng Đào tạo)
-- **Định dạng Lỗi (RFC 7807 `ProblemDetail`):** Mọi lỗi nghiệp vụ và validation trả về `application/problem+json` gồm `title`, `status`, `detail`, `instance`, `errorCode`, `timestamp` (và danh sách lỗi trường dữ liệu khi `400 Bad Request`).
+- **Định dạng Lỗi Thống nhất (RFC 9457 `ProblemDetail` — `application/problem+json`):** Cả **Warm Path (`core-java`)** lẫn **Hot Path (`rust-enrollment`: `enrollment-engine`, `sse-gateway` dự kiến)** đều chuẩn hóa 100% lỗi HTTP (xác thực/JWT, phân quyền RBAC/IDOR, JSON/validation, gate guard, từ chối quy chế, 404/405 và lỗi nội bộ) theo **RFC 9457**:
+  - Header `Content-Type: application/problem+json`
+  - Các trường chuẩn: `type` (`"urn:unieee:error:<ERROR_CODE>"`), `title`, `status`, `detail`, `instance` (request URI path), `errorCode`, `timestamp` (ISO-8601 UTC), kèm `errors` (bản đồ lỗi theo trường khi `400 VALIDATION_FAILED` / `CONSTRAINT_VIOLATION`).
+
+  **Ví dụ Warm Path (`core-java` — `400 Bad Request`):**
+
+  ```json
+  {
+    "type": "urn:unieee:error:VALIDATION_FAILED",
+    "title": "Validation Error",
+    "status": 400,
+    "detail": "Request validation failed",
+    "instance": "/api/v1/courses",
+    "errorCode": "VALIDATION_FAILED",
+    "errors": {
+      "code": "code must not be blank"
+    },
+    "timestamp": "2026-11-25T00:15:00.123456Z"
+  }
+  ```
+
+  **Ví dụ Hot Path (`enrollment-engine` — `409 Conflict`):**
+
+  ```json
+  {
+    "type": "urn:unieee:error:SECTION_FULL",
+    "title": "Conflict",
+    "status": 409,
+    "detail": "Section 701 has no available seats remaining",
+    "instance": "/api/v1/enrollments/register",
+    "errorCode": "SECTION_FULL",
+    "timestamp": "2026-11-25T00:15:01.456789Z"
+  }
+  ```
 
 ---
 
@@ -111,7 +144,7 @@ Toàn bộ HTTP API đi qua **Reverse Proxy** (`https://localhost:8443` ở ch�
 
 ## 3. Đường dẫn Dự kiến cho Các Phase Tiếp theo (Phases 7–10)
 
-Reverse Proxy ([unieee-routes.conf](../../infra/reverse-proxy/snippets/unieee-routes.conf)) đã định tuyến sẵn các prefix sau:
-- `/api/v1/enrollments/*` -> **Rust `enrollment-engine`** (Active/Standby failover, Phases 7–8)
+Reverse Proxy ([unieee-routes.conf](../../infra/reverse-proxy/snippets/unieee-routes.conf)) đã định tuyến sẵn các prefix sau (đồng nhất chuẩn lỗi RFC 9457 `application/problem+json`):
+- `/api/v1/enrollments/*` -> **Rust `enrollment-engine`** (Active/Standby failover, Phase 7+)
 - `/api/v1/sse/*` -> **Rust `sse-gateway`** (tắt proxy buffering cho SSE, Phase 9)
 - `/api/v1/ai/*` -> **`core-java` `ai_advisor`** (rate limit riêng bảo vệ quota LLM, Phase 10)

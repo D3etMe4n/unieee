@@ -26,7 +26,7 @@ Bộ tài liệu công khai dành cho người xem repository và cộng tác vi
 - **[Trung tâm Tài liệu (Tiếng Việt)](./guides/README.vi.md)** | [Public Documentation Hub (English)](./guides/README.md)
 - [Hướng dẫn Khởi chạy & Vận hành Cục bộ](./guides/vi/getting-started.md) — yêu cầu môi trường, dùng `scripts/unieee.sh`, lấy JWT Keycloak dev và chạy `./gradlew check`.
 - [Kiến trúc Hệ thống & Thiết kế CSDL](./guides/vi/architecture.md) — kiến trúc lai Warm/Hot Path, 4 Bounded Contexts + `common` (DAG 1 chiều), PostgreSQL Schema-per-Bounded-Context (`V001`–`V005`), Single-Writer Gate Guard và Policy Engine đa trường.
-- [Tài liệu REST API](./guides/vi/api-reference.md) — phân quyền RBAC, chuẩn lỗi RFC 7807 và toàn bộ endpoint đã triển khai trên `common`, `catalog`, `account`, `registration`.
+- [Tài liệu REST API](./guides/vi/api-reference.md) — phân quyền RBAC, chuẩn lỗi RFC 9457 (`application/problem+json`) và toàn bộ endpoint đã triển khai trên `common`, `catalog`, `account`, `registration`.
 - [Lộ trình 12 Phases & Chiến lược Kiểm thử](./guides/vi/roadmap-and-testing.md) — tiến độ 12 phases (Phases 1–5 hoàn thành), chính sách coverage phân tầng (`>= 90%` core, `>= 65%` tầng biên) và CI guardrails.
 
 ---

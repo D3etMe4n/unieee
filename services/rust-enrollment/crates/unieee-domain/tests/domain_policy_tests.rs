@@ -1,13 +1,15 @@
 use chrono::{TimeZone, Utc};
 use rust_decimal::Decimal;
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use unieee_domain::{
-    CourseId, CreditLimitPolicy, DomainError, EnrollmentAction, EnrollmentEventStatus,
-    EnrollmentEventType, EnrollmentRecordStatus, EventId, GateState, GradeRank,
-    HotPathEnrollmentState, PolicyId, PolicyRuleCode, PolicySnapshotPayload, PrerequisitePolicy,
-    PrerequisiteRelationType, RegistrationWindowSnapshot, RetakeImprovePolicy, RuleErrorCode,
-    ScheduleConflictPolicy, SectionId, SectionStatus, StudentId, TermId, TuitionHoldPolicy,
-    WindowId, WindowStatus,
+    canonical_reason_phrase, CourseId, CreditLimitPolicy, DomainError, EnrollmentAction,
+    EnrollmentEventStatus, EnrollmentEventType, EnrollmentRecordStatus, EventId, GateState,
+    GradeRank, HotPathEnrollmentState, PolicyId, PolicyRuleCode, PolicySnapshotPayload,
+    PrerequisitePolicy, PrerequisiteRelationType, ProblemDetail, RegistrationWindowSnapshot,
+    RetakeImprovePolicy, RuleErrorCode, ScheduleConflictPolicy, SectionId, SectionStatus,
+    StudentId, TermId, TuitionHoldPolicy, WindowId, WindowStatus, APPLICATION_PROBLEM_JSON,
+    PROBLEM_TYPE_PREFIX,
 };
 use uuid::Uuid;
 
@@ -508,4 +510,81 @@ fn java_policy_snapshot_json_deserializes_and_evaluates_helpers() {
             allow_buffer_gap_periods: 0,
         },
     );
+}
+
+#[test]
+fn rfc9457_problem_detail_serializes_with_core_java_wire_parity() {
+    assert_eq!(APPLICATION_PROBLEM_JSON, "application/problem+json");
+    assert_eq!(PROBLEM_TYPE_PREFIX, "urn:unieee:error:");
+
+    for (code, phrase) in [
+        (400, "Bad Request"),
+        (401, "Unauthorized"),
+        (403, "Forbidden"),
+        (404, "Not Found"),
+        (405, "Method Not Allowed"),
+        (409, "Conflict"),
+        (415, "Unsupported Media Type"),
+        (422, "Unprocessable Entity"),
+        (429, "Too Many Requests"),
+        (500, "Internal Server Error"),
+        (502, "Bad Gateway"),
+        (503, "Service Unavailable"),
+        (504, "Gateway Timeout"),
+        (418, "Error"),
+    ] {
+        assert_eq!(canonical_reason_phrase(code), phrase);
+    }
+
+    let fixed_ts = Utc.with_ymd_and_hms(2026, 11, 25, 1, 2, 3).unwrap();
+    let rule_problem = ProblemDetail::from_rule_error(
+        RuleErrorCode::SectionFull,
+        "Section 701 is full",
+        "/api/v1/enrollments/register",
+    )
+    .with_timestamp(fixed_ts);
+
+    let json_val = serde_json::to_value(&rule_problem).unwrap();
+    assert_eq!(json_val["type"], "urn:unieee:error:SECTION_FULL");
+    assert_eq!(json_val["title"], "Conflict");
+    assert_eq!(json_val["status"], 409);
+    assert_eq!(json_val["detail"], "Section 701 is full");
+    assert_eq!(json_val["instance"], "/api/v1/enrollments/register");
+    assert_eq!(json_val["errorCode"], "SECTION_FULL");
+    assert_eq!(json_val["timestamp"], "2026-11-25T01:02:03Z");
+    assert!(json_val.get("errors").is_none());
+
+    let roundtrip: ProblemDetail = serde_json::from_value(json_val).unwrap();
+    assert_eq!(roundtrip, rule_problem);
+
+    let mut errs = BTreeMap::new();
+    errs.insert(
+        "sectionId".to_owned(),
+        "sectionId must be positive".to_owned(),
+    );
+    let val_problem = ProblemDetail::validation(
+        "Request validation failed",
+        "/api/v1/enrollments/drop",
+        errs,
+    )
+    .with_instance("/api/v1/enrollments/register");
+    let val_json = serde_json::to_value(&val_problem).unwrap();
+    assert_eq!(val_json["type"], "urn:unieee:error:VALIDATION_FAILED");
+    assert_eq!(val_json["title"], "Validation Error");
+    assert_eq!(val_json["status"], 400);
+    assert_eq!(val_json["instance"], "/api/v1/enrollments/register");
+    assert_eq!(val_json["errorCode"], "VALIDATION_FAILED");
+    assert_eq!(
+        val_json["errors"]["sectionId"],
+        "sectionId must be positive"
+    );
+
+    let custom = ProblemDetail::for_status(
+        503,
+        "NODE_STANDBY",
+        "Standby node cannot accept mutations",
+        "/api/v1/enrollments/register",
+    );
+    assert_eq!(custom.title, "Service Unavailable");
+    assert_eq!(custom.problem_type, "urn:unieee:error:NODE_STANDBY");
 }

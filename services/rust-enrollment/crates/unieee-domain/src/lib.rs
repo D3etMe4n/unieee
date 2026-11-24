@@ -8,6 +8,7 @@ pub mod enums;
 pub mod error;
 pub mod ids;
 pub mod policy;
+pub mod problem;
 
 pub use bitmask::{ScheduleBitmask, ScheduleSlot};
 pub use enums::{
@@ -20,4 +21,7 @@ pub use ids::{CourseId, EventId, PolicyId, SectionId, StudentId, TermId, WindowI
 pub use policy::{
     CreditLimitPolicy, PolicySnapshotPayload, PrerequisitePolicy, RegistrationWindowSnapshot,
     RetakeImprovePolicy, ScheduleConflictPolicy, TuitionHoldPolicy,
+};
+pub use problem::{
+    canonical_reason_phrase, ProblemDetail, APPLICATION_PROBLEM_JSON, PROBLEM_TYPE_PREFIX,
 };

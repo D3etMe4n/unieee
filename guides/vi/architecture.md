@@ -25,7 +25,7 @@ Core Java được tổ chức thành **4 Bounded Contexts theo Business Capabil
 
 ```mermaid
 flowchart TB
-    common["common (OPEN: Virtual Threads, JWT Security, ProblemDetail, Keycloak Client, Outbox Cleanup)"]
+    common["common (OPEN: Virtual Threads, JWT Security, RFC 9457 ProblemDetail, Keycloak Client, Outbox Cleanup)"]
     catalog["catalog (Học kỳ, Khoa/Ngành/CTK, Môn học, Tiên quyết DFS, Lớp HP & Bitmask 20 tuần)"]
     account["account (Giảng viên, Sinh viên với Embeddable Standing, GPA trọng số tín chỉ, Keycloak Provisioning)"]
     registration["registration (Admin Override + Gate Guard, Đối soát, Khảo sát NV, Đợt ĐK, Policy Engine)"]

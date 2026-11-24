@@ -1,14 +1,18 @@
 use crate::core::{AuthError, EngineError, EngineReadiness};
-use crate::http::dto::ErrorResponse;
-use axum::http::StatusCode;
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{FromRequest, Request};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use serde::de::DeserializeOwned;
+use std::collections::BTreeMap;
+use unieee_domain::{canonical_reason_phrase, ProblemDetail, APPLICATION_PROBLEM_JSON};
 
-#[derive(Debug)]
+const FALLBACK_PROBLEM_JSON: &[u8] = br#"{"type":"urn:unieee:error:INTERNAL_ERROR","title":"Internal Server Error","status":500,"detail":"Failed to serialize RFC 9457 problem response","instance":"","errorCode":"INTERNAL_ERROR","timestamp":"1970-01-01T00:00:00Z"}"#;
+
+#[derive(Debug, Clone)]
 pub struct ApiError {
     pub status: StatusCode,
-    pub error_code: String,
-    pub message: String,
+    pub problem: Box<ProblemDetail>,
 }
 
 impl ApiError {
@@ -16,34 +20,124 @@ impl ApiError {
     pub fn new(
         status: StatusCode,
         error_code: impl Into<String>,
-        message: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        let title = status
+            .canonical_reason()
+            .unwrap_or_else(|| canonical_reason_phrase(status.as_u16()));
+        Self::with_title(status, title, error_code, detail)
+    }
+
+    #[must_use]
+    pub fn with_title(
+        status: StatusCode,
+        title: impl Into<String>,
+        error_code: impl Into<String>,
+        detail: impl Into<String>,
     ) -> Self {
         Self {
             status,
-            error_code: error_code.into(),
-            message: message.into(),
+            problem: Box::new(ProblemDetail::new(
+                status.as_u16(),
+                title,
+                error_code,
+                detail,
+                "",
+            )),
         }
     }
 
     #[must_use]
-    pub fn not_found(error_code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::new(StatusCode::NOT_FOUND, error_code, message)
+    pub fn not_found(error_code: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, error_code, detail)
     }
 
     #[must_use]
-    pub fn bad_request(error_code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, error_code, message)
+    pub fn bad_request(error_code: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, error_code, detail)
+    }
+
+    #[must_use]
+    pub fn validation(
+        detail: impl Into<String>,
+        instance: impl Into<String>,
+        errors: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            problem: Box::new(ProblemDetail::validation(detail, instance, errors)),
+        }
+    }
+
+    #[must_use]
+    pub fn with_instance(mut self, instance: impl Into<String>) -> Self {
+        self.problem.instance = instance.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_errors(mut self, errors: BTreeMap<String, String>) -> Self {
+        self.problem.errors = Some(errors);
+        self
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = ErrorResponse {
-            status: self.status.as_u16(),
-            error_code: self.error_code,
-            message: self.message,
-        };
-        (self.status, Json(body)).into_response()
+        let body =
+            serde_json::to_vec(&self.problem).unwrap_or_else(|_| FALLBACK_PROBLEM_JSON.to_vec());
+        (
+            self.status,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(APPLICATION_PROBLEM_JSON),
+            )],
+            body,
+        )
+            .into_response()
+    }
+}
+
+/// JSON request extractor that normalizes all body/deserialization rejections to RFC 9457
+/// `application/problem+json` with `instance` populated from the request URI path.
+#[derive(Debug, Clone)]
+pub struct ProblemJson<T>(pub T);
+
+impl<S, T> FromRequest<S> for ProblemJson<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let instance = req.uri().path().to_owned();
+        match axum::Json::<T>::from_request(req, state).await {
+            Ok(axum::Json(payload)) => Ok(Self(payload)),
+            Err(JsonRejection::MissingJsonContentType(_)) => Err(ApiError::new(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "UNSUPPORTED_MEDIA_TYPE",
+                "Request Content-Type must be application/json",
+            )
+            .with_instance(instance)),
+            Err(JsonRejection::JsonDataError(err)) => Err(ApiError::validation(
+                "Request validation failed",
+                instance,
+                BTreeMap::from([("body".to_owned(), err.body_text())]),
+            )),
+            Err(JsonRejection::JsonSyntaxError(err)) => {
+                Err(ApiError::bad_request("INVALID_JSON", err.body_text()).with_instance(instance))
+            }
+            Err(JsonRejection::BytesRejection(err)) => Err(ApiError::bad_request(
+                "INVALID_REQUEST_BODY",
+                err.body_text(),
+            )
+            .with_instance(instance)),
+            Err(other) => {
+                Err(ApiError::bad_request("INVALID_REQUEST", other.body_text())
+                    .with_instance(instance))
+            }
+        }
     }
 }
 

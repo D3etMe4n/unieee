@@ -17,7 +17,7 @@ Welcome to the public reader documentation for **unieee** — a university acade
 | :--- | :--- | :--- |
 | [Getting Started & Local Ops](./en/getting-started.md) | New visitors & operators | Prerequisites, starting the container stack with `scripts/unieee.sh`, TLS modes, local dev Keycloak tokens, and running Java + Testcontainers tests. |
 | [System Architecture & Database Design](./en/architecture.md) | Engineers & architects | Hybrid Warm/Hot Path architecture, 4-Bounded-Context Spring Modulith DAG, PostgreSQL Schema-per-Bounded-Context (`V001`–`V005`), Single-Writer Gate Guard, Multi-University Policy Engine, and planned Rust Hot Path / AI Advisor design. |
-| [REST API Reference](./en/api-reference.md) | Frontend/API consumers & QA | JWT authentication, RBAC roles, RFC 7807 error format, and every implemented endpoint across `common`, `catalog`, `account`, and `registration` (plus reserved Hot Path / AI prefixes). |
+| [REST API Reference](./en/api-reference.md) | Frontend/API consumers & QA | JWT authentication, RBAC roles, RFC 9457 Problem Details (`application/problem+json`), and every implemented endpoint across `common`, `catalog`, `account`, and `registration` (plus reserved Hot Path / AI prefixes). |
 | [Implementation Roadmap & Testing](./en/roadmap-and-testing.md) | Contributors & reviewers | Status across all 12 phases, 5-tier testing strategy, JaCoCo / `cargo-llvm-cov` tiered coverage policy (`>= 90%` core, `>= 65%` edge), and CI guardrails. |
 
 ---

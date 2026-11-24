@@ -27,7 +27,7 @@ use enrollment_engine::core::{
 };
 use enrollment_engine::http::build_router;
 use enrollment_engine::http::dto::{
-    EnrollmentAcceptedResponse, EnrollmentStatusResponse, ErrorResponse,
+    EnrollmentAcceptedResponse, EnrollmentStatusResponse, ProblemDetail, APPLICATION_PROBLEM_JSON,
 };
 use enrollment_engine::http::handlers::AppState;
 use http_body_util::BodyExt;
@@ -46,6 +46,33 @@ use unieee_events::{
     REDIS_CHANNEL_GATE_CONTROL, REDIS_CHANNEL_SEAT_CONFIRMED,
 };
 use uuid::Uuid;
+
+async fn assert_problem_detail(
+    resp: axum::response::Response,
+    expected_status: StatusCode,
+    expected_code: &str,
+    expected_instance: &str,
+) -> ProblemDetail {
+    assert_eq!(resp.status(), expected_status);
+    let content_type = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(content_type, APPLICATION_PROBLEM_JSON);
+
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(raw["type"], format!("urn:unieee:error:{expected_code}"));
+    assert_eq!(raw["status"], expected_status.as_u16());
+    assert_eq!(raw["instance"], expected_instance);
+    assert_eq!(raw["errorCode"], expected_code);
+    assert!(raw["title"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(raw["detail"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(raw["timestamp"].as_str().is_some_and(|s| !s.is_empty()));
+
+    serde_json::from_slice(&bytes).unwrap()
+}
 
 #[tokio::test]
 async fn http_api_covers_register_drop_status_idor_healthz_readyz_and_promote() {
@@ -149,7 +176,7 @@ async fn http_api_covers_register_drop_status_idor_healthz_readyz_and_promote() 
         None,
     );
 
-    // 2. Register fails with 401 when unauthenticated, 503 when not ready
+    // 2. Register fails with 401 RFC 9457 when unauthenticated / expired, 503 when not ready
     let unauth = app
         .clone()
         .oneshot(
@@ -160,7 +187,40 @@ async fn http_api_covers_register_drop_status_idor_healthz_readyz_and_promote() 
         )
         .await
         .unwrap();
-    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+    assert_problem_detail(
+        unauth,
+        StatusCode::UNAUTHORIZED,
+        "UNAUTHORIZED",
+        "/api/v1/enrollments/register",
+    )
+    .await;
+
+    let expired_jwt = keypair.sign_jwt(
+        "sub-s1",
+        "https://idp.test",
+        "unieee-web",
+        now.timestamp() - 60,
+        &["STUDENT"],
+        None,
+    );
+    let expired_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/enrollments/register")
+                .header(header::AUTHORIZATION, format!("Bearer {expired_jwt}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"sectionId":701}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(
+        expired_resp,
+        StatusCode::UNAUTHORIZED,
+        "TOKEN_EXPIRED",
+        "/api/v1/enrollments/register",
+    )
+    .await;
 
     let not_ready_reg = app
         .clone()
@@ -173,7 +233,13 @@ async fn http_api_covers_register_drop_status_idor_healthz_readyz_and_promote() 
         )
         .await
         .unwrap();
-    assert_eq!(not_ready_reg.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_problem_detail(
+        not_ready_reg,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "ENGINE_NOT_READY",
+        "/api/v1/enrollments/register",
+    )
+    .await;
 
     // 3. Hydrate as STANDBY -> /readyz = 200, writes rejected 503 NODE_STANDBY until /internal/promote
     engine
@@ -191,13 +257,15 @@ async fn http_api_covers_register_drop_status_idor_healthz_readyz_and_promote() 
         )
         .await
         .unwrap();
-    assert_eq!(standby_reg.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let err_standby: ErrorResponse =
-        serde_json::from_slice(&standby_reg.into_body().collect().await.unwrap().to_bytes())
-            .unwrap();
-    assert_eq!(err_standby.error_code, "NODE_STANDBY");
+    assert_problem_detail(
+        standby_reg,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "NODE_STANDBY",
+        "/api/v1/enrollments/register",
+    )
+    .await;
 
-    // Promote rejects bad token (403), accepts right token (200)
+    // Promote rejects bad token (403 RFC 9457), accepts right token (200)
     let bad_promote = app
         .clone()
         .oneshot(
@@ -208,7 +276,13 @@ async fn http_api_covers_register_drop_status_idor_healthz_readyz_and_promote() 
         )
         .await
         .unwrap();
-    assert_eq!(bad_promote.status(), StatusCode::FORBIDDEN);
+    assert_problem_detail(
+        bad_promote,
+        StatusCode::FORBIDDEN,
+        "FORBIDDEN",
+        "/internal/promote",
+    )
+    .await;
 
     let promote = app
         .clone()
@@ -226,7 +300,7 @@ async fn http_api_covers_register_drop_status_idor_healthz_readyz_and_promote() 
     assert_eq!(prom_body["role"], "ACTIVE");
     assert_eq!(prom_body["epoch"], 2);
 
-    // Non-student role forbidden on register
+    // Non-student role forbidden on register & drop (403 RFC 9457)
     let lec_reg = app
         .clone()
         .oneshot(
@@ -238,7 +312,140 @@ async fn http_api_covers_register_drop_status_idor_healthz_readyz_and_promote() 
         )
         .await
         .unwrap();
-    assert_eq!(lec_reg.status(), StatusCode::FORBIDDEN);
+    assert_problem_detail(
+        lec_reg,
+        StatusCode::FORBIDDEN,
+        "FORBIDDEN",
+        "/api/v1/enrollments/register",
+    )
+    .await;
+
+    let lec_drop = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/enrollments/drop")
+                .header(header::AUTHORIZATION, format!("Bearer {tok_lecturer}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"sectionId":701}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(
+        lec_drop,
+        StatusCode::FORBIDDEN,
+        "FORBIDDEN",
+        "/api/v1/enrollments/drop",
+    )
+    .await;
+
+    // Payload & content-type rejections map to RFC 9457 with instance & validation errors
+    let missing_ct = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/enrollments/register")
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .body(Body::from(r#"{"sectionId":701}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(
+        missing_ct,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "UNSUPPORTED_MEDIA_TYPE",
+        "/api/v1/enrollments/register",
+    )
+    .await;
+
+    let bad_syntax = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/enrollments/register")
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{bad"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(
+        bad_syntax,
+        StatusCode::BAD_REQUEST,
+        "INVALID_JSON",
+        "/api/v1/enrollments/register",
+    )
+    .await;
+
+    let missing_field = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/enrollments/register")
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let missing_field_problem = assert_problem_detail(
+        missing_field,
+        StatusCode::BAD_REQUEST,
+        "VALIDATION_FAILED",
+        "/api/v1/enrollments/register",
+    )
+    .await;
+    assert_eq!(missing_field_problem.title, "Validation Error");
+    assert!(missing_field_problem
+        .errors
+        .as_ref()
+        .is_some_and(|e| e.contains_key("body")));
+
+    let zero_reg = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/enrollments/register")
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"sectionId":0}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let zero_reg_problem = assert_problem_detail(
+        zero_reg,
+        StatusCode::BAD_REQUEST,
+        "VALIDATION_FAILED",
+        "/api/v1/enrollments/register",
+    )
+    .await;
+    assert!(zero_reg_problem
+        .errors
+        .as_ref()
+        .is_some_and(|e| e.contains_key("sectionId")));
+
+    let zero_drop = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/enrollments/drop")
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"sectionId":0}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let zero_drop_problem = assert_problem_detail(
+        zero_drop,
+        StatusCode::BAD_REQUEST,
+        "VALIDATION_FAILED",
+        "/api/v1/enrollments/drop",
+    )
+    .await;
+    assert!(zero_drop_problem
+        .errors
+        .as_ref()
+        .is_some_and(|e| e.contains_key("sectionId")));
 
     // 4. Register happy path -> 202 Accepted
     let reg_ok = app
@@ -258,11 +465,32 @@ async fn http_api_covers_register_drop_status_idor_healthz_readyz_and_promote() 
     assert_eq!(accepted.status, HotPathEnrollmentState::Reserved);
     assert_eq!(accepted.available_seats, 1);
 
-    // 5. Status endpoint: owner allowed (200), admin allowed (200), other student blocked IDOR (403), bad UUID (400), unknown (404)
+    // Duplicate register -> 409 ALREADY_ENROLLED_IN_COURSE RFC 9457
+    let dup_reg = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/enrollments/register")
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"sectionId":701}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(
+        dup_reg,
+        StatusCode::CONFLICT,
+        "ALREADY_ENROLLED_IN_COURSE",
+        "/api/v1/enrollments/register",
+    )
+    .await;
+
+    // 5. Status endpoint: owner allowed (200), admin allowed (200), other student blocked IDOR (403), lecturer (403), bad UUID (400), unknown (404)
+    let status_path = format!("/api/v1/enrollments/status/{}", accepted.event_id);
     let st_owner = app
         .clone()
         .oneshot(
-            Request::get(format!("/api/v1/enrollments/status/{}", accepted.event_id))
+            Request::get(&status_path)
                 .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -277,7 +505,7 @@ async fn http_api_covers_register_drop_status_idor_healthz_readyz_and_promote() 
     let st_admin = app
         .clone()
         .oneshot(
-            Request::get(format!("/api/v1/enrollments/status/{}", accepted.event_id))
+            Request::get(&status_path)
                 .header(header::AUTHORIZATION, format!("Bearer {tok_admin}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -289,14 +517,26 @@ async fn http_api_covers_register_drop_status_idor_healthz_readyz_and_promote() 
     let st_idor = app
         .clone()
         .oneshot(
-            Request::get(format!("/api/v1/enrollments/status/{}", accepted.event_id))
+            Request::get(&status_path)
                 .header(header::AUTHORIZATION, format!("Bearer {tok_s2}"))
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(st_idor.status(), StatusCode::FORBIDDEN);
+    assert_problem_detail(st_idor, StatusCode::FORBIDDEN, "FORBIDDEN", &status_path).await;
+
+    let st_lec = app
+        .clone()
+        .oneshot(
+            Request::get(&status_path)
+                .header(header::AUTHORIZATION, format!("Bearer {tok_lecturer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(st_lec, StatusCode::FORBIDDEN, "FORBIDDEN", &status_path).await;
 
     let st_bad_id = app
         .clone()
@@ -308,19 +548,32 @@ async fn http_api_covers_register_drop_status_idor_healthz_readyz_and_promote() 
         )
         .await
         .unwrap();
-    assert_eq!(st_bad_id.status(), StatusCode::BAD_REQUEST);
+    assert_problem_detail(
+        st_bad_id,
+        StatusCode::BAD_REQUEST,
+        "INVALID_EVENT_ID",
+        "/api/v1/enrollments/status/not-a-uuid",
+    )
+    .await;
 
+    let missing_event_path = format!("/api/v1/enrollments/status/{}", Uuid::new_v4());
     let st_missing = app
         .clone()
         .oneshot(
-            Request::get(format!("/api/v1/enrollments/status/{}", Uuid::new_v4()))
+            Request::get(&missing_event_path)
                 .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(st_missing.status(), StatusCode::NOT_FOUND);
+    assert_problem_detail(
+        st_missing,
+        StatusCode::NOT_FOUND,
+        "EVENT_NOT_FOUND",
+        &missing_event_path,
+    )
+    .await;
 
     // 6. Drop happy path -> 202 DROP_PENDING
     let drop_ok = app
@@ -340,8 +593,9 @@ async fn http_api_covers_register_drop_status_idor_healthz_readyz_and_promote() 
     assert_eq!(drop_body.status, HotPathEnrollmentState::DropPending);
     assert_eq!(drop_body.available_seats, 2);
 
-    // Duplicate drop fails 409 NOT_ENROLLED_IN_SECTION
+    // Duplicate drop fails 409 NOT_ENROLLED_IN_SECTION RFC 9457
     let drop_dup = app
+        .clone()
         .oneshot(
             Request::post("/api/v1/enrollments/drop")
                 .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
@@ -351,7 +605,47 @@ async fn http_api_covers_register_drop_status_idor_healthz_readyz_and_promote() 
         )
         .await
         .unwrap();
-    assert_eq!(drop_dup.status(), StatusCode::CONFLICT);
+    assert_problem_detail(
+        drop_dup,
+        StatusCode::CONFLICT,
+        "NOT_ENROLLED_IN_SECTION",
+        "/api/v1/enrollments/drop",
+    )
+    .await;
+
+    // 7. Fallback 404 & 405 return RFC 9457 problem+json
+    let unknown_route = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/enrollments/unknown")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(
+        unknown_route,
+        StatusCode::NOT_FOUND,
+        "RESOURCE_NOT_FOUND",
+        "/api/v1/enrollments/unknown",
+    )
+    .await;
+
+    let wrong_method = app
+        .oneshot(
+            Request::get("/api/v1/enrollments/register")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(
+        wrong_method,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "METHOD_NOT_ALLOWED",
+        "/api/v1/enrollments/register",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -434,39 +728,81 @@ async fn covers_config_error_branches_api_errors_and_redis_kafka_adapter_helpers
     dispatch_pubsub_payload(&engine, "unieee:unknown", "{}").await;
     dispatch_pubsub_payload(&engine, REDIS_CHANNEL_GATE_CONTROL, "{bad}").await;
 
-    // Http ApiError mappings
+    // Http ApiError mappings -> RFC 9457 application/problem+json
     use axum::response::IntoResponse;
     use enrollment_engine::core::{AuthError, EngineError};
     use enrollment_engine::http::error::ApiError;
-    assert_eq!(
-        ApiError::from(AuthError::Expired).into_response().status(),
-        StatusCode::UNAUTHORIZED
-    );
-    assert_eq!(
+    use std::collections::BTreeMap;
+    assert_problem_detail(
+        ApiError::from(AuthError::Expired)
+            .with_instance("/api/v1/enrollments/register")
+            .into_response(),
+        StatusCode::UNAUTHORIZED,
+        "TOKEN_EXPIRED",
+        "/api/v1/enrollments/register",
+    )
+    .await;
+    assert_problem_detail(
         ApiError::from(AuthError::JwksFetchFailed("down".to_owned()))
-            .into_response()
-            .status(),
-        StatusCode::SERVICE_UNAVAILABLE
-    );
-    assert_eq!(
+            .with_instance("/api/v1/enrollments/register")
+            .into_response(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "OIDC_JWKS_UNAVAILABLE",
+        "/api/v1/enrollments/register",
+    )
+    .await;
+    assert_problem_detail(
         ApiError::from(EngineError::Internal("boom".to_owned()))
-            .into_response()
-            .status(),
-        StatusCode::INTERNAL_SERVER_ERROR
-    );
-    assert_eq!(
+            .with_instance("/api/v1/enrollments/register")
+            .into_response(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "INTERNAL_ERROR",
+        "/api/v1/enrollments/register",
+    )
+    .await;
+    assert_problem_detail(
         ApiError::from(EngineError::NotReady(EngineReadiness::Ready))
-            .into_response()
-            .status(),
-        StatusCode::INTERNAL_SERVER_ERROR
-    );
-    assert_eq!(
+            .with_instance("/api/v1/enrollments/register")
+            .into_response(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "ENGINE_INTERNAL_ERROR",
+        "/api/v1/enrollments/register",
+    )
+    .await;
+    assert_problem_detail(
+        ApiError::from(EngineError::Forbidden("denied".to_owned()))
+            .with_instance("/api/v1/enrollments/register")
+            .into_response(),
+        StatusCode::FORBIDDEN,
+        "FORBIDDEN",
+        "/api/v1/enrollments/register",
+    )
+    .await;
+    assert_problem_detail(
         ApiError::from(EngineError::Domain(
-            unieee_domain::DomainError::UnsupportedGradeCode("Z".to_owned())
+            unieee_domain::DomainError::UnsupportedGradeCode("Z".to_owned()),
         ))
-        .into_response()
-        .status(),
-        StatusCode::BAD_REQUEST
+        .with_instance("/api/v1/enrollments/register")
+        .into_response(),
+        StatusCode::BAD_REQUEST,
+        "DOMAIN_ERROR",
+        "/api/v1/enrollments/register",
+    )
+    .await;
+    let err_with_fields = ApiError::bad_request("INVALID_INPUT", "bad input")
+        .with_instance("/api/v1/enrollments/register")
+        .with_errors(BTreeMap::from([("field".to_owned(), "bad".to_owned())]))
+        .into_response();
+    let p = assert_problem_detail(
+        err_with_fields,
+        StatusCode::BAD_REQUEST,
+        "INVALID_INPUT",
+        "/api/v1/enrollments/register",
+    )
+    .await;
+    assert_eq!(
+        p.errors.unwrap().get("field").map(String::as_str),
+        Some("bad")
     );
 
     // Remaining postgres parser variants
