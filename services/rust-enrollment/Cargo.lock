@@ -533,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "enrollment-engine"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -565,6 +565,35 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unieee-cacheline",
+ "unieee-domain",
+ "unieee-events",
+ "uuid",
+]
+
+[[package]]
+name = "enrollment-writer"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "enrollment-engine",
+ "futures-util",
+ "http-body-util",
+ "parking_lot",
+ "rdkafka",
+ "redis",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
  "unieee-domain",
  "unieee-events",
  "uuid",
@@ -2858,7 +2887,7 @@ checksum = "993ad287eb20e8ba755312801cfe1413e0f25d604075863acaddca10b04c1833"
 
 [[package]]
 name = "unieee-cacheline"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "parking_lot",
  "thiserror",
@@ -2867,7 +2896,7 @@ dependencies = [
 
 [[package]]
 name = "unieee-domain"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "proptest",
@@ -2880,7 +2909,7 @@ dependencies = [
 
 [[package]]
 name = "unieee-events"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "rust_decimal",

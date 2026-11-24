@@ -156,4 +156,45 @@ services:
       retries: 20
       start_period: 10s
 
-  # Rust Writer and SSE Gateway services will be added in Phases 8-9.
+  enrollment-writer:
+    build:
+      context: ../services/rust-enrollment
+      dockerfile: Dockerfile
+      args:
+        BIN_NAME: enrollment-writer
+    container_name: unieee-enrollment-writer
+    restart: unless-stopped
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis-master:
+        condition: service_healthy
+      redis-sentinel-1:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      BIND_ADDR: 0.0.0.0:8082
+      DATABASE_URL: postgresql://${POSTGRES_USER:-unieee}:${POSTGRES_PASSWORD:-unieee_dev_password}@pgbouncer:6432/${POSTGRES_DB:-unieee}
+      PG_MAX_CONNECTIONS: ${WRITER_PG_MAX_CONNECTIONS:-16}
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_GROUP_ID: unieee-enrollment-writer
+      REDIS_SENTINEL_MASTER: unieee-master
+      REDIS_SENTINEL_NODES: redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-unieee_redis_dev_password}
+      BATCH_SIZE: ${WRITER_BATCH_SIZE:-250}
+      BATCH_TIMEOUT_MS: ${WRITER_BATCH_TIMEOUT_MS:-30}
+      OUTBOX_SWEEP_INTERVAL_MS: ${WRITER_OUTBOX_SWEEP_INTERVAL_MS:-1000}
+      OUTBOX_SWEEP_BATCH_SIZE: ${WRITER_OUTBOX_SWEEP_BATCH_SIZE:-100}
+      CACHE_TTL_SECS: ${WRITER_CACHE_TTL_SECS:-900}
+    networks:
+      - app
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8082/readyz >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  # Rust SSE Gateway service will be added in Phase 9.
