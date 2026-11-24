@@ -197,4 +197,44 @@ services:
       retries: 20
       start_period: 10s
 
-  # Rust SSE Gateway service will be added in Phase 9.
+  sse-gateway:
+    build:
+      context: ../services/rust-enrollment
+      dockerfile: Dockerfile
+      args:
+        BIN_NAME: sse-gateway
+    container_name: unieee-sse-gateway
+    restart: unless-stopped
+    depends_on:
+      redis-master:
+        condition: service_healthy
+      redis-sentinel-1:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    environment:
+      BIND_ADDR: 0.0.0.0:8083
+      REDIS_SENTINEL_MASTER: unieee-master
+      REDIS_SENTINEL_NODES: redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-unieee_redis_dev_password}
+      OIDC_JWKS_URI: ${OIDC_JWKS_URI:-http://keycloak:8080/auth/realms/unieee/protocol/openid-connect/certs}
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_AUDIENCE: ${OIDC_AUDIENCE:-}
+      JWT_CACHE_TTL_SECS: ${JWT_CACHE_TTL_SECS:-30}
+      JWKS_REFRESH_INTERVAL_SECS: ${JWKS_REFRESH_INTERVAL_SECS:-300}
+      SSE_COALESCE_WINDOW_MS: ${SSE_COALESCE_WINDOW_MS:-150}
+      SSE_HEARTBEAT_INTERVAL_SECS: ${SSE_HEARTBEAT_INTERVAL_SECS:-15}
+      SSE_RETRY_MIN_MS: ${SSE_RETRY_MIN_MS:-2000}
+      SSE_RETRY_MAX_MS: ${SSE_RETRY_MAX_MS:-12000}
+      SSE_MAX_CONN_AGE_MIN_SECS: ${SSE_MAX_CONN_AGE_MIN_SECS:-2700}
+      SSE_MAX_CONN_AGE_MAX_SECS: ${SSE_MAX_CONN_AGE_MAX_SECS:-3300}
+      SSE_MAX_CONNECTIONS: ${SSE_MAX_CONNECTIONS:-50000}
+    networks:
+      - app
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8083/readyz >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
