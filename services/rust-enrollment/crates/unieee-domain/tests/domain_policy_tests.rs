@@ -23,7 +23,9 @@ fn ids_validate_uuid_v7_and_postgres_bigint_bounds() {
     assert_eq!(sec.as_u64(), 42);
     assert_eq!(sec.to_pg_i64().unwrap(), 42);
     assert_eq!("42".parse::<SectionId>().unwrap(), sec);
-    assert_eq!(u64::from(sec), 42);
+    assert_eq!(SectionId::from(42u64), sec);
+    let raw_sec: u64 = sec.into();
+    assert_eq!(raw_sec, 42);
 
     assert!(matches!(
         SectionId::try_from_pg(0),
@@ -54,23 +56,76 @@ fn ids_validate_uuid_v7_and_postgres_bigint_bounds() {
 
 #[test]
 fn enums_and_hot_path_state_machine_enforce_contracts() {
-    assert_eq!(EnrollmentAction::Register.seat_delta(), 1);
-    assert!(EnrollmentAction::Retake.is_seat_consuming());
-    assert_eq!(EnrollmentAction::Drop.seat_delta(), -1);
-    assert!(!EnrollmentAction::Drop.is_seat_consuming());
-    assert_eq!(
-        EnrollmentEventType::from(EnrollmentAction::Improve),
-        EnrollmentEventType::Improve
-    );
+    for (action, expected_str, consumes, delta, expected_evt) in [
+        (
+            EnrollmentAction::Register,
+            "REGISTER",
+            true,
+            1,
+            EnrollmentEventType::Register,
+        ),
+        (
+            EnrollmentAction::Drop,
+            "DROP",
+            false,
+            -1,
+            EnrollmentEventType::Drop,
+        ),
+        (
+            EnrollmentAction::Retake,
+            "RETAKE",
+            true,
+            1,
+            EnrollmentEventType::Retake,
+        ),
+        (
+            EnrollmentAction::Improve,
+            "IMPROVE",
+            true,
+            1,
+            EnrollmentEventType::Improve,
+        ),
+    ] {
+        assert_eq!(action.as_str(), expected_str);
+        assert_eq!(action.to_string(), expected_str);
+        assert_eq!(action.is_seat_consuming(), consumes);
+        assert_eq!(action.seat_delta(), delta);
+        assert_eq!(action.to_event_type(), expected_evt);
+        assert_eq!(EnrollmentEventType::from(action), expected_evt);
+    }
+
+    for (evt_type, expected) in [
+        (EnrollmentEventType::Register, "REGISTER"),
+        (EnrollmentEventType::Drop, "DROP"),
+        (EnrollmentEventType::Retake, "RETAKE"),
+        (EnrollmentEventType::Improve, "IMPROVE"),
+        (EnrollmentEventType::AdminAdd, "ADMIN_ADD"),
+        (EnrollmentEventType::AdminDrop, "ADMIN_DROP"),
+    ] {
+        assert_eq!(evt_type.as_str(), expected);
+    }
 
     assert_eq!(EnrollmentRecordStatus::Confirmed.as_str(), "CONFIRMED");
     assert_eq!(EnrollmentRecordStatus::Dropped.as_str(), "DROPPED");
+    assert_eq!(EnrollmentEventStatus::Confirmed.as_str(), "CONFIRMED");
+    assert_eq!(EnrollmentEventStatus::Rejected.as_str(), "REJECTED");
     assert_eq!(EnrollmentEventStatus::Reverted.as_str(), "REVERTED");
-    assert!(SectionStatus::Open.is_open_for_enrollment());
-    assert!(!SectionStatus::Frozen.is_open_for_enrollment());
-    assert_eq!(SectionStatus::Cancelled.as_str(), "CANCELLED");
+
+    for (status, expected, open) in [
+        (SectionStatus::Draft, "DRAFT", false),
+        (SectionStatus::Open, "OPEN", true),
+        (SectionStatus::Frozen, "FROZEN", false),
+        (SectionStatus::Closed, "CLOSED", false),
+        (SectionStatus::Cancelled, "CANCELLED", false),
+    ] {
+        assert_eq!(status.as_str(), expected);
+        assert_eq!(status.is_open_for_enrollment(), open);
+    }
 
     // Hot path state transitions from docs/03
+    assert_eq!(HotPathEnrollmentState::Reserved.as_str(), "RESERVED");
+    assert_eq!(HotPathEnrollmentState::DropPending.as_str(), "DROP_PENDING");
+    assert_eq!(HotPathEnrollmentState::Dropped.as_str(), "DROPPED");
     let confirmed = HotPathEnrollmentState::Reserved
         .transition_to(HotPathEnrollmentState::Confirmed)
         .unwrap();
@@ -105,13 +160,27 @@ fn enums_and_hot_path_state_machine_enforce_contracts() {
         })
     ));
 
-    // GradeRank parsing & comparisons
-    let d_plus = GradeRank::from_code(" d+ ").unwrap();
-    assert_eq!(d_plus, GradeRank::DPlus);
-    assert!(d_plus.is_passing());
-    assert!(d_plus.is_at_least(GradeRank::D));
-    assert!(d_plus.is_at_most(GradeRank::C));
-    assert!(!GradeRank::F.is_passing());
+    // GradeRank parsing & comparisons across all grades
+    let all_grades = [
+        ("F", GradeRank::F, false),
+        ("D", GradeRank::D, true),
+        ("D+", GradeRank::DPlus, true),
+        ("C", GradeRank::C, true),
+        ("C+", GradeRank::CPlus, true),
+        ("B", GradeRank::B, true),
+        ("B+", GradeRank::BPlus, true),
+        ("A", GradeRank::A, true),
+        ("A+", GradeRank::APlus, true),
+    ];
+    for (code, expected, passing) in all_grades {
+        let parsed = GradeRank::from_code(&format!(" {} ", code.to_lowercase())).unwrap();
+        assert_eq!(parsed, expected);
+        assert_eq!(parsed.code(), code);
+        assert_eq!(parsed.to_string(), code);
+        assert_eq!(parsed.is_passing(), passing);
+    }
+    assert!(GradeRank::DPlus.is_at_least(GradeRank::D));
+    assert!(GradeRank::DPlus.is_at_most(GradeRank::C));
     assert!(GradeRank::from_code("Z").is_err());
 
     assert_eq!(serde_json::to_string(&GradeRank::BPlus).unwrap(), "\"B+\"");
@@ -128,11 +197,124 @@ fn enums_and_hot_path_state_machine_enforce_contracts() {
         "\"READY_PRELOADED\""
     );
 
-    assert_eq!(RuleErrorCode::SectionFull.http_status_code(), 409);
-    assert_eq!(RuleErrorCode::SectionFull.as_str(), "SECTION_FULL");
-    assert_eq!(RuleErrorCode::StudentNotFound.http_status_code(), 404);
-    assert_eq!(RuleErrorCode::ScheduleConflict.http_status_code(), 422);
-    assert_eq!(RuleErrorCode::GateClosed.http_status_code(), 503);
+    let rule_errors = [
+        (RuleErrorCode::GateClosed, "GATE_CLOSED", 503),
+        (RuleErrorCode::NoActiveWindow, "NO_ACTIVE_WINDOW", 422),
+        (RuleErrorCode::WindowNotActive, "WINDOW_NOT_ACTIVE", 422),
+        (
+            RuleErrorCode::WindowOutsideTimeRange,
+            "WINDOW_OUTSIDE_TIME_RANGE",
+            422,
+        ),
+        (
+            RuleErrorCode::WindowActionNotAllowed,
+            "WINDOW_ACTION_NOT_ALLOWED",
+            422,
+        ),
+        (
+            RuleErrorCode::WindowCohortNotAllowed,
+            "WINDOW_COHORT_NOT_ALLOWED",
+            422,
+        ),
+        (
+            RuleErrorCode::WindowFacultyNotAllowed,
+            "WINDOW_FACULTY_NOT_ALLOWED",
+            422,
+        ),
+        (RuleErrorCode::WindowNotEligible, "WINDOW_NOT_ELIGIBLE", 422),
+        (RuleErrorCode::StudentNotFound, "STUDENT_NOT_FOUND", 404),
+        (RuleErrorCode::StudentNotActive, "STUDENT_NOT_ACTIVE", 422),
+        (RuleErrorCode::EnrollmentBlocked, "ENROLLMENT_BLOCKED", 422),
+        (
+            RuleErrorCode::TuitionDebtExceeded,
+            "TUITION_DEBT_EXCEEDED",
+            422,
+        ),
+        (
+            RuleErrorCode::MissingPrerequisite,
+            "MISSING_PREREQUISITE",
+            422,
+        ),
+        (RuleErrorCode::MissingPriorStudy, "MISSING_PRIOR_STUDY", 422),
+        (
+            RuleErrorCode::MissingCorequisite,
+            "MISSING_COREQUISITE",
+            422,
+        ),
+        (
+            RuleErrorCode::AlreadyEnrolledInCourse,
+            "ALREADY_ENROLLED_IN_COURSE",
+            409,
+        ),
+        (
+            RuleErrorCode::CourseAlreadyPassedUseImprove,
+            "COURSE_ALREADY_PASSED_USE_IMPROVE",
+            422,
+        ),
+        (RuleErrorCode::UseRetakeAction, "USE_RETAKE_ACTION", 422),
+        (
+            RuleErrorCode::RetakeRequiresPriorAttempt,
+            "RETAKE_REQUIRES_PRIOR_ATTEMPT",
+            422,
+        ),
+        (RuleErrorCode::ImproveNotAllowed, "IMPROVE_NOT_ALLOWED", 422),
+        (
+            RuleErrorCode::ImproveRequiresPassedCourse,
+            "IMPROVE_REQUIRES_PASSED_COURSE",
+            422,
+        ),
+        (
+            RuleErrorCode::GradeTooHighForImprove,
+            "GRADE_TOO_HIGH_FOR_IMPROVE",
+            422,
+        ),
+        (
+            RuleErrorCode::MaxImproveAttemptsReached,
+            "MAX_IMPROVE_ATTEMPTS_REACHED",
+            422,
+        ),
+        (RuleErrorCode::BelowMinCredits, "BELOW_MIN_CREDITS", 422),
+        (
+            RuleErrorCode::CreditLimitExceeded,
+            "CREDIT_LIMIT_EXCEEDED",
+            422,
+        ),
+        (RuleErrorCode::ScheduleConflict, "SCHEDULE_CONFLICT", 422),
+        (
+            RuleErrorCode::BufferGapViolation,
+            "BUFFER_GAP_VIOLATION",
+            422,
+        ),
+        (RuleErrorCode::SectionNotFound, "SECTION_NOT_FOUND", 404),
+        (RuleErrorCode::SectionNotOpen, "SECTION_NOT_OPEN", 409),
+        (RuleErrorCode::SectionFull, "SECTION_FULL", 409),
+        (
+            RuleErrorCode::SeatCapacityOverflow,
+            "SEAT_CAPACITY_OVERFLOW",
+            409,
+        ),
+        (
+            RuleErrorCode::NotEnrolledInSection,
+            "NOT_ENROLLED_IN_SECTION",
+            409,
+        ),
+        (RuleErrorCode::StaleEpoch, "STALE_EPOCH", 409),
+        (RuleErrorCode::DuplicateEventId, "DUPLICATE_EVENT_ID", 409),
+        (
+            RuleErrorCode::KafkaPublishFailed,
+            "KAFKA_PUBLISH_FAILED",
+            503,
+        ),
+        (
+            RuleErrorCode::DatabaseConstraintViolation,
+            "DATABASE_CONSTRAINT_VIOLATION",
+            409,
+        ),
+    ];
+    for (err, expected_code, expected_status) in rule_errors {
+        assert_eq!(err.as_str(), expected_code);
+        assert_eq!(err.http_status_code(), expected_status);
+    }
 }
 
 #[test]
@@ -242,6 +424,13 @@ fn java_policy_snapshot_json_deserializes_and_evaluates_helpers() {
         window.explain_ineligibility("K68", "EE", EnrollmentAction::Drop, in_range),
         Some(RuleErrorCode::WindowActionNotAllowed)
     );
+    let mut window_faculty = window.clone();
+    window_faculty.allowed_faculties = vec!["SOICT".to_owned()];
+    assert_eq!(
+        window_faculty.explain_ineligibility("K68", "EE", EnrollmentAction::Register, in_range),
+        Some(RuleErrorCode::WindowFacultyNotAllowed)
+    );
+
     let outside = Utc.with_ymd_and_hms(2026, 12, 1, 0, 0, 0).unwrap();
     assert_eq!(
         window.explain_ineligibility("K68", "EE", EnrollmentAction::Register, outside),
