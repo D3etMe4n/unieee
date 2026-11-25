@@ -719,6 +719,7 @@ pub fn build_student_states_from_rows(
                 action,
                 state: HotPathEnrollmentState::Confirmed,
                 last_event_id: EventId::from_uuid(e.id),
+                seat_released: false,
             });
     }
 

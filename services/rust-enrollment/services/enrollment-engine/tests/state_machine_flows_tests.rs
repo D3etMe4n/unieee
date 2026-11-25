@@ -1075,6 +1075,7 @@ async fn covers_remaining_rule_error_branches_and_idempotent_replays() {
             action: EnrollmentAction::Register,
             state: HotPathEnrollmentState::Confirmed,
             last_event_id: EventId::new_v7(),
+            seat_released: false,
         });
     assert!(
         evaluate_prerequisites(&p2, &s_with_coreq, &coreq_only, EnrollmentAction::Register).is_ok()

@@ -118,6 +118,8 @@ pub struct ActiveEnrollment {
     pub action: EnrollmentAction,
     pub state: HotPathEnrollmentState,
     pub last_event_id: EventId,
+    #[serde(default)]
+    pub seat_released: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,10 +155,12 @@ impl StudentState {
         let mut mask = ScheduleBitmask::empty();
         let mut credits = 0i32;
         for item in &self.active_enrollments {
-            if matches!(
-                item.state,
-                HotPathEnrollmentState::Reserved | HotPathEnrollmentState::Confirmed
-            ) {
+            let holds_seat_and_schedule = match item.state {
+                HotPathEnrollmentState::Reserved | HotPathEnrollmentState::Confirmed => true,
+                HotPathEnrollmentState::DropPending => !item.seat_released,
+                HotPathEnrollmentState::Reverted | HotPathEnrollmentState::Dropped => false,
+            };
+            if holds_seat_and_schedule {
                 credits = credits.saturating_add(item.credits_counted);
                 if let Some(meta) = sections.get(&item.section_id) {
                     mask.add_in_place(&meta.bitmask);

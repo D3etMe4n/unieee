@@ -98,12 +98,17 @@ fn empty_policy() -> PolicySnapshotPayload {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PolicyState {
+    policy: PolicySnapshotPayload,
+    active_window_id: Option<WindowId>,
+}
+
 pub struct EnrollmentEngine {
     catalog: ArcSwap<TermCatalog>,
     students: ShardedMap<StudentId, StudentState>,
     event_index: ShardedMap<EventId, EventStatusRecord>,
-    policy: RwLock<PolicySnapshotPayload>,
-    active_window_id: RwLock<Option<WindowId>>,
+    policy_state: ArcSwap<PolicyState>,
     applied_section_deltas: RwLock<HashSet<EventId>>,
     gate_state: AtomicU8,
     role: AtomicU8,
@@ -127,8 +132,10 @@ impl EnrollmentEngine {
             catalog: ArcSwap::from_pointee(TermCatalog::empty()),
             students: ShardedMap::new(),
             event_index: ShardedMap::new(),
-            policy: RwLock::new(empty_policy()),
-            active_window_id: RwLock::new(None),
+            policy_state: ArcSwap::from_pointee(PolicyState {
+                policy: empty_policy(),
+                active_window_id: None,
+            }),
             applied_section_deltas: RwLock::new(HashSet::new()),
             gate_state: AtomicU8::new(encode_gate_state(GateState::Preloading)),
             role: AtomicU8::new(configured_role as u8),
@@ -249,8 +256,10 @@ impl EnrollmentEngine {
         });
 
         self.catalog.store(catalog);
-        *self.policy.write() = dataset.policy;
-        *self.active_window_id.write() = dataset.active_window_id;
+        self.policy_state.store(Arc::new(PolicyState {
+            policy: dataset.policy,
+            active_window_id: dataset.active_window_id,
+        }));
         self.applied_section_deltas.write().clear();
         self.gate_state
             .store(encode_gate_state(dataset.gate_state), Ordering::Release);
@@ -495,8 +504,6 @@ impl EnrollmentEngine {
             });
         }
 
-        let policy_snapshot = self.policy.read().clone();
-        let active_window_id = *self.active_window_id.read();
         let prereqs = catalog
             .prerequisites
             .get(&section_meta.course_id)
@@ -506,54 +513,66 @@ impl EnrollmentEngine {
         let event_id = EventId::new_v7();
         let mut engine_epoch = self.epoch();
 
-        let reservation_res = self.students.with_write(&student_id, |opt_student| {
-            let Some(student) = opt_student else {
-                return Err(RuleViolation::new(
-                    RuleErrorCode::StudentNotFound,
-                    format!("Student {student_id} not preloaded"),
-                ));
-            };
+        let reservation_res = {
+            // Scope ArcSwap Guard strictly before `.await` so future remains `Send` with zero heap clone.
+            let policy_state = self.policy_state.load();
+            self.students.with_write(&student_id, |opt_student| {
+                let Some(student) = opt_student else {
+                    return Err(RuleViolation::new(
+                        RuleErrorCode::StudentNotFound,
+                        format!("Student {student_id} not preloaded"),
+                    ));
+                };
 
-            evaluate_wave_eligibility(&policy_snapshot, active_window_id, student, action, now)?;
-            evaluate_tuition_and_standing(&policy_snapshot, student, action)?;
-            evaluate_retake_improve(
-                &policy_snapshot,
-                student,
-                section_meta.course_id,
-                &section_meta.course_code,
-                action,
-            )?;
-            evaluate_prerequisites(&policy_snapshot, student, prereqs, action)?;
-            evaluate_credit_limit(&policy_snapshot, student, section_meta.credits, action)?;
-            evaluate_schedule_conflict(
-                &policy_snapshot,
-                &student.schedule_bitmask,
-                &section_meta.bitmask,
-                &section_meta.section_code,
-                action,
-            )?;
+                evaluate_wave_eligibility(
+                    &policy_state.policy,
+                    policy_state.active_window_id,
+                    student,
+                    action,
+                    now,
+                )?;
+                evaluate_tuition_and_standing(&policy_state.policy, student, action)?;
+                evaluate_retake_improve(
+                    &policy_state.policy,
+                    student,
+                    section_meta.course_id,
+                    &section_meta.course_code,
+                    action,
+                )?;
+                evaluate_prerequisites(&policy_state.policy, student, prereqs, action)?;
+                evaluate_credit_limit(&policy_state.policy, student, section_meta.credits, action)?;
+                evaluate_schedule_conflict(
+                    &policy_state.policy,
+                    &student.schedule_bitmask,
+                    &section_meta.bitmask,
+                    &section_meta.section_code,
+                    action,
+                )?;
 
-            let reservation = slot
-                .try_reserve()
-                .map_err(|e| RuleViolation::new(e.to_rule_error_code(), e.to_string()))?;
-            engine_epoch = reservation.epoch;
+                let reservation = slot
+                    .try_reserve()
+                    .map_err(|e| RuleViolation::new(e.to_rule_error_code(), e.to_string()))?;
+                engine_epoch = reservation.epoch;
 
-            let credits_counted = policy_snapshot
-                .credit_limit
-                .counted_candidate_credits(action, section_meta.credits);
-            student.active_enrollments.push(ActiveEnrollment {
-                section_id,
-                course_id: section_meta.course_id,
-                credits_counted,
-                action,
-                state: HotPathEnrollmentState::Reserved,
-                last_event_id: event_id,
-            });
-            student.processed_event_ids.insert(event_id);
-            student.recompute_schedule_and_credits(&catalog.sections_meta);
+                let credits_counted = policy_state
+                    .policy
+                    .credit_limit
+                    .counted_candidate_credits(action, section_meta.credits);
+                student.active_enrollments.push(ActiveEnrollment {
+                    section_id,
+                    course_id: section_meta.course_id,
+                    credits_counted,
+                    action,
+                    state: HotPathEnrollmentState::Reserved,
+                    last_event_id: event_id,
+                    seat_released: false,
+                });
+                student.processed_event_ids.insert(event_id);
+                student.recompute_schedule_and_credits(&catalog.sections_meta);
 
-            Ok(reservation)
-        });
+                Ok(reservation)
+            })
+        };
 
         let reservation = match reservation_res {
             Ok(r) => r,
@@ -654,65 +673,66 @@ impl EnrollmentEngine {
             });
         };
 
-        let policy_snapshot = self.policy.read().clone();
-        let active_window_id = *self.active_window_id.read();
         let event_id = EventId::new_v7();
 
-        let drop_res = self.students.with_write(&student_id, |opt_student| {
-            let Some(student) = opt_student else {
-                return Err(RuleViolation::new(
-                    RuleErrorCode::StudentNotFound,
-                    format!("Student {student_id} not preloaded"),
-                ));
-            };
+        let drop_res = {
+            // Scope ArcSwap Guard strictly before `.await` so future remains `Send` with zero heap clone.
+            let policy_state = self.policy_state.load();
+            self.students.with_write(&student_id, |opt_student| {
+                let Some(student) = opt_student else {
+                    return Err(RuleViolation::new(
+                        RuleErrorCode::StudentNotFound,
+                        format!("Student {student_id} not preloaded"),
+                    ));
+                };
 
-            evaluate_wave_eligibility(
-                &policy_snapshot,
-                active_window_id,
-                student,
-                EnrollmentAction::Drop,
-                now,
-            )?;
+                evaluate_wave_eligibility(
+                    &policy_state.policy,
+                    policy_state.active_window_id,
+                    student,
+                    EnrollmentAction::Drop,
+                    now,
+                )?;
 
-            let Some(pos) = student.active_enrollments.iter().position(|e| {
-                e.section_id == section_id
-                    && matches!(
-                        e.state,
-                        HotPathEnrollmentState::Reserved | HotPathEnrollmentState::Confirmed
-                    )
-            }) else {
-                return Err(RuleViolation::new(
-                    RuleErrorCode::NotEnrolledInSection,
-                    format!(
-                        "Student does not hold an active enrollment for section {}",
-                        section_meta.section_code
-                    ),
-                ));
-            };
+                let Some(pos) = student.active_enrollments.iter().position(|e| {
+                    e.section_id == section_id
+                        && matches!(
+                            e.state,
+                            HotPathEnrollmentState::Reserved | HotPathEnrollmentState::Confirmed
+                        )
+                }) else {
+                    return Err(RuleViolation::new(
+                        RuleErrorCode::NotEnrolledInSection,
+                        format!(
+                            "Student does not hold an active enrollment for section {}",
+                            section_meta.section_code
+                        ),
+                    ));
+                };
 
-            let credits_to_deduct = student.active_enrollments[pos].credits_counted;
-            evaluate_credit_limit(
-                &policy_snapshot,
-                student,
-                credits_to_deduct,
-                EnrollmentAction::Drop,
-            )?;
+                let credits_to_deduct = student.active_enrollments[pos].credits_counted;
+                evaluate_credit_limit(
+                    &policy_state.policy,
+                    student,
+                    credits_to_deduct,
+                    EnrollmentAction::Drop,
+                )?;
 
-            let prev_state = student.active_enrollments[pos].state;
-            let prev_event_id = student.active_enrollments[pos].last_event_id;
-            let release = slot
-                .try_release()
-                .map_err(|e| RuleViolation::new(e.to_rule_error_code(), e.to_string()))?;
+                let prev_state = student.active_enrollments[pos].state;
+                let prev_event_id = student.active_enrollments[pos].last_event_id;
+                let entry_epoch = slot.epoch();
 
-            student.active_enrollments[pos].state = HotPathEnrollmentState::DropPending;
-            student.active_enrollments[pos].last_event_id = event_id;
-            student.processed_event_ids.insert(event_id);
-            student.recompute_schedule_and_credits(&catalog.sections_meta);
+                // Defer releasing RAM seat, schedule bitmask, and credits until Kafka ACKs the drop command.
+                student.active_enrollments[pos].state = HotPathEnrollmentState::DropPending;
+                student.active_enrollments[pos].last_event_id = event_id;
+                student.active_enrollments[pos].seat_released = false;
+                student.processed_event_ids.insert(event_id);
 
-            Ok((release, prev_state, prev_event_id))
-        });
+                Ok((entry_epoch, prev_state, prev_event_id))
+            })
+        };
 
-        let (release, prev_state, prev_event_id) = match drop_res {
+        let (entry_epoch, prev_state, prev_event_id) = match drop_res {
             Ok(v) => v,
             Err(violation) => {
                 return Err(EngineError::RuleViolation {
@@ -733,7 +753,7 @@ impl EnrollmentEngine {
                 action: EnrollmentAction::Drop,
                 state: HotPathEnrollmentState::DropPending,
                 reason_code: None,
-                engine_epoch: release.epoch,
+                engine_epoch: entry_epoch,
                 updated_at: now,
             },
         );
@@ -745,7 +765,7 @@ impl EnrollmentEngine {
             section_id,
             section_meta.course_id,
             EnrollmentAction::Drop,
-            release.epoch,
+            entry_epoch,
             now,
         );
 
@@ -755,11 +775,10 @@ impl EnrollmentEngine {
                 section_id = %section_id,
                 student_id = %student_id,
                 error = %err,
-                "Kafka publish failed after RAM drop; rolling back to previous state"
+                "Kafka publish failed after marking DropPending; rolling back without touching seat slot"
             );
             self.rollback_failed_drop(
                 &catalog,
-                slot,
                 student_id,
                 section_id,
                 event_id,
@@ -773,14 +792,48 @@ impl EnrollmentEngine {
             });
         }
 
-        let _ = self.coalescer.enqueue_nonblocking(SeatTentativeEvent::new(
-            catalog.term_id,
-            section_id,
-            release.available_seats,
-            release.max_capacity,
-            release.epoch,
-            now,
-        ));
+        let mut tentative_release: Option<unieee_cacheline::SeatRelease> = None;
+        self.students.with_write(&student_id, |opt_student| {
+            let Some(student) = opt_student else {
+                return;
+            };
+            if let Some(entry) = student.active_enrollments.iter_mut().find(|e| {
+                e.section_id == section_id
+                    && e.last_event_id == event_id
+                    && e.state == HotPathEnrollmentState::DropPending
+                    && !e.seat_released
+            }) {
+                match slot.try_release() {
+                    Ok(rel) => {
+                        tentative_release = Some(rel);
+                    }
+                    Err(err) => {
+                        warn!(
+                            section_id = %section_id,
+                            error = %err,
+                            "seat slot release hit capacity ceiling after Kafka drop ACK"
+                        );
+                    }
+                }
+                entry.seat_released = true;
+                student.recompute_schedule_and_credits(&catalog.sections_meta);
+            }
+        });
+
+        let (available_seats, max_capacity, response_epoch) = if let Some(rel) = tentative_release {
+            let _ = self.coalescer.enqueue_nonblocking(SeatTentativeEvent::new(
+                catalog.term_id,
+                section_id,
+                rel.available_seats,
+                rel.max_capacity,
+                rel.epoch,
+                now,
+            ));
+            (rel.available_seats, rel.max_capacity, rel.epoch)
+        } else {
+            let snap = slot.snapshot();
+            (snap.available_seats, snap.max_capacity, snap.epoch)
+        };
 
         Ok(EnrollmentAccepted {
             event_id,
@@ -790,9 +843,9 @@ impl EnrollmentEngine {
             course_id: section_meta.course_id,
             action: EnrollmentAction::Drop,
             status: HotPathEnrollmentState::DropPending,
-            available_seats: release.available_seats,
-            max_capacity: release.max_capacity,
-            engine_epoch: release.epoch,
+            available_seats,
+            max_capacity,
+            engine_epoch: response_epoch,
             accepted_at: now,
         })
     }
@@ -807,6 +860,7 @@ impl EnrollmentEngine {
             return;
         }
         let catalog = self.catalog.load();
+        let mut tentative_to_emit: Option<SeatTentativeEvent> = None;
         self.students.with_write(&ev.student_id, |opt_student| {
             let Some(student) = opt_student else {
                 return;
@@ -821,13 +875,31 @@ impl EnrollmentEngine {
                         student.active_enrollments[pos].state = HotPathEnrollmentState::Confirmed;
                     }
                     HotPathEnrollmentState::DropPending => {
+                        let already_released = student.active_enrollments[pos].seat_released;
                         student.active_enrollments.remove(pos);
+                        if !already_released {
+                            if let Some(slot) = catalog.seat_table.get(ev.section_id) {
+                                if let Ok(rel) = slot.try_release() {
+                                    tentative_to_emit = Some(SeatTentativeEvent::new(
+                                        ev.term_id,
+                                        ev.section_id,
+                                        rel.available_seats,
+                                        rel.max_capacity,
+                                        rel.epoch,
+                                        ev.confirmed_at,
+                                    ));
+                                }
+                            }
+                        }
                         student.recompute_schedule_and_credits(&catalog.sections_meta);
                     }
                     _ => {}
                 }
             }
         });
+        if let Some(ev_tentative) = tentative_to_emit {
+            let _ = self.coalescer.enqueue_nonblocking(ev_tentative);
+        }
         self.event_index.with_write(&ev.event_id, |opt_rec| {
             if let Some(rec) = opt_rec {
                 if rec.state == HotPathEnrollmentState::DropPending {
@@ -840,8 +912,7 @@ impl EnrollmentEngine {
         });
     }
 
-    /// Apply RevertEvent with RAM-first idempotency in student shard BEFORE best-effort Redis dedup write.
-    pub async fn apply_revert_event(&self, revert: &RevertEvent) -> RevertOutcome {
+    pub(crate) fn apply_revert_in_ram(&self, revert: &RevertEvent) -> RevertOutcome {
         let catalog = self.catalog.load();
         if revert.term_id != catalog.term_id {
             return RevertOutcome::UnknownSectionOrStudent;
@@ -864,18 +935,22 @@ impl EnrollmentEngine {
                 let mut reverted_drop = false;
                 if let Some(entry) = student.active_enrollments.iter_mut().find(|e| {
                     e.section_id == revert.section_id
+                        && e.last_event_id == revert.event_id
                         && e.state == HotPathEnrollmentState::DropPending
                 }) {
-                    if let Ok(res) = slot.try_reserve() {
-                        tentative_to_emit = Some(SeatTentativeEvent::new(
-                            revert.term_id,
-                            revert.section_id,
-                            res.remaining_seats,
-                            res.max_capacity,
-                            res.epoch,
-                            revert.reverted_at,
-                        ));
+                    if entry.seat_released {
+                        if let Ok(res) = slot.try_reserve() {
+                            tentative_to_emit = Some(SeatTentativeEvent::new(
+                                revert.term_id,
+                                revert.section_id,
+                                res.remaining_seats,
+                                res.max_capacity,
+                                res.epoch,
+                                revert.reverted_at,
+                            ));
+                        }
                     }
+                    entry.seat_released = false;
                     entry.state = HotPathEnrollmentState::Confirmed;
                     reverted_drop = true;
                 }
@@ -886,12 +961,12 @@ impl EnrollmentEngine {
                 return RevertOutcome::Applied;
             }
 
-            // Register / Retake / Improve revert
-            if let Some(pos) = student
-                .active_enrollments
-                .iter()
-                .position(|e| e.section_id == revert.section_id)
-            {
+            // Register / Retake / Improve revert: match section_id, last_event_id, and Reserved state strictly.
+            if let Some(pos) = student.active_enrollments.iter().position(|e| {
+                e.section_id == revert.section_id
+                    && e.last_event_id == revert.event_id
+                    && e.state == HotPathEnrollmentState::Reserved
+            }) {
                 student.active_enrollments.remove(pos);
                 if let Ok(rel) = slot.try_release() {
                     tentative_to_emit = Some(SeatTentativeEvent::new(
@@ -910,11 +985,6 @@ impl EnrollmentEngine {
         });
 
         if outcome == RevertOutcome::Applied {
-            let final_state = if revert.action == EnrollmentAction::Drop {
-                HotPathEnrollmentState::Confirmed
-            } else {
-                HotPathEnrollmentState::Reverted
-            };
             self.event_index.insert(
                 revert.event_id,
                 EventStatusRecord {
@@ -924,7 +994,7 @@ impl EnrollmentEngine {
                     section_id: revert.section_id,
                     course_id: revert.course_id,
                     action: revert.action,
-                    state: final_state,
+                    state: HotPathEnrollmentState::Reverted,
                     reason_code: Some(revert.reason_code),
                     engine_epoch: revert.engine_epoch,
                     updated_at: revert.reverted_at,
@@ -934,7 +1004,15 @@ impl EnrollmentEngine {
             if let Some(ev) = tentative_to_emit {
                 let _ = self.coalescer.enqueue_nonblocking(ev);
             }
+        }
 
+        outcome
+    }
+
+    /// Apply RevertEvent with RAM-first idempotency in student shard BEFORE best-effort Redis dedup write.
+    pub async fn apply_revert_event(&self, revert: &RevertEvent) -> RevertOutcome {
+        let outcome = self.apply_revert_in_ram(revert);
+        if outcome == RevertOutcome::Applied {
             // Best-effort Redis dedup fallback key written strictly AFTER RAM-first idempotency update
             if let Err(err) = self
                 .revert_dedup
@@ -948,7 +1026,6 @@ impl EnrollmentEngine {
                 );
             }
         }
-
         outcome
     }
 
@@ -984,17 +1061,22 @@ impl EnrollmentEngine {
         self.gate_state
             .store(encode_gate_state(gate.gate_state), Ordering::Release);
 
-        *self.active_window_id.write() = gate.active_window_id;
-        if let Some(target_window_id) = gate.active_window_id {
-            let mut policy = self.policy.write();
-            for window in &mut policy.windows {
-                if window.id == Some(target_window_id) {
-                    window.status = WindowStatus::Active;
-                } else if window.status == WindowStatus::Active {
-                    window.status = WindowStatus::Closed;
+        self.policy_state.rcu(|current| {
+            let mut next_policy = current.policy.clone();
+            if let Some(target_window_id) = gate.active_window_id {
+                for window in &mut next_policy.windows {
+                    if window.id == Some(target_window_id) {
+                        window.status = WindowStatus::Active;
+                    } else if window.status == WindowStatus::Active {
+                        window.status = WindowStatus::Closed;
+                    }
                 }
             }
-        }
+            Arc::new(PolicyState {
+                policy: next_policy,
+                active_window_id: gate.active_window_id,
+            })
+        });
         Ok(())
     }
 
@@ -1026,7 +1108,7 @@ impl EnrollmentEngine {
         let Some(slot) = catalog.seat_table.get(cmd.section_id) else {
             return;
         };
-        let policy_snapshot = self.policy.read().clone();
+        let policy_state = self.policy_state.load();
 
         self.students.with_write(&cmd.student_id, |opt_student| {
             let Some(student) = opt_student else {
@@ -1049,6 +1131,7 @@ impl EnrollmentEngine {
                     student.active_enrollments[pos].state = HotPathEnrollmentState::DropPending;
                     student.active_enrollments[pos].last_event_id = cmd.event_id;
                     let _ = slot.try_release();
+                    student.active_enrollments[pos].seat_released = true;
                 }
                 student.processed_event_ids.insert(cmd.event_id);
                 student.recompute_schedule_and_credits(&catalog.sections_meta);
@@ -1079,7 +1162,8 @@ impl EnrollmentEngine {
             });
             if !already_holds {
                 let _ = slot.try_reserve();
-                let credits_counted = policy_snapshot
+                let credits_counted = policy_state
+                    .policy
                     .credit_limit
                     .counted_candidate_credits(cmd.action, section_meta.credits);
                 student.active_enrollments.push(ActiveEnrollment {
@@ -1089,6 +1173,7 @@ impl EnrollmentEngine {
                     action: cmd.action,
                     state: HotPathEnrollmentState::Reserved,
                     last_event_id: cmd.event_id,
+                    seat_released: false,
                 });
             }
             student.processed_event_ids.insert(cmd.event_id);
@@ -1126,7 +1211,7 @@ impl EnrollmentEngine {
             return;
         };
         let action = map_event_type_to_action(rec.event_type);
-        let policy_snapshot = self.policy.read().clone();
+        let policy_state = self.policy_state.load();
 
         self.students.with_write(&rec.student_id, |opt_student| {
             let Some(student) = opt_student else {
@@ -1188,7 +1273,8 @@ impl EnrollmentEngine {
                                 .any(|e| e.section_id == rec.section_id);
                             if !holds {
                                 let _ = slot.try_reserve();
-                                let credits_counted = policy_snapshot
+                                let credits_counted = policy_state
+                                    .policy
                                     .credit_limit
                                     .counted_candidate_credits(action, section_meta.credits);
                                 student.active_enrollments.push(ActiveEnrollment {
@@ -1198,6 +1284,7 @@ impl EnrollmentEngine {
                                     action,
                                     state: HotPathEnrollmentState::Confirmed,
                                     last_event_id: rec.event_id,
+                                    seat_released: false,
                                 });
                             }
                         }
@@ -1268,14 +1355,15 @@ impl EnrollmentEngine {
             students.push(state.clone());
         });
 
+        let policy_state = self.policy_state.load();
         PreloadDataset {
             term_id: catalog.term_id,
             term_code: catalog.term_code.clone(),
             checkpoint_seq: self.checkpoint_seq(),
             engine_epoch: self.epoch(),
             gate_state: self.gate_state(),
-            active_window_id: *self.active_window_id.read(),
-            policy: self.policy.read().clone(),
+            active_window_id: policy_state.active_window_id,
+            policy: policy_state.policy.clone(),
             sections,
             prerequisites,
             students,
@@ -1431,7 +1519,6 @@ impl EnrollmentEngine {
     fn rollback_failed_drop(
         &self,
         catalog: &TermCatalog,
-        slot: &SectionSeatSlot,
         student_id: StudentId,
         section_id: SectionId,
         event_id: EventId,
@@ -1441,14 +1528,15 @@ impl EnrollmentEngine {
     ) {
         self.students.with_write(&student_id, |opt_student| {
             if let Some(student) = opt_student {
-                if let Some(entry) = student
-                    .active_enrollments
-                    .iter_mut()
-                    .find(|e| e.section_id == section_id && e.last_event_id == event_id)
-                {
-                    let _ = slot.try_reserve();
+                if let Some(entry) = student.active_enrollments.iter_mut().find(|e| {
+                    e.section_id == section_id
+                        && e.last_event_id == event_id
+                        && e.state == HotPathEnrollmentState::DropPending
+                        && !e.seat_released
+                }) {
                     entry.state = prev_state;
                     entry.last_event_id = prev_event_id;
+                    entry.seat_released = false;
                     student.recompute_schedule_and_credits(&catalog.sections_meta);
                 }
             }

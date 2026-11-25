@@ -148,10 +148,10 @@ pub fn evaluate_retake_improve(
 
     let already_enrolled = student.active_enrollments.iter().any(|e| {
         e.course_id == course_id
-            && matches!(
+            && (matches!(
                 e.state,
                 HotPathEnrollmentState::Reserved | HotPathEnrollmentState::Confirmed
-            )
+            ) || (e.state == HotPathEnrollmentState::DropPending && !e.seat_released))
     });
     if already_enrolled {
         return Err(RuleViolation::new(

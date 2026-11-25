@@ -310,11 +310,7 @@ fn enums_and_hot_path_state_machine_enforce_contracts() {
             503,
         ),
         (RuleErrorCode::KafkaBackpressure, "KAFKA_BACKPRESSURE", 503),
-        (
-            RuleErrorCode::KafkaBackpressure,
-            "KAFKA_BACKPRESSURE",
-            503,
-        ),
+        (RuleErrorCode::KafkaBackpressure, "KAFKA_BACKPRESSURE", 503),
         (
             RuleErrorCode::DatabaseConstraintViolation,
             "DATABASE_CONSTRAINT_VIOLATION",
