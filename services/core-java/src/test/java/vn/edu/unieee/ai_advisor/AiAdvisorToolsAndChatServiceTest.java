@@ -16,8 +16,6 @@ import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -47,6 +45,7 @@ import vn.edu.unieee.ai_advisor.internal.cache.RedisSectionSeatCacheReader;
 import vn.edu.unieee.ai_advisor.internal.cache.SectionSeatCacheReader;
 import vn.edu.unieee.ai_advisor.internal.config.AiAdvisorConfig;
 import vn.edu.unieee.ai_advisor.internal.config.AiAdvisorProperties;
+import vn.edu.unieee.ai_advisor.internal.config.AiAdvisorVirtualThreadRunner;
 import vn.edu.unieee.ai_advisor.internal.exception.AiAdvisorGuardrailViolationException;
 import vn.edu.unieee.ai_advisor.internal.guardrail.AdvisorCircuitBreaker;
 import vn.edu.unieee.ai_advisor.internal.guardrail.AdvisorRateLimiter;
@@ -205,6 +204,7 @@ class AiAdvisorToolsAndChatServiceTest {
         };
 
         AiAdvisorConfig config = new AiAdvisorConfig();
+        assertThat(config.aiAdvisorClock()).isNotNull();
         AiAdvisorProperties props = new AiAdvisorProperties();
         Clock fixedClock = Clock.fixed(Instant.parse("2026-08-01T09:00:00Z"), ZoneOffset.UTC);
         BitmaskConflictChecker bitmaskChecker = new BitmaskConflictChecker();
@@ -212,7 +212,7 @@ class AiAdvisorToolsAndChatServiceTest {
             accountFacade, catalogFacade, registrationFacade, bitmaskChecker, seatCacheReader
         );
         ToolCallback[] verifiedCallbacks = config.validatedAdvisorToolCallbacks(tools, new ReadOnlyToolGuardrail());
-        try (ExecutorService vtExecutor = config.aiAdvisorVirtualThreadExecutor()) {
+        try (AiAdvisorVirtualThreadRunner vtRunner = config.aiAdvisorVirtualThreadRunner()) {
             AiAdvisorChatService chatService = new AiAdvisorChatService(
                 providerOf(scriptedChatModel),
                 verifiedCallbacks,
@@ -227,7 +227,7 @@ class AiAdvisorToolsAndChatServiceTest {
                 new ScheduleSuggestionPostValidator(bitmaskChecker),
                 props,
                 fixedClock,
-                vtExecutor
+                vtRunner
             );
             AiAdvisorFacade facade = new AiAdvisorFacadeImpl(chatService);
 
@@ -305,12 +305,12 @@ class AiAdvisorToolsAndChatServiceTest {
         );
         AdvisorCircuitBreaker circuitBreaker = new AdvisorCircuitBreaker(props, fixedClock);
 
-        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+        try (AiAdvisorVirtualThreadRunner runner = new AiAdvisorVirtualThreadRunner()) {
             // 1. Absent ChatModel -> deterministic fallback
             AiAdvisorChatService absentService = new AiAdvisorChatService(
                 providerOf(null), callbacks, accountFacade, catalogFacade, registrationFacade,
                 checker, noOpCache, new PromptInjectionGuardrail(), new AdvisorRateLimiter(props, fixedClock),
-                circuitBreaker, new ScheduleSuggestionPostValidator(checker), props, fixedClock, executor
+                circuitBreaker, new ScheduleSuggestionPostValidator(checker), props, fixedClock, runner
             );
             var absentRes = absentService.advise(new AiAdvisorChatRequest(
                 termId, "Gợi ý lịch học", 6, List.of("CS101"), List.of(), true, false
@@ -331,7 +331,7 @@ class AiAdvisorToolsAndChatServiceTest {
             AiAdvisorChatService timeoutService = new AiAdvisorChatService(
                 providerOf(slowModel), callbacks, accountFacade, catalogFacade, registrationFacade,
                 checker, noOpCache, new PromptInjectionGuardrail(), new AdvisorRateLimiter(props, fixedClock),
-                circuitBreaker, new ScheduleSuggestionPostValidator(checker), props, fixedClock, executor
+                circuitBreaker, new ScheduleSuggestionPostValidator(checker), props, fixedClock, runner
             );
             var timeoutRes = timeoutService.advise(new AiAdvisorChatRequest(termId, "Gợi ý", null, null, null, null, null));
             assertThat(timeoutRes.fallbackUsed()).isTrue();

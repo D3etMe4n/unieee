@@ -11,7 +11,6 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
@@ -38,6 +37,7 @@ import vn.edu.unieee.ai_advisor.internal.bitmask.BitmaskConflictChecker;
 import vn.edu.unieee.ai_advisor.internal.bitmask.SectionBitmaskInput;
 import vn.edu.unieee.ai_advisor.internal.cache.SectionSeatCacheReader;
 import vn.edu.unieee.ai_advisor.internal.config.AiAdvisorProperties;
+import vn.edu.unieee.ai_advisor.internal.config.AiAdvisorVirtualThreadRunner;
 import vn.edu.unieee.ai_advisor.internal.guardrail.AdvisorCircuitBreaker;
 import vn.edu.unieee.ai_advisor.internal.guardrail.AdvisorRateLimiter;
 import vn.edu.unieee.ai_advisor.internal.guardrail.AiAdvisorToolContext;
@@ -98,7 +98,7 @@ public class AiAdvisorChatService {
     private final ScheduleSuggestionPostValidator postValidator;
     private final AiAdvisorProperties properties;
     private final Clock clock;
-    private final ExecutorService aiAdvisorVirtualThreadExecutor;
+    private final AiAdvisorVirtualThreadRunner virtualThreadRunner;
 
     public AiAdvisorScheduleSuggestionResponse advise(AiAdvisorChatRequest request) {
         StudentProfileResponse student = accountFacade.getMyStudentProfile();
@@ -262,7 +262,7 @@ public class AiAdvisorChatService {
         AiAdvisorToolContext toolContext
     ) throws InterruptedException, ExecutionException, TimeoutException {
         SecurityContext callerSecurityContext = SecurityContextHolder.getContext();
-        CompletableFuture<String> future = CompletableFuture.supplyAsync(() -> {
+        CompletableFuture<String> future = virtualThreadRunner.supplyAsync(() -> {
             SecurityContext previous = SecurityContextHolder.getContext();
             try {
                 SecurityContextHolder.setContext(callerSecurityContext);
@@ -277,7 +277,7 @@ public class AiAdvisorChatService {
             } finally {
                 SecurityContextHolder.setContext(previous);
             }
-        }, aiAdvisorVirtualThreadExecutor);
+        });
 
         long timeoutMillis = Math.max(100L, properties.getTimeout().toMillis());
         try {
