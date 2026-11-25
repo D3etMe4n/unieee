@@ -3,11 +3,11 @@ use crate::core::models::{
     ActiveEnrollment, BootstrapOptions, BootstrapReport, BootstrapSourceKind,
     CoursePrerequisiteEdge, DeltaOutcome, EngineError, EngineReadiness, EngineRuntimeOptions,
     EnrollmentAccepted, EventStatusRecord, NodeRole, PreloadDataset, ReplayEventRecord,
-    RevertOutcome, SectionMeta, StudentState,
+    RevertOutcome, SectionMeta, StudentState, SweepReport,
 };
 use crate::core::ports::{
-    CommandPublisher, FallbackEventLogSource, KafkaReplaySource, PreloadSource, PublishError,
-    RevertDedupStore,
+    CommandPublisher, EventStatusCacheReader, EventStatusFallbackStore, FallbackEventLogSource,
+    KafkaReplaySource, PreloadSource, PublishError, RevertDedupStore,
 };
 use crate::core::rules::{
     evaluate_credit_limit, evaluate_prerequisites, evaluate_retake_improve,
@@ -16,13 +16,14 @@ use crate::core::rules::{
 };
 use crate::core::snapshot::SnapshotStore;
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{watch, Notify, Semaphore};
+use tokio::task::JoinHandle;
 use tracing::warn;
 use unieee_cacheline::{SeatSlotTable, SectionSeatSlot, SectionSlotState, ShardedMap};
 use unieee_domain::{
@@ -127,6 +128,122 @@ impl Drop for InFlightGuard<'_> {
     }
 }
 
+struct IdempotencyEntry {
+    key: String,
+    accepted: EnrollmentAccepted,
+    expires_at: DateTime<Utc>,
+}
+
+struct IdempotencyCache {
+    entries: ShardedMap<StudentId, Vec<IdempotencyEntry>>,
+    total_entries: AtomicUsize,
+    ttl: ChronoDuration,
+    max_entries: usize,
+    max_per_student: usize,
+}
+
+impl IdempotencyCache {
+    fn new(ttl: Duration, max_entries: usize, max_per_student: usize) -> Self {
+        let ttl_chrono =
+            ChronoDuration::from_std(ttl).unwrap_or_else(|_| ChronoDuration::seconds(60));
+        Self {
+            entries: ShardedMap::new(),
+            total_entries: AtomicUsize::new(0),
+            ttl: ttl_chrono.max(ChronoDuration::milliseconds(1)),
+            max_entries: max_entries.max(1),
+            max_per_student: max_per_student.max(1),
+        }
+    }
+
+    fn get(
+        &self,
+        student_id: StudentId,
+        key: &str,
+        now: DateTime<Utc>,
+    ) -> Option<EnrollmentAccepted> {
+        self.entries.with_read(&student_id, |opt| {
+            opt.and_then(|list| {
+                list.iter()
+                    .find(|entry| entry.key == key && entry.expires_at > now)
+                    .map(|entry| entry.accepted.clone())
+            })
+        })
+    }
+
+    fn insert(
+        &self,
+        student_id: StudentId,
+        key: String,
+        accepted: EnrollmentAccepted,
+        now: DateTime<Utc>,
+    ) {
+        let expires_at = now + self.ttl;
+        self.entries.with_entry(student_id, Vec::new, |list| {
+            let before = list.len();
+            list.retain(|entry| entry.expires_at > now);
+            let removed_expired = before.saturating_sub(list.len());
+            if removed_expired > 0 {
+                let _ =
+                    self.total_entries
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                            Some(cur.saturating_sub(removed_expired))
+                        });
+            }
+
+            if let Some(existing) = list.iter_mut().find(|entry| entry.key == key) {
+                existing.accepted = accepted;
+                existing.expires_at = expires_at;
+                return;
+            }
+
+            if list.len() >= self.max_per_student {
+                if let Some((oldest_idx, _)) = list
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, entry)| entry.expires_at)
+                {
+                    list.remove(oldest_idx);
+                    list.push(IdempotencyEntry {
+                        key,
+                        accepted,
+                        expires_at,
+                    });
+                }
+                return;
+            }
+
+            let cur_total = self.total_entries.load(Ordering::Acquire);
+            if cur_total < self.max_entries {
+                self.total_entries.fetch_add(1, Ordering::AcqRel);
+                list.push(IdempotencyEntry {
+                    key,
+                    accepted,
+                    expires_at,
+                });
+            }
+        });
+    }
+
+    fn clear(&self) {
+        self.entries.clear();
+        self.total_entries.store(0, Ordering::Release);
+    }
+
+    fn sweep(&self, now: DateTime<Utc>) -> usize {
+        let mut evicted = 0usize;
+        let mut remaining = 0usize;
+        self.entries.retain(|_, list| {
+            let before = list.len();
+            list.retain(|entry| entry.expires_at > now);
+            evicted = evicted.saturating_add(before.saturating_sub(list.len()));
+            remaining = remaining.saturating_add(list.len());
+            !list.is_empty()
+        });
+        self.total_entries.store(remaining, Ordering::Release);
+        evicted
+    }
+}
+
 pub struct EnrollmentEngine {
     catalog: ArcSwap<TermCatalog>,
     students: ShardedMap<StudentId, StudentState>,
@@ -141,10 +258,16 @@ pub struct EnrollmentEngine {
     in_flight: AtomicUsize,
     in_flight_zero: Notify,
     publish_semaphore: Arc<Semaphore>,
+    status_pg_semaphore: Arc<Semaphore>,
+    idempotency_cache: IdempotencyCache,
+    status_negative_cache: ShardedMap<EventId, DateTime<Utc>>,
+    status_negative_count: AtomicUsize,
     runtime_opts: EngineRuntimeOptions,
     command_publisher: Arc<dyn CommandPublisher>,
     coalescer: SeatTentativeCoalescerHandle,
     revert_dedup: Arc<dyn RevertDedupStore>,
+    event_status_cache: Option<Arc<dyn EventStatusCacheReader>>,
+    event_status_pg: Option<Arc<dyn EventStatusFallbackStore>>,
 }
 
 impl EnrollmentEngine {
@@ -173,6 +296,12 @@ impl EnrollmentEngine {
         runtime_opts: EngineRuntimeOptions,
     ) -> Self {
         let publish_permits = runtime_opts.max_in_flight_kafka_publishes.max(1);
+        let pg_lookup_permits = runtime_opts.status_pg_lookup_concurrency.max(1);
+        let idempotency_cache = IdempotencyCache::new(
+            runtime_opts.idempotency_ttl,
+            runtime_opts.idempotency_max_entries,
+            runtime_opts.idempotency_max_per_student,
+        );
         Self {
             catalog: ArcSwap::from_pointee(TermCatalog::empty()),
             students: ShardedMap::new(),
@@ -190,11 +319,28 @@ impl EnrollmentEngine {
             in_flight: AtomicUsize::new(0),
             in_flight_zero: Notify::new(),
             publish_semaphore: Arc::new(Semaphore::new(publish_permits)),
+            status_pg_semaphore: Arc::new(Semaphore::new(pg_lookup_permits)),
+            idempotency_cache,
+            status_negative_cache: ShardedMap::new(),
+            status_negative_count: AtomicUsize::new(0),
             runtime_opts,
             command_publisher,
             coalescer,
             revert_dedup,
+            event_status_cache: None,
+            event_status_pg: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_status_fallbacks(
+        mut self,
+        event_status_cache: Option<Arc<dyn EventStatusCacheReader>>,
+        event_status_pg: Option<Arc<dyn EventStatusFallbackStore>>,
+    ) -> Self {
+        self.event_status_cache = event_status_cache;
+        self.event_status_pg = event_status_pg;
+        self
     }
 
     #[must_use]
@@ -312,6 +458,9 @@ impl EnrollmentEngine {
         let mut sub_to_student = HashMap::with_capacity(dataset.students.len());
         self.students.clear();
         self.event_index.clear();
+        self.idempotency_cache.clear();
+        self.status_negative_cache.clear();
+        self.status_negative_count.store(0, Ordering::Release);
         for mut student in dataset.students {
             student.recompute_schedule_and_credits(&sections_meta);
             if let Some(sub) = student
@@ -547,6 +696,18 @@ impl EnrollmentEngine {
         action: EnrollmentAction,
         now: DateTime<Utc>,
     ) -> Result<EnrollmentAccepted, EngineError> {
+        self.register_with_idempotency(student_id, section_id, action, None, now)
+            .await
+    }
+
+    pub async fn register_with_idempotency(
+        &self,
+        student_id: StudentId,
+        section_id: SectionId,
+        action: EnrollmentAction,
+        idempotency_key: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<EnrollmentAccepted, EngineError> {
         if action == EnrollmentAction::Drop {
             return Err(EngineError::RuleViolation {
                 code: RuleErrorCode::WindowActionNotAllowed,
@@ -556,6 +717,12 @@ impl EnrollmentEngine {
         // Track active mutating handler before checking readiness/role/gate to close demote TOCTOU window.
         let _in_flight = InFlightGuard::enter(&self.in_flight, &self.in_flight_zero);
         self.ensure_ready_active_gate_open()?;
+
+        if let Some(key) = idempotency_key {
+            if let Some(cached) = self.idempotency_cache.get(student_id, key, now) {
+                return Ok(cached);
+            }
+        }
 
         let _publish_permit = self
             .publish_semaphore
@@ -749,7 +916,7 @@ impl EnrollmentEngine {
             now,
         ));
 
-        Ok(EnrollmentAccepted {
+        let accepted = EnrollmentAccepted {
             event_id,
             term_id: catalog.term_id,
             student_id,
@@ -761,7 +928,12 @@ impl EnrollmentEngine {
             max_capacity: reservation.max_capacity,
             engine_epoch,
             accepted_at: now,
-        })
+        };
+        if let Some(key) = idempotency_key {
+            self.idempotency_cache
+                .insert(student_id, key.to_owned(), accepted.clone(), now);
+        }
+        Ok(accepted)
     }
 
     pub async fn drop_section(
@@ -770,8 +942,25 @@ impl EnrollmentEngine {
         section_id: SectionId,
         now: DateTime<Utc>,
     ) -> Result<EnrollmentAccepted, EngineError> {
+        self.drop_section_with_idempotency(student_id, section_id, None, now)
+            .await
+    }
+
+    pub async fn drop_section_with_idempotency(
+        &self,
+        student_id: StudentId,
+        section_id: SectionId,
+        idempotency_key: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<EnrollmentAccepted, EngineError> {
         let _in_flight = InFlightGuard::enter(&self.in_flight, &self.in_flight_zero);
         self.ensure_ready_active_gate_open()?;
+
+        if let Some(key) = idempotency_key {
+            if let Some(cached) = self.idempotency_cache.get(student_id, key, now) {
+                return Ok(cached);
+            }
+        }
 
         let _publish_permit = self
             .publish_semaphore
@@ -976,7 +1165,7 @@ impl EnrollmentEngine {
             (snap.available_seats, snap.max_capacity, snap.epoch)
         };
 
-        Ok(EnrollmentAccepted {
+        let accepted = EnrollmentAccepted {
             event_id,
             term_id: catalog.term_id,
             student_id,
@@ -988,12 +1177,208 @@ impl EnrollmentEngine {
             max_capacity,
             engine_epoch: response_epoch,
             accepted_at: now,
-        })
+        };
+        if let Some(key) = idempotency_key {
+            self.idempotency_cache
+                .insert(student_id, key.to_owned(), accepted.clone(), now);
+        }
+        Ok(accepted)
     }
 
     #[must_use]
     pub fn get_event_status(&self, event_id: EventId) -> Option<EventStatusRecord> {
         self.event_index.get_cloned(&event_id)
+    }
+
+    pub async fn get_event_status_with_fallback(
+        &self,
+        event_id: EventId,
+        now: DateTime<Utc>,
+    ) -> Result<Option<EventStatusRecord>, EngineError> {
+        // Tier 1: Hot in-memory RAM index
+        if let Some(rec) = self.event_index.get_cloned(&event_id) {
+            return Ok(Some(rec));
+        }
+
+        // Tier 2: Short-lived negative cache protecting Redis/PG against random-UUID floods
+        let neg_hit = self
+            .status_negative_cache
+            .with_read(&event_id, |opt| opt.is_some_and(|exp| *exp > now));
+        if neg_hit {
+            return Ok(None);
+        }
+
+        // Tier 3: Redis `unieee:event:status:{eventId}` written by enrollment-writer
+        if let Some(redis_reader) = &self.event_status_cache {
+            match redis_reader.get_event_status(event_id).await {
+                Ok(Some(rec)) => return Ok(Some(rec)),
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(event_id = %event_id, error = %err, "Redis event status fallback failed; falling back to PostgreSQL");
+                }
+            }
+        }
+
+        // Tier 4: Concurrency-bounded PostgreSQL point lookup on `registration.enrollment_events`
+        let Some(pg_store) = &self.event_status_pg else {
+            return Ok(None);
+        };
+        let _pg_permit = self
+            .status_pg_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| EngineError::ServiceUnavailable {
+                code: "STATUS_LOOKUP_SATURATED",
+                detail: "Event status database lookup concurrency limit reached; retry shortly"
+                    .to_owned(),
+            })?;
+
+        match pg_store.find_event_by_id(event_id).await {
+            Ok(Some(rec)) => {
+                let course_id = self
+                    .catalog
+                    .load()
+                    .sections_meta
+                    .get(&rec.section_id)
+                    .map(|meta| meta.course_id)
+                    .unwrap_or_else(|| CourseId::from_uuid(uuid::Uuid::nil()));
+                let action = map_event_type_to_action(rec.event_type);
+                let state = match rec.status {
+                    EnrollmentEventStatus::Confirmed => {
+                        if matches!(
+                            rec.event_type,
+                            EnrollmentEventType::Drop | EnrollmentEventType::AdminDrop
+                        ) {
+                            HotPathEnrollmentState::Dropped
+                        } else {
+                            HotPathEnrollmentState::Confirmed
+                        }
+                    }
+                    EnrollmentEventStatus::Rejected | EnrollmentEventStatus::Reverted => {
+                        HotPathEnrollmentState::Reverted
+                    }
+                };
+                let reason_code = rec
+                    .reason_code
+                    .as_deref()
+                    .and_then(RuleErrorCode::from_code);
+                Ok(Some(EventStatusRecord {
+                    event_id: rec.event_id,
+                    term_id: rec.term_id,
+                    student_id: rec.student_id,
+                    section_id: rec.section_id,
+                    course_id,
+                    action,
+                    state,
+                    reason_code,
+                    engine_epoch: rec.engine_epoch,
+                    updated_at: rec.created_at,
+                }))
+            }
+            Ok(None) => {
+                let ttl = ChronoDuration::from_std(self.runtime_opts.status_negative_cache_ttl)
+                    .unwrap_or_else(|_| ChronoDuration::seconds(10));
+                let cur_count = self.status_negative_count.load(Ordering::Acquire);
+                if cur_count < self.runtime_opts.status_negative_cache_max_entries.max(1)
+                    && self
+                        .status_negative_cache
+                        .insert(event_id, now + ttl)
+                        .is_none()
+                {
+                    self.status_negative_count.fetch_add(1, Ordering::AcqRel);
+                }
+                Ok(None)
+            }
+            Err(err) => {
+                warn!(event_id = %event_id, error = %err, "PostgreSQL event status point-lookup failed");
+                Err(EngineError::Internal(err))
+            }
+        }
+    }
+
+    /// Periodically evicts settled `event_index` entries past TTL (`event_index_ttl`), expired
+    /// idempotency / negative-status entries, and UUIDv7 dedup IDs strictly older than >=24h.
+    pub fn sweep_expired_state(&self, now: DateTime<Utc>) -> SweepReport {
+        let event_ttl = ChronoDuration::from_std(self.runtime_opts.event_index_ttl)
+            .unwrap_or_else(|_| ChronoDuration::seconds(1800));
+        let evicted_event_index = self.event_index.retain(|_, rec| {
+            let is_settled = matches!(
+                rec.state,
+                HotPathEnrollmentState::Confirmed
+                    | HotPathEnrollmentState::Dropped
+                    | HotPathEnrollmentState::Reverted
+            );
+            if !is_settled {
+                return true;
+            }
+            now.signed_duration_since(rec.updated_at) < event_ttl
+        });
+
+        let evicted_idempotency = self.idempotency_cache.sweep(now);
+
+        let mut remaining_neg = 0usize;
+        let evicted_negative_status = self.status_negative_cache.retain(|_, expires_at| {
+            let keep = *expires_at > now;
+            if keep {
+                remaining_neg = remaining_neg.saturating_add(1);
+            }
+            keep
+        });
+        self.status_negative_count
+            .store(remaining_neg, Ordering::Release);
+
+        // Enforce strict >=24h floor so dedup sets are never pruned prematurely.
+        let min_dedup = Duration::from_secs(86_400);
+        let dedup_retention = self.runtime_opts.dedup_retention.max(min_dedup);
+        let dedup_chrono = ChronoDuration::from_std(dedup_retention)
+            .unwrap_or_else(|_| ChronoDuration::seconds(86_400));
+
+        let mut pruned_dedup_ids = 0usize;
+        self.students.for_each_write(|_, student| {
+            let pinned: HashSet<EventId> = student
+                .active_enrollments
+                .iter()
+                .map(|e| e.last_event_id)
+                .collect();
+
+            let before_proc = student.processed_event_ids.len();
+            student.processed_event_ids.retain(|id| {
+                pinned.contains(id)
+                    || id
+                        .v7_timestamp_utc()
+                        .is_none_or(|ts| now.signed_duration_since(ts) <= dedup_chrono)
+            });
+            pruned_dedup_ids = pruned_dedup_ids
+                .saturating_add(before_proc.saturating_sub(student.processed_event_ids.len()));
+
+            let before_rev = student.reverted_event_ids.len();
+            student.reverted_event_ids.retain(|id| {
+                pinned.contains(id)
+                    || id
+                        .v7_timestamp_utc()
+                        .is_none_or(|ts| now.signed_duration_since(ts) <= dedup_chrono)
+            });
+            pruned_dedup_ids = pruned_dedup_ids
+                .saturating_add(before_rev.saturating_sub(student.reverted_event_ids.len()));
+        });
+
+        {
+            let mut deltas = self.applied_section_deltas.write();
+            let before_deltas = deltas.len();
+            deltas.retain(|id| {
+                id.v7_timestamp_utc()
+                    .is_none_or(|ts| now.signed_duration_since(ts) <= dedup_chrono)
+            });
+            pruned_dedup_ids =
+                pruned_dedup_ids.saturating_add(before_deltas.saturating_sub(deltas.len()));
+        }
+
+        SweepReport {
+            evicted_event_index,
+            evicted_idempotency,
+            evicted_negative_status,
+            pruned_dedup_ids,
+        }
     }
 
     pub fn apply_seat_confirmed(&self, ev: &SeatConfirmedEvent) {
@@ -1803,4 +2188,30 @@ const fn map_event_type_to_action(event_type: EnrollmentEventType) -> Enrollment
         EnrollmentEventType::Retake => EnrollmentAction::Retake,
         EnrollmentEventType::Improve => EnrollmentAction::Improve,
     }
+}
+
+pub fn spawn_state_sweeper(
+    engine: Arc<EnrollmentEngine>,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    let tick_every = interval.max(Duration::from_millis(50));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(tick_every);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Consume immediate first tick so first sweep waits one interval.
+        let _ = ticker.tick().await;
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                _ = ticker.tick() => {
+                    let _ = engine.sweep_expired_state(Utc::now());
+                }
+            }
+        }
+    })
 }

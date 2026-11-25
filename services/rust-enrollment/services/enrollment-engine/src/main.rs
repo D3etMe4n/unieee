@@ -10,10 +10,14 @@ use enrollment_engine::adapters::kafka::{
 };
 use enrollment_engine::adapters::postgres::PgPreloadAndReplayAdapter;
 use enrollment_engine::adapters::redis_io::{
-    connect_redis_backend, spawn_pubsub_listener, RedisRevertDedupStore, RedisTentativeSink,
+    connect_redis_backend, spawn_pubsub_listener, RedisEventStatusReader, RedisRevertDedupStore,
+    RedisTentativeSink,
 };
 use enrollment_engine::config::EngineConfig;
-use enrollment_engine::core::{spawn_coalescer, EnrollmentEngine, OidcJwtVerifier, SnapshotStore};
+use enrollment_engine::core::{
+    spawn_coalescer, spawn_state_sweeper, EnrollmentEngine, EventStatusCacheReader,
+    EventStatusFallbackStore, OidcJwtVerifier, SnapshotStore,
+};
 use enrollment_engine::http::build_router;
 use enrollment_engine::http::handlers::AppState;
 use std::sync::Arc;
@@ -43,19 +47,25 @@ async fn main() -> anyhow::Result<()> {
 
     let tentative_sink = Arc::new(RedisTentativeSink::new(redis_backend.clone()));
     let revert_dedup = Arc::new(RedisRevertDedupStore::new(redis_backend.clone()));
+    let event_status_cache = Arc::new(RedisEventStatusReader::new(redis_backend.clone()))
+        as Arc<dyn EventStatusCacheReader>;
+    let event_status_pg = Arc::new(pg_adapter.clone()) as Arc<dyn EventStatusFallbackStore>;
     let (coalescer, coalescer_handle) = spawn_coalescer(
         tentative_sink,
         Duration::from_millis(cfg.coalesce_window_ms),
         4096,
     );
 
-    let engine = Arc::new(EnrollmentEngine::with_options(
-        cfg.node_role,
-        kafka_pub,
-        coalescer,
-        revert_dedup,
-        cfg.to_runtime_options(),
-    ));
+    let engine = Arc::new(
+        EnrollmentEngine::with_options(
+            cfg.node_role,
+            kafka_pub,
+            coalescer,
+            revert_dedup,
+            cfg.to_runtime_options(),
+        )
+        .with_status_fallbacks(Some(event_status_cache), Some(event_status_pg)),
+    );
 
     let jwks_fetcher = Arc::new(
         ReqwestJwksFetcher::new(cfg.oidc_jwks_uri.clone(), Duration::from_secs(5))
@@ -66,6 +76,11 @@ async fn main() -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let jwks_handle = Arc::clone(&verifier).spawn_background_refresher(
         Duration::from_secs(cfg.jwks_refresh_interval_secs),
+        shutdown_rx.clone(),
+    );
+    let sweeper_handle = spawn_state_sweeper(
+        Arc::clone(&engine),
+        Duration::from_secs(cfg.event_index_sweep_interval_secs),
         shutdown_rx.clone(),
     );
 
@@ -135,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
         .await;
     let _ = shutdown_tx.send(true);
     let _ = supervisor_handle.await;
+    let _ = sweeper_handle.await;
     drop(coalescer_handle);
     drop(jwks_handle);
     Ok(())

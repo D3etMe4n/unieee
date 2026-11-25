@@ -1,5 +1,8 @@
 use crate::config::EngineConfig;
-use crate::core::{EnrollmentEngine, RevertDedupStore, TentativeSeatSink};
+use crate::core::{
+    EnrollmentEngine, EventStatusCacheReader, EventStatusRecord, RevertDedupStore,
+    TentativeSeatSink,
+};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use redis::sentinel::{Sentinel, SentinelNodeConnectionInfo};
@@ -11,9 +14,9 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 use unieee_domain::EventId;
 use unieee_events::{
-    encode_json, revert_dedup_key, HotPathPubSubMessage, SeatTentativeEvent,
-    REDIS_CHANNEL_ENROLLMENT_REVERT, REDIS_CHANNEL_GATE_CONTROL, REDIS_CHANNEL_SEAT_CONFIRMED,
-    REDIS_CHANNEL_SEAT_TENTATIVE,
+    decode_json, encode_json, event_status_cache_key, revert_dedup_key, EventStatusCachePayload,
+    HotPathPubSubMessage, SeatTentativeEvent, REDIS_CHANNEL_ENROLLMENT_REVERT,
+    REDIS_CHANNEL_GATE_CONTROL, REDIS_CHANNEL_SEAT_CONFIRMED, REDIS_CHANNEL_SEAT_TENTATIVE,
 };
 
 #[derive(Clone)]
@@ -213,6 +216,54 @@ impl RevertDedupStore for RedisRevertDedupStore {
         conn.set_ex::<_, _, ()>(key, "1", ttl_secs)
             .await
             .map_err(|e| format!("Redis SET revert dedup failed: {e}"))
+    }
+}
+
+pub fn decode_event_status_payload(raw: &str) -> Result<EventStatusRecord, String> {
+    let payload: EventStatusCachePayload =
+        decode_json(raw).map_err(|e| format!("invalid EventStatusCachePayload: {e}"))?;
+    Ok(EventStatusRecord {
+        event_id: payload.event_id,
+        term_id: payload.term_id,
+        student_id: payload.student_id,
+        section_id: payload.section_id,
+        course_id: payload.course_id,
+        action: payload.action,
+        state: payload.status,
+        reason_code: payload.reason_code,
+        engine_epoch: payload.engine_epoch,
+        updated_at: payload.updated_at,
+    })
+}
+
+#[derive(Clone)]
+pub struct RedisEventStatusReader {
+    backend: RedisBackend,
+}
+
+impl RedisEventStatusReader {
+    #[must_use]
+    pub const fn new(backend: RedisBackend) -> Self {
+        Self { backend }
+    }
+}
+
+#[async_trait]
+impl EventStatusCacheReader for RedisEventStatusReader {
+    async fn get_event_status(
+        &self,
+        event_id: EventId,
+    ) -> Result<Option<EventStatusRecord>, String> {
+        let mut conn = self.backend.get_multiplexed_async_connection().await?;
+        let key = event_status_cache_key(event_id);
+        let raw: Option<String> = conn
+            .get(key)
+            .await
+            .map_err(|e| format!("Redis GET event status failed: {e}"))?;
+        match raw {
+            Some(json) => decode_event_status_payload(&json).map(Some),
+            None => Ok(None),
+        }
     }
 }
 

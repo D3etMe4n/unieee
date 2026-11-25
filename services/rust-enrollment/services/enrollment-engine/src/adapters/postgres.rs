@@ -1,6 +1,7 @@
 use crate::core::{
-    ActiveEnrollment, CoursePrerequisiteEdge, FallbackEventLogSource, PreloadDataset,
-    PreloadSource, ReplayEventRecord, SectionMeta, StudentCourseAttempt, StudentState,
+    ActiveEnrollment, CoursePrerequisiteEdge, EventStatusFallbackStore, FallbackEventLogSource,
+    PreloadDataset, PreloadSource, ReplayEventRecord, SectionMeta, StudentCourseAttempt,
+    StudentState,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -463,6 +464,43 @@ impl FallbackEventLogSource for PgPreloadAndReplayAdapter {
             })
             .collect();
         build_replay_records(&raw_rows)
+    }
+}
+
+#[async_trait]
+impl EventStatusFallbackStore for PgPreloadAndReplayAdapter {
+    async fn find_event_by_id(
+        &self,
+        event_id: EventId,
+    ) -> Result<Option<ReplayEventRecord>, String> {
+        let row = sqlx::query(
+            "SELECT seq, event_id, term_id, student_id, section_id, event_type, status, \
+             reason_code, engine_epoch, created_at \
+             FROM registration.enrollment_events \
+             WHERE event_id = $1 LIMIT 1",
+        )
+        .bind(event_id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("PostgreSQL event point-lookup failed: {e}"))?;
+
+        let Some(r) = row else {
+            return Ok(None);
+        };
+        let raw = RawEventRow {
+            seq: r.get("seq"),
+            event_id: r.get("event_id"),
+            term_id: r.get("term_id"),
+            student_id: r.get("student_id"),
+            section_id: r.get("section_id"),
+            event_type: r.get("event_type"),
+            status: r.get("status"),
+            reason_code: r.get("reason_code"),
+            engine_epoch: r.get("engine_epoch"),
+            created_at: r.get("created_at"),
+        };
+        let mut parsed = build_replay_records(&[raw])?;
+        Ok(parsed.pop())
     }
 }
 

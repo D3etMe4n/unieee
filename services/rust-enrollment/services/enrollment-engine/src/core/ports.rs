@@ -1,4 +1,4 @@
-use crate::core::models::{PreloadDataset, ReplayEventRecord};
+use crate::core::models::{EventStatusRecord, PreloadDataset, ReplayEventRecord};
 use async_trait::async_trait;
 use thiserror::Error;
 use unieee_domain::{EventId, TermId};
@@ -74,4 +74,20 @@ pub trait FallbackEventLogSource: Send + Sync {
 #[async_trait]
 pub trait JwksFetcher: Send + Sync {
     async fn fetch_jwks_json(&self) -> Result<String, String>;
+}
+
+#[async_trait]
+pub trait EventStatusCacheReader: Send + Sync {
+    async fn get_event_status(
+        &self,
+        event_id: EventId,
+    ) -> Result<Option<EventStatusRecord>, String>;
+}
+
+#[async_trait]
+pub trait EventStatusFallbackStore: Send + Sync {
+    async fn find_event_by_id(
+        &self,
+        event_id: EventId,
+    ) -> Result<Option<ReplayEventRecord>, String>;
 }
