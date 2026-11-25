@@ -27,6 +27,7 @@ repositories {
 dependencyManagement {
     imports {
         mavenBom(libs.spring.modulith.bom.get().toString())
+        mavenBom(libs.spring.ai.bom.get().toString())
     }
 }
 
@@ -39,6 +40,7 @@ dependencies {
     implementation("org.springframework.boot:spring-boot-starter-validation")
     implementation("org.springframework.boot:spring-boot-starter-actuator")
     implementation("org.springframework.boot:spring-boot-starter-data-redis")
+    implementation("org.springframework.ai:spring-ai-starter-model-openai")
 
     implementation("org.springframework.modulith:spring-modulith-starter-core")
     implementation("org.springframework.modulith:spring-modulith-starter-jpa")
