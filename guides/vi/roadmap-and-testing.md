@@ -46,5 +46,5 @@ Mọi Pull Request vào `dev` hoặc `main` đều chạy 2 job tự động:
    - Kiểm tra syntax script shell (`bash -n` / `sh -n`) và cấu hình realm Keycloak (`registrationAllowed == false`, đủ 3 role).
    - Xác thực toàn bộ 5 tổ hợp Compose (`compose.base.yml`, `compose.hotpath.yml`, `compose.letsencrypt.yml`, `compose.cloudflared.yml`).
    - Kiểm tra toàn bộ liên kết tương đối trong `README.md` và `README.vi.md`.
-2. **Spring Boot 4.1.2 Core & Modulith:**
+2. **Spring Boot 4.1.3 Core & Modulith:**
    - Chạy `./gradlew check --no-daemon` trên PostgreSQL Testcontainers thật, cưỡng chế `ModularityVerificationTest` và ngưỡng JaCoCo phân tầng.

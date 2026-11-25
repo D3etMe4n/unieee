@@ -15,7 +15,7 @@ This guide shows how to start the **unieee** stack locally, authenticate with Ke
 | :--- | :--- | :--- |
 | **Podman + Compose** *(default)* | Podman 5.x + `podman compose` | Preferred container runtime in [scripts/unieee.sh](../../scripts/unieee.sh). |
 | **Docker + Compose** *(fallback)* | Docker Engine + Compose v2 | Selected automatically if Podman is absent, or forced via `--runtime docker`. |
-| **Java JDK** | Temurin / OpenJDK **21 (LTS)** | Required only if running `./gradlew check` outside containers. |
+| **Java JDK** | Temurin / OpenJDK **25 (LTS)** | Required only if running `./gradlew check` outside containers. |
 | **CLI utilities** | `bash`, `curl`, `jq` | Used for smoke requests and inspecting JSON responses. |
 
 ---

@@ -33,10 +33,10 @@ Public guides for repository visitors, operators, and contributors live under `g
 
 ## Architecture Overview
 
-- **Warm / Cold Path — Spring Boot 4.1.2 Modular Monolith (`services/core-java/`):**
+- **Warm / Cold Path — Spring Boot 4.1.3 Modular Monolith (`services/core-java/`):**
   - Organized as **4 Bounded Contexts** (`catalog`, `account`, `registration`, and planned Phase 10 `ai_advisor`) over an open shared kernel (`common`) with a strict 1-way linear dependency DAG verified by Spring Modulith and schema-per-bounded-context PostgreSQL isolation (`V001`–`V005`).
   - Manages academic terms, faculties/majors/curricula, courses & DAG prerequisites, course sections with 20-week bitmask schedules, Keycloak account provisioning, credit-weighted GPA, admin enrollment overrides protected by a **Single-Writer Gate Guard** (`409 REGISTRATION_GATE_OPEN` when `REGISTRATION_OPEN`), non-seat-reserving wish surveys, registration wave windows, and a configurable **Multi-University Policy Engine** with SHA-256 snapshot export (`unieee:cache:policy:{termId}:snapshot`).
-  - Built with **Java 21 (Virtual Threads)**, **Spring Modulith** (Event Publication Registry + Cleanup Job), **Spring Data JPA**, **Flyway**, **Spring Security** (Keycloak OIDC 1.0 / OAuth 2.0 / JWT), **MapStruct**, and upcoming **Spring AI** (`ai_advisor`).
+  - Built with **Java 25 (Virtual Threads)**, **Spring Modulith** (Event Publication Registry + Cleanup Job), **Spring Data JPA**, **Flyway**, **Spring Security** (Keycloak OIDC 1.0 / OAuth 2.0 / JWT), **MapStruct**, and upcoming **Spring AI** (`ai_advisor`).
 - **Hot Path — Rust Service Cluster (`services/rust-enrollment/` — Planned Phases 6–9):**
   - **Enrollment State-Machine (`enrollment-engine`, Axum + Tokio):** Holds registration state in RAM using *cache-line* aligned structures (`#[repr(align(64))]`), per-student sharding, lock-free atomic seat reservations, and `O(1)` **Bitmask** schedule conflict checks; publishes events to **Kafka (KRaft)** and supports state recovery via event replay and Active–Standby failover.
   - **Writer / Commit Service (`enrollment-writer`):** Consumes Kafka batches, validates and commits durably to **PostgreSQL** (via **PgBouncer**) using `UNNEST` + Atomic `UPDATE` + `CHECK` constraints; updates **Redis HA** (Read Cache & Pub/Sub) and emits compensating **Revert** events if PostgreSQL rejects a record.
@@ -49,7 +49,7 @@ Public guides for repository visitors, operators, and contributors live under `g
 
 ## Implementation Progress
 
-**Phases 1–5 are completed and merged into `dev`** (monorepo & container infrastructure, Spring Boot 4.1.2 Modulith core, `catalog`/`account`/`registration` bounded contexts with `V001`–`V005`, wish surveys, registration windows, and multi-university Policy Engine + snapshot export). **Phases 6–12** (Rust Hot Path cluster, Spring AI advisor, HA failover drills, and k6 load testing) follow next — see [Implementation Roadmap & Testing](./guides/en/roadmap-and-testing.md).
+**Phases 1–5 are completed and merged into `dev`** (monorepo & container infrastructure, Spring Boot 4.1.3 Modulith core, `catalog`/`account`/`registration` bounded contexts with `V001`–`V005`, wish surveys, registration windows, and multi-university Policy Engine + snapshot export). **Phases 6–12** (Rust Hot Path cluster, Spring AI advisor, HA failover drills, and k6 load testing) follow next — see [Implementation Roadmap & Testing](./guides/en/roadmap-and-testing.md).
 
 ---
 
@@ -65,7 +65,7 @@ Public guides for repository visitors, operators, and contributors live under `g
 
 | Layer / Component | Technology |
 | :--- | :--- |
-| Core Monolith & AI | Java 21 (Virtual Threads), Spring Boot 4.1.2, Spring Modulith, Gradle Kotlin DSL, JPA, Flyway, MapStruct, Spring AI |
+| Core Monolith & AI | Java 25 (Virtual Threads), Spring Boot 4.1.3, Spring Modulith, Gradle Kotlin DSL, JPA, Flyway, MapStruct, Spring AI |
 | Hot Path Services | Rust, Axum, Tokio (`enrollment-engine`, `enrollment-writer`, `sse-gateway`) |
 | Database & Pooling | PostgreSQL (`CHECK` constraints + Event Sourcing), PgBouncer |
 | Cache & Pub/Sub | Redis HA (Master–Replica + Sentinel, AOF/RDB) |
@@ -85,7 +85,7 @@ unieee/
 │   ├── en/                      # English guides (setup, architecture, API, roadmap)
 │   └── vi/                      # Vietnamese guides
 ├── services/
-│   ├── core-java/               # Spring Boot 4.1.2 Modular Monolith (common, catalog, account, registration)
+│   ├── core-java/               # Spring Boot 4.1.3 Modular Monolith (common, catalog, account, registration)
 │   └── rust-enrollment/         # Rust Cargo Workspace (crates/ + services/) [Phases 6-9]
 ├── infra/
 │   ├── compose.base.yml         # Base stack (core profile)

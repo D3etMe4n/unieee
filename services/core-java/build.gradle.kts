@@ -6,11 +6,11 @@ plugins {
 }
 
 group = "vn.edu.unieee"
-version = "0.1.0-SNAPSHOT"
+version = "0.1.1-SNAPSHOT"
 
 java {
     toolchain {
-        languageVersion = JavaLanguageVersion.of(21)
+        languageVersion = JavaLanguageVersion.of(25)
     }
 }
 
@@ -76,7 +76,7 @@ tasks.withType<Test> {
 }
 
 jacoco {
-    toolVersion = "0.8.13"
+    toolVersion = "0.8.14"
 }
 
 val jacocoExclusions = listOf(

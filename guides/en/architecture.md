@@ -2,7 +2,7 @@
 
 **Language:** **English** | [Tiếng Việt](../vi/architecture.md) | [Documentation Hub](../README.md)
 
-**unieee** combines a **Spring Boot 4.1.2 Modular Monolith** (Warm/Cold Path running 24/7) with a planned **Rust Hot Path** (toggled on during peak registration windows), unified around **PostgreSQL** as the single Source of Truth and **Redis HA** strictly as a Read Cache & Pub/Sub backbone.
+**unieee** combines a **Spring Boot 4.1.3 Modular Monolith** (Warm/Cold Path running 24/7) with a planned **Rust Hot Path** (toggled on during peak registration windows), unified around **PostgreSQL** as the single Source of Truth and **Redis HA** strictly as a Read Cache & Pub/Sub backbone.
 
 ---
 
@@ -10,7 +10,7 @@
 
 | Dimension | Warm / Cold Path (`services/core-java/`) | Hot Path (`services/rust-enrollment/` — Phases 6–9) |
 | :--- | :--- | :--- |
-| **Runtime** | Java 21 (Virtual Threads), Spring Boot 4.1.2, Spring Modulith 2.1.2 | Rust, Axum, Tokio (`enrollment-engine`, `enrollment-writer`, `sse-gateway`) |
+| **Runtime** | Java 25 (Virtual Threads), Spring Boot 4.1.3, Spring Modulith 2.1.2 | Rust, Axum, Tokio (`enrollment-engine`, `enrollment-writer`, `sse-gateway`) |
 | **Scope** | Curricula, courses, prerequisites, terms, sections, Keycloak provisioning, wish surveys, policy engine & snapshot export, registration windows, admin overrides, reconciliation, AI advisor (Phase 10) | High-concurrency seat reservation in RAM, lock-free CAS capacity decrement, `O(1)` Bitmask conflict checks, Kafka batch ingestion, PostgreSQL `UNNEST` batch commit + Revert, real-time SSE fan-out |
 | **Lifecycle** | Active **24/7** (`core` Compose profile) | Activated cyclically before peak waves (`prepare-registration` / `open-registration`) and drained cleanly afterward (`close-registration`) |
 
