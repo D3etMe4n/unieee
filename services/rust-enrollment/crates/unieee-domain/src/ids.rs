@@ -74,6 +74,17 @@ impl EventId {
     pub fn is_v7(&self) -> bool {
         self.0.get_version() == Some(Version::SortRand)
     }
+
+    /// Extract UTC timestamp from UUIDv7 `EventId`; returns `None` for non-v7 UUIDs.
+    #[must_use]
+    pub fn v7_timestamp_utc(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        if !self.is_v7() {
+            return None;
+        }
+        let ts = self.0.get_timestamp()?;
+        let (secs, nanos) = ts.to_unix();
+        chrono::DateTime::from_timestamp(i64::try_from(secs).ok()?, nanos)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

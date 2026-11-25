@@ -552,4 +552,15 @@ fn sharded_map_remove_if_is_atomic_and_conditional() {
     assert_eq!(map.remove_if(&s2, |count| *count == 0), Some(0));
     assert!(!map.contains_key(&s2));
     assert!(map.remove_if(&StudentId::new_v4(), |_| true).is_none());
+
+    let s3 = StudentId::new_v4();
+    map.insert(s3, 10);
+    map.for_each_write(|_, v| *v += 1);
+    assert_eq!(map.get_cloned(&s1), Some(4));
+    assert_eq!(map.get_cloned(&s3), Some(11));
+
+    let evicted = map.retain(|_, v| *v >= 10);
+    assert_eq!(evicted, 1);
+    assert!(!map.contains_key(&s1));
+    assert_eq!(map.get_cloned(&s3), Some(11));
 }

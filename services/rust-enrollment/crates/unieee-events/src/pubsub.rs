@@ -6,8 +6,8 @@ use crate::topics::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use unieee_domain::{
-    CourseId, EnrollmentAction, EnrollmentEventStatus, EventId, GateState, RuleErrorCode,
-    SectionId, StudentId, TermId, WindowId,
+    CourseId, EnrollmentAction, EnrollmentEventStatus, EventId, GateState, HotPathEnrollmentState,
+    RuleErrorCode, SectionId, StudentId, TermId, WindowId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,5 +214,59 @@ impl HotPathPubSubMessage {
             REDIS_CHANNEL_GATE_CONTROL => Ok(Self::GateControl(decode_json(raw)?)),
             other => Err(EventCodecError::UnknownChannel(other.to_owned())),
         }
+    }
+}
+
+/// Terminal/post-commit status snapshot persisted to `unieee:event:status:{eventId}` by `enrollment-writer`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventStatusCachePayload {
+    pub schema_version: u16,
+    pub event_id: EventId,
+    pub term_id: TermId,
+    pub student_id: StudentId,
+    pub section_id: SectionId,
+    pub course_id: CourseId,
+    pub action: EnrollmentAction,
+    pub status: HotPathEnrollmentState,
+    pub reason_code: Option<RuleErrorCode>,
+    pub engine_epoch: u64,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl EventStatusCachePayload {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        event_id: EventId,
+        term_id: TermId,
+        student_id: StudentId,
+        section_id: SectionId,
+        course_id: CourseId,
+        action: EnrollmentAction,
+        status: HotPathEnrollmentState,
+        reason_code: Option<RuleErrorCode>,
+        engine_epoch: u64,
+        updated_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            schema_version: EVENT_SCHEMA_VERSION_V1,
+            event_id,
+            term_id,
+            student_id,
+            section_id,
+            course_id,
+            action,
+            status,
+            reason_code,
+            engine_epoch,
+            updated_at,
+        }
+    }
+}
+
+impl VersionedEvent for EventStatusCachePayload {
+    fn schema_version(&self) -> u16 {
+        self.schema_version
     }
 }

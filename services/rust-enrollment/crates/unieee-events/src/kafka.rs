@@ -1,4 +1,5 @@
 use crate::envelope::{VersionedEvent, EVENT_SCHEMA_VERSION_V1};
+use crate::pubsub::{GateControlEvent, RevertEvent};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -219,14 +220,18 @@ impl VersionedEvent for SectionCapacityUpdatedEvent {
 pub enum EnrollmentDeltaEvent {
     StudentStandingUpdated(StudentStandingUpdatedEvent),
     SectionCapacityUpdated(SectionCapacityUpdatedEvent),
+    Revert(RevertEvent),
+    GateControl(GateControlEvent),
 }
 
 impl EnrollmentDeltaEvent {
     #[must_use]
-    pub const fn event_id(&self) -> EventId {
+    pub const fn event_id(&self) -> Option<EventId> {
         match self {
-            Self::StudentStandingUpdated(e) => e.event_id,
-            Self::SectionCapacityUpdated(e) => e.event_id,
+            Self::StudentStandingUpdated(e) => Some(e.event_id),
+            Self::SectionCapacityUpdated(e) => Some(e.event_id),
+            Self::Revert(e) => Some(e.event_id),
+            Self::GateControl(_) => None,
         }
     }
 
@@ -235,6 +240,8 @@ impl EnrollmentDeltaEvent {
         match self {
             Self::StudentStandingUpdated(e) => e.term_id,
             Self::SectionCapacityUpdated(e) => e.term_id,
+            Self::Revert(e) => e.term_id,
+            Self::GateControl(e) => e.term_id,
         }
     }
 
@@ -243,6 +250,8 @@ impl EnrollmentDeltaEvent {
         match self {
             Self::StudentStandingUpdated(e) => e.partition_key(),
             Self::SectionCapacityUpdated(e) => e.partition_key(),
+            Self::Revert(e) => e.student_id.to_string(),
+            Self::GateControl(e) => e.term_id.to_string(),
         }
     }
 
@@ -251,6 +260,8 @@ impl EnrollmentDeltaEvent {
         match self {
             Self::StudentStandingUpdated(e) => e.occurred_at,
             Self::SectionCapacityUpdated(e) => e.occurred_at,
+            Self::Revert(e) => e.reverted_at,
+            Self::GateControl(e) => e.issued_at,
         }
     }
 }
@@ -260,6 +271,8 @@ impl VersionedEvent for EnrollmentDeltaEvent {
         match self {
             Self::StudentStandingUpdated(e) => e.schema_version,
             Self::SectionCapacityUpdated(e) => e.schema_version,
+            Self::Revert(e) => e.schema_version,
+            Self::GateControl(e) => e.schema_version,
         }
     }
 }

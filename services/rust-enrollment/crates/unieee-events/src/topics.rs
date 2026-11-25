@@ -33,3 +33,8 @@ pub fn policy_snapshot_cache_key(term_id: TermId) -> String {
 pub fn revert_dedup_key(event_id: EventId) -> String {
     format!("unieee:revert:dedup:{event_id}")
 }
+
+#[must_use]
+pub fn event_status_cache_key(event_id: EventId) -> String {
+    format!("unieee:event:status:{event_id}")
+}

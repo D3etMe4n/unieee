@@ -960,6 +960,9 @@ impl EnrollmentEngine {
             EnrollmentDeltaEvent::SectionCapacityUpdated(ev) => {
                 self.apply_section_capacity_delta(ev)
             }
+            EnrollmentDeltaEvent::Revert(_) | EnrollmentDeltaEvent::GateControl(_) => {
+                DeltaOutcome::WrongTerm
+            }
         }
     }
 
