@@ -140,8 +140,17 @@ pub async fn dispatch_pubsub_payload(engine: &EnrollmentEngine, channel: &str, p
             let _ = engine.apply_revert_event(&ev).await;
         }
         Ok(HotPathPubSubMessage::GateControl(ev)) => {
-            if let Err(code) = engine.apply_gate_control(&ev) {
-                warn!(code = code.as_str(), "ignored GateControlEvent");
+            let drained = engine
+                .apply_gate_control_and_drain(&ev, engine.drain_timeout())
+                .await;
+            match drained {
+                Ok(false) => {
+                    warn!("gate transitioned to DRAINING but in-flight requests did not fully drain before timeout");
+                }
+                Err(code) => {
+                    warn!(code = code.as_str(), "ignored GateControlEvent");
+                }
+                Ok(true) => {}
             }
         }
         Ok(HotPathPubSubMessage::SeatTentative(_)) => {}

@@ -49,11 +49,12 @@ async fn main() -> anyhow::Result<()> {
         4096,
     );
 
-    let engine = Arc::new(EnrollmentEngine::new_awaiting_preload(
+    let engine = Arc::new(EnrollmentEngine::with_options(
         cfg.node_role,
         kafka_pub,
         coalescer,
         revert_dedup,
+        cfg.to_runtime_options(),
     ));
 
     let jwks_fetcher = Arc::new(
@@ -112,6 +113,8 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let shutdown_engine = Arc::clone(&engine);
+    let drain_timeout = cfg.to_runtime_options().drain_timeout;
     let router = build_router(AppState {
         engine,
         verifier,
@@ -127,6 +130,9 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("HTTP server error")?;
 
+    let _ = shutdown_engine
+        .demote_to_standby_and_drain(drain_timeout)
+        .await;
     let _ = shutdown_tx.send(true);
     let _ = supervisor_handle.await;
     drop(coalescer_handle);

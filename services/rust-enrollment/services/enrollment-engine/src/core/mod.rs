@@ -10,13 +10,13 @@ pub use auth::{AuthError, OidcJwtVerifier, OidcVerifierConfig, VerifiedClaims};
 pub use coalescer::{spawn_coalescer, SeatTentativeCoalescerHandle};
 pub use models::{
     ActiveEnrollment, BootstrapOptions, BootstrapReport, BootstrapSourceKind,
-    CoursePrerequisiteEdge, DeltaOutcome, EngineError, EngineReadiness, EnrollmentAccepted,
-    EventStatusRecord, NodeRole, PreloadDataset, ReplayEventRecord, RevertOutcome, SectionMeta,
-    StudentCourseAttempt, StudentState,
+    CoursePrerequisiteEdge, DeltaOutcome, EngineError, EngineReadiness, EngineRuntimeOptions,
+    EnrollmentAccepted, EventStatusRecord, NodeRole, PreloadDataset, ReplayEventRecord,
+    RevertOutcome, SectionMeta, StudentCourseAttempt, StudentState, SweepReport,
 };
 pub use ports::{
     CommandPublisher, FallbackEventLogSource, JwksFetcher, KafkaPartitionOffset, KafkaReplayBatch,
-    KafkaReplaySource, PreloadSource, RevertDedupStore, TentativeSeatSink,
+    KafkaReplaySource, PreloadSource, PublishError, RevertDedupStore, TentativeSeatSink,
 };
 pub use snapshot::{DiskSnapshotMeta, LoadedDiskSnapshot, SnapshotError, SnapshotStore};
 pub use state_machine::EnrollmentEngine;

@@ -1,7 +1,18 @@
 use crate::core::models::{PreloadDataset, ReplayEventRecord};
 use async_trait::async_trait;
+use thiserror::Error;
 use unieee_domain::{EventId, TermId};
 use unieee_events::{EnrollmentCommandEvent, EnrollmentDeltaEvent, SeatTentativeEvent};
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum PublishError {
+    /// Broker or local client definitely did not persist the message; safe to roll back RAM.
+    #[error("definite Kafka publish failure: {0}")]
+    Definite(String),
+    /// Delivery outcome is unknown (e.g., timeout/disconnect after send); retain RAM state pending reconciliation.
+    #[error("indeterminate Kafka publish failure: {0}")]
+    Indeterminate(String),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KafkaPartitionOffset {
@@ -19,7 +30,7 @@ pub struct KafkaReplayBatch {
 
 #[async_trait]
 pub trait CommandPublisher: Send + Sync {
-    async fn publish_command(&self, event: &EnrollmentCommandEvent) -> Result<(), String>;
+    async fn publish_command(&self, event: &EnrollmentCommandEvent) -> Result<(), PublishError>;
 }
 
 #[async_trait]

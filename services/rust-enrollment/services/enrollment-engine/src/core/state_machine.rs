@@ -1,12 +1,13 @@
 use crate::core::coalescer::SeatTentativeCoalescerHandle;
 use crate::core::models::{
     ActiveEnrollment, BootstrapOptions, BootstrapReport, BootstrapSourceKind,
-    CoursePrerequisiteEdge, DeltaOutcome, EngineError, EngineReadiness, EnrollmentAccepted,
-    EventStatusRecord, NodeRole, PreloadDataset, ReplayEventRecord, RevertOutcome, SectionMeta,
-    StudentState,
+    CoursePrerequisiteEdge, DeltaOutcome, EngineError, EngineReadiness, EngineRuntimeOptions,
+    EnrollmentAccepted, EventStatusRecord, NodeRole, PreloadDataset, ReplayEventRecord,
+    RevertOutcome, SectionMeta, StudentState,
 };
 use crate::core::ports::{
-    CommandPublisher, FallbackEventLogSource, KafkaReplaySource, PreloadSource, RevertDedupStore,
+    CommandPublisher, FallbackEventLogSource, KafkaReplaySource, PreloadSource, PublishError,
+    RevertDedupStore,
 };
 use crate::core::rules::{
     evaluate_credit_limit, evaluate_prerequisites, evaluate_retake_improve,
@@ -18,8 +19,10 @@ use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{Notify, Semaphore};
 use tracing::warn;
 use unieee_cacheline::{SeatSlotTable, SectionSeatSlot, SectionSlotState, ShardedMap};
 use unieee_domain::{
@@ -104,6 +107,26 @@ struct PolicyState {
     active_window_id: Option<WindowId>,
 }
 
+struct InFlightGuard<'a> {
+    counter: &'a AtomicUsize,
+    notify: &'a Notify,
+}
+
+impl<'a> InFlightGuard<'a> {
+    fn enter(counter: &'a AtomicUsize, notify: &'a Notify) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self { counter, notify }
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        if self.counter.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.notify.notify_waiters();
+        }
+    }
+}
+
 pub struct EnrollmentEngine {
     catalog: ArcSwap<TermCatalog>,
     students: ShardedMap<StudentId, StudentState>,
@@ -115,6 +138,10 @@ pub struct EnrollmentEngine {
     readiness: AtomicU8,
     epoch: AtomicU64,
     checkpoint_seq: AtomicI64,
+    in_flight: AtomicUsize,
+    in_flight_zero: Notify,
+    publish_semaphore: Arc<Semaphore>,
+    runtime_opts: EngineRuntimeOptions,
     command_publisher: Arc<dyn CommandPublisher>,
     coalescer: SeatTentativeCoalescerHandle,
     revert_dedup: Arc<dyn RevertDedupStore>,
@@ -128,6 +155,24 @@ impl EnrollmentEngine {
         coalescer: SeatTentativeCoalescerHandle,
         revert_dedup: Arc<dyn RevertDedupStore>,
     ) -> Self {
+        Self::with_options(
+            configured_role,
+            command_publisher,
+            coalescer,
+            revert_dedup,
+            EngineRuntimeOptions::default(),
+        )
+    }
+
+    #[must_use]
+    pub fn with_options(
+        configured_role: NodeRole,
+        command_publisher: Arc<dyn CommandPublisher>,
+        coalescer: SeatTentativeCoalescerHandle,
+        revert_dedup: Arc<dyn RevertDedupStore>,
+        runtime_opts: EngineRuntimeOptions,
+    ) -> Self {
+        let publish_permits = runtime_opts.max_in_flight_kafka_publishes.max(1);
         Self {
             catalog: ArcSwap::from_pointee(TermCatalog::empty()),
             students: ShardedMap::new(),
@@ -142,9 +187,43 @@ impl EnrollmentEngine {
             readiness: AtomicU8::new(EngineReadiness::AwaitingPreload as u8),
             epoch: AtomicU64::new(1),
             checkpoint_seq: AtomicI64::new(0),
+            in_flight: AtomicUsize::new(0),
+            in_flight_zero: Notify::new(),
+            publish_semaphore: Arc::new(Semaphore::new(publish_permits)),
+            runtime_opts,
             command_publisher,
             coalescer,
             revert_dedup,
+        }
+    }
+
+    #[must_use]
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
+    #[must_use]
+    pub const fn drain_timeout(&self) -> Duration {
+        self.runtime_opts.drain_timeout
+    }
+
+    pub async fn drain_in_flight(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.in_flight_zero.notified();
+            if self.in_flight.load(Ordering::SeqCst) == 0 {
+                return true;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return self.in_flight.load(Ordering::SeqCst) == 0;
+            }
+            if tokio::time::timeout(deadline - now, notified)
+                .await
+                .is_err()
+            {
+                return self.in_flight.load(Ordering::SeqCst) == 0;
+            }
         }
     }
 
@@ -474,7 +553,18 @@ impl EnrollmentEngine {
                 detail: "Use /api/v1/enrollments/drop for DROP action".to_owned(),
             });
         }
+        // Track active mutating handler before checking readiness/role/gate to close demote TOCTOU window.
+        let _in_flight = InFlightGuard::enter(&self.in_flight, &self.in_flight_zero);
         self.ensure_ready_active_gate_open()?;
+
+        let _publish_permit = self
+            .publish_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| EngineError::RuleViolation {
+                code: RuleErrorCode::KafkaBackpressure,
+                detail: "Kafka publish pipeline saturated; retry shortly".to_owned(),
+            })?;
 
         let catalog = self.catalog.load_full();
         let Some(section_meta) = catalog.sections_meta.get(&section_id) else {
@@ -617,20 +707,37 @@ impl EnrollmentEngine {
             now,
         );
 
-        if let Err(err) = self.command_publisher.publish_command(&cmd).await {
-            warn!(
-                event_id = %event_id,
-                section_id = %section_id,
-                student_id = %student_id,
-                error = %err,
-                "Kafka publish failed after RAM seat reservation; rolling back RAM state"
-            );
-            self.rollback_failed_register(&catalog, slot, student_id, event_id, now);
-            return Err(EngineError::RuleViolation {
-                code: RuleErrorCode::KafkaPublishFailed,
-                detail: "Temporary messaging failure; seat reservation rolled back".to_owned(),
-            });
+        match self.command_publisher.publish_command(&cmd).await {
+            Ok(()) => {}
+            Err(PublishError::Definite(err)) => {
+                warn!(
+                    event_id = %event_id,
+                    section_id = %section_id,
+                    student_id = %student_id,
+                    error = %err,
+                    "definite Kafka publish failure after RAM seat reservation; rolling back RAM state"
+                );
+                self.rollback_failed_register(&catalog, slot, student_id, event_id, now);
+                return Err(EngineError::RuleViolation {
+                    code: RuleErrorCode::KafkaPublishFailed,
+                    detail: "Temporary messaging failure; seat reservation rolled back".to_owned(),
+                });
+            }
+            Err(PublishError::Indeterminate(err)) => {
+                warn!(
+                    event_id = %event_id,
+                    section_id = %section_id,
+                    student_id = %student_id,
+                    error = %err,
+                    "indeterminate Kafka publish outcome after RAM seat reservation; retaining RESERVED pending reconciliation"
+                );
+                return Err(EngineError::RuleViolation {
+                    code: RuleErrorCode::KafkaPublishFailed,
+                    detail: "Messaging delivery outcome indeterminate; seat reservation retained pending reconciliation".to_owned(),
+                });
+            }
         }
+        drop(_publish_permit);
 
         // Non-blocking enqueue into 50ms coalescer (0 Redis blocking round-trips on critical path)
         let _ = self.coalescer.enqueue_nonblocking(SeatTentativeEvent::new(
@@ -663,7 +770,17 @@ impl EnrollmentEngine {
         section_id: SectionId,
         now: DateTime<Utc>,
     ) -> Result<EnrollmentAccepted, EngineError> {
+        let _in_flight = InFlightGuard::enter(&self.in_flight, &self.in_flight_zero);
         self.ensure_ready_active_gate_open()?;
+
+        let _publish_permit = self
+            .publish_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| EngineError::RuleViolation {
+                code: RuleErrorCode::KafkaBackpressure,
+                detail: "Kafka publish pipeline saturated; retry shortly".to_owned(),
+            })?;
 
         let catalog = self.catalog.load_full();
         let Some(section_meta) = catalog.sections_meta.get(&section_id) else {
@@ -775,28 +892,46 @@ impl EnrollmentEngine {
             now,
         );
 
-        if let Err(err) = self.command_publisher.publish_command(&cmd).await {
-            warn!(
-                event_id = %event_id,
-                section_id = %section_id,
-                student_id = %student_id,
-                error = %err,
-                "Kafka publish failed after marking DropPending; rolling back without touching seat slot"
-            );
-            self.rollback_failed_drop(
-                &catalog,
-                student_id,
-                section_id,
-                event_id,
-                prev_state,
-                prev_event_id,
-                now,
-            );
-            return Err(EngineError::RuleViolation {
-                code: RuleErrorCode::KafkaPublishFailed,
-                detail: "Temporary messaging failure; drop action rolled back".to_owned(),
-            });
+        match self.command_publisher.publish_command(&cmd).await {
+            Ok(()) => {}
+            Err(PublishError::Definite(err)) => {
+                warn!(
+                    event_id = %event_id,
+                    section_id = %section_id,
+                    student_id = %student_id,
+                    error = %err,
+                    "definite Kafka publish failure after marking DropPending; rolling back without touching seat slot"
+                );
+                self.rollback_failed_drop(
+                    &catalog,
+                    student_id,
+                    section_id,
+                    event_id,
+                    prev_state,
+                    prev_event_id,
+                    now,
+                );
+                return Err(EngineError::RuleViolation {
+                    code: RuleErrorCode::KafkaPublishFailed,
+                    detail: "Temporary messaging failure; drop action rolled back".to_owned(),
+                });
+            }
+            Err(PublishError::Indeterminate(err)) => {
+                warn!(
+                    event_id = %event_id,
+                    section_id = %section_id,
+                    student_id = %student_id,
+                    error = %err,
+                    "indeterminate Kafka publish outcome for DropPending; retaining seat_released=false pending reconciliation"
+                );
+                return Err(EngineError::RuleViolation {
+                    code: RuleErrorCode::KafkaPublishFailed,
+                    detail: "Messaging delivery outcome indeterminate; drop pending reconciliation"
+                        .to_owned(),
+                });
+            }
         }
+        drop(_publish_permit);
 
         let mut tentative_release: Option<unieee_cacheline::SeatRelease> = None;
         self.students.with_write(&student_id, |opt_student| {
@@ -1082,7 +1217,7 @@ impl EnrollmentEngine {
         }
         self.advance_epoch_if_higher(&catalog, gate.epoch);
         self.gate_state
-            .store(encode_gate_state(gate.gate_state), Ordering::Release);
+            .store(encode_gate_state(gate.gate_state), Ordering::SeqCst);
 
         self.policy_state.rcu(|current| {
             let mut next_policy = current.policy.clone();
@@ -1103,18 +1238,36 @@ impl EnrollmentEngine {
         Ok(())
     }
 
+    pub async fn apply_gate_control_and_drain(
+        &self,
+        gate: &GateControlEvent,
+        timeout: Duration,
+    ) -> Result<bool, RuleErrorCode> {
+        self.apply_gate_control(gate)?;
+        if gate.gate_state == GateState::Draining {
+            Ok(self.drain_in_flight(timeout).await)
+        } else {
+            Ok(true)
+        }
+    }
+
     pub fn promote_to_active(&self) -> u64 {
         let next_epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
         let catalog = self.catalog.load();
         for slot in catalog.seat_table.as_slice() {
             let _ = slot.advance_epoch(next_epoch);
         }
-        self.role.store(NodeRole::Active as u8, Ordering::Release);
+        self.role.store(NodeRole::Active as u8, Ordering::SeqCst);
         next_epoch
     }
 
     pub fn demote_to_standby(&self) {
-        self.role.store(NodeRole::Standby as u8, Ordering::Release);
+        self.role.store(NodeRole::Standby as u8, Ordering::SeqCst);
+    }
+
+    pub async fn demote_to_standby_and_drain(&self, timeout: Duration) -> bool {
+        self.demote_to_standby();
+        self.drain_in_flight(timeout).await
     }
 
     pub fn apply_replayed_command(&self, cmd: &EnrollmentCommandEvent) {
@@ -1376,8 +1529,18 @@ impl EnrollmentEngine {
         });
     }
 
-    #[must_use]
-    pub fn export_preload_dataset(&self, now: DateTime<Utc>) -> PreloadDataset {
+    pub fn try_export_preload_dataset(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<PreloadDataset, EngineError> {
+        let gate_state = decode_gate_state(self.gate_state.load(Ordering::SeqCst));
+        let in_flight = self.in_flight.load(Ordering::SeqCst);
+        if gate_state == GateState::Open || in_flight > 0 {
+            return Err(EngineError::SnapshotBlocked {
+                gate_state,
+                in_flight,
+            });
+        }
         let catalog = self.catalog.load();
         let mut sections = Vec::with_capacity(catalog.sections_meta.len());
         for (sec_id, meta) in &catalog.sections_meta {
@@ -1406,19 +1569,26 @@ impl EnrollmentEngine {
         });
 
         let policy_state = self.policy_state.load();
-        PreloadDataset {
+        Ok(PreloadDataset {
             term_id: catalog.term_id,
             term_code: catalog.term_code.clone(),
             checkpoint_seq: self.checkpoint_seq(),
             engine_epoch: self.epoch(),
-            gate_state: self.gate_state(),
+            gate_state,
             active_window_id: policy_state.active_window_id,
             policy: policy_state.policy.clone(),
             sections,
             prerequisites,
             students,
             created_at: now,
-        }
+        })
+    }
+
+    pub fn export_preload_dataset(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<PreloadDataset, EngineError> {
+        self.try_export_preload_dataset(now)
     }
 
     fn apply_kafka_replay_batch(&self, batch: crate::core::ports::KafkaReplayBatch) -> usize {
@@ -1524,13 +1694,15 @@ impl EnrollmentEngine {
         if readiness != EngineReadiness::Ready {
             return Err(EngineError::NotReady(readiness));
         }
-        if self.role() != NodeRole::Active {
+        let role = NodeRole::from_u8(self.role.load(Ordering::SeqCst)).unwrap_or(NodeRole::Standby);
+        if role != NodeRole::Active {
             return Err(EngineError::NodeStandby);
         }
-        if self.gate_state() != GateState::Open {
+        let gate_state = decode_gate_state(self.gate_state.load(Ordering::SeqCst));
+        if gate_state != GateState::Open {
             return Err(EngineError::RuleViolation {
                 code: RuleErrorCode::GateClosed,
-                detail: format!("Registration gate is currently {:?}", self.gate_state()),
+                detail: format!("Registration gate is currently {gate_state:?}"),
             });
         }
         Ok(())

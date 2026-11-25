@@ -1,10 +1,11 @@
 use crate::core::{
     CommandPublisher, EnrollmentEngine, KafkaPartitionOffset, KafkaReplayBatch, KafkaReplaySource,
-    NodeRole,
+    NodeRole, PublishError,
 };
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer, StreamConsumer};
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::Message;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::{Offset, TopicPartitionList};
@@ -57,11 +58,64 @@ impl RdkafkaCommandPublisher {
     }
 }
 
+/// Maps `rdkafka::error::KafkaError` into `PublishError::Definite` (safe to roll back RAM) or
+/// `PublishError::Indeterminate` (conservative: keep RAM lock/reservation to preserve 0% overbooking).
+#[must_use]
+pub fn classify_rdkafka_error(err: &KafkaError) -> PublishError {
+    match err {
+        KafkaError::MessageProduction(code) => match code {
+            RDKafkaErrorCode::QueueFull
+            | RDKafkaErrorCode::TimedOutQueue
+            | RDKafkaErrorCode::PurgeQueue
+            | RDKafkaErrorCode::MessageSizeTooLarge
+            | RDKafkaErrorCode::MessageBatchTooLarge
+            | RDKafkaErrorCode::InvalidMessage
+            | RDKafkaErrorCode::InvalidMessageSize
+            | RDKafkaErrorCode::BadMessage
+            | RDKafkaErrorCode::BadCompression
+            | RDKafkaErrorCode::UnknownTopic
+            | RDKafkaErrorCode::UnknownTopicOrPartition
+            | RDKafkaErrorCode::UnknownPartition
+            | RDKafkaErrorCode::InvalidTopic
+            | RDKafkaErrorCode::InvalidArgument
+            | RDKafkaErrorCode::KeySerialization
+            | RDKafkaErrorCode::ValueSerialization
+            | RDKafkaErrorCode::Authentication
+            | RDKafkaErrorCode::InvalidDifferentRecord
+            | RDKafkaErrorCode::NotConfigured
+            | RDKafkaErrorCode::ReadOnly
+            | RDKafkaErrorCode::UnsupportedFeature => {
+                PublishError::Definite(format!("Kafka definite production error ({code:?}): {err}"))
+            }
+            RDKafkaErrorCode::MessageTimedOut
+            | RDKafkaErrorCode::OperationTimedOut
+            | RDKafkaErrorCode::RequestTimedOut
+            | RDKafkaErrorCode::NetworkException
+            | RDKafkaErrorCode::BrokerTransportFailure
+            | RDKafkaErrorCode::AllBrokersDown
+            | RDKafkaErrorCode::NotLeaderForPartition
+            | RDKafkaErrorCode::LeaderNotAvailable
+            | RDKafkaErrorCode::BrokerNotAvailable
+            | RDKafkaErrorCode::ReplicaNotAvailable
+            | RDKafkaErrorCode::ISRInsufficient
+            | RDKafkaErrorCode::PurgeInflight
+            | RDKafkaErrorCode::Interrupted
+            | _ => PublishError::Indeterminate(format!(
+                "Kafka indeterminate production error ({code:?}): {err}"
+            )),
+        },
+        KafkaError::Nul(_) | KafkaError::ClientConfig(..) | KafkaError::ClientCreation(_) => {
+            PublishError::Definite(format!("Kafka client configuration error: {err}"))
+        }
+        _ => PublishError::Indeterminate(format!("Kafka indeterminate send error: {err}")),
+    }
+}
+
 #[async_trait]
 impl CommandPublisher for RdkafkaCommandPublisher {
-    async fn publish_command(&self, event: &EnrollmentCommandEvent) -> Result<(), String> {
-        let payload =
-            encode_json(event).map_err(|e| format!("failed encoding command event: {e}"))?;
+    async fn publish_command(&self, event: &EnrollmentCommandEvent) -> Result<(), PublishError> {
+        let payload = encode_json(event)
+            .map_err(|e| PublishError::Definite(format!("failed encoding command event: {e}")))?;
         let key = event.partition_key();
         let record = FutureRecord::to(KAFKA_TOPIC_ENROLLMENT_COMMANDS)
             .payload(&payload)
@@ -70,7 +124,7 @@ impl CommandPublisher for RdkafkaCommandPublisher {
             .send(record, Duration::from_secs(3))
             .await
             .map(|_| ())
-            .map_err(|(err, _)| format!("Kafka send error: {err}"))
+            .map_err(|(err, _)| classify_rdkafka_error(&err))
     }
 }
 

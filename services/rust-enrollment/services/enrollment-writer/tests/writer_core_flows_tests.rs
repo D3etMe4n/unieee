@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use enrollment_engine::core::{
     ActiveEnrollment, CommandPublisher, CoursePrerequisiteEdge, EngineReadiness, EnrollmentEngine,
-    NodeRole, PreloadDataset, RevertDedupStore, RevertOutcome, SeatTentativeCoalescerHandle,
-    SectionMeta, StudentCourseAttempt, StudentState,
+    NodeRole, PreloadDataset, PublishError, RevertDedupStore, RevertOutcome,
+    SeatTentativeCoalescerHandle, SectionMeta, StudentCourseAttempt, StudentState,
 };
 use enrollment_writer::core::{
     BatchAccumulator, DlqPublisher, EpochTracker, FastBatchCommitResult, FastPathBatchError,
@@ -896,7 +896,7 @@ struct EngineMockPub {
 
 #[async_trait]
 impl CommandPublisher for EngineMockPub {
-    async fn publish_command(&self, event: &EnrollmentCommandEvent) -> Result<(), String> {
+    async fn publish_command(&self, event: &EnrollmentCommandEvent) -> Result<(), PublishError> {
         self.commands.lock().await.push(event.clone());
         Ok(())
     }

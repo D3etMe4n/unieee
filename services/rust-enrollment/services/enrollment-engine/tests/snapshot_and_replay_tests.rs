@@ -6,19 +6,21 @@ use common::{
     MockKafkaReplaySource, MockPreloadSource, MockRevertDedupStore,
 };
 use enrollment_engine::core::{
-    BootstrapOptions, BootstrapSourceKind, CommandPublisher, EngineReadiness, EnrollmentEngine,
-    NodeRole, ReplayEventRecord, RevertDedupStore, SeatTentativeCoalescerHandle, SnapshotError,
-    SnapshotStore,
+    BootstrapOptions, BootstrapSourceKind, CommandPublisher, EngineError, EngineReadiness,
+    EnrollmentEngine, NodeRole, ReplayEventRecord, RevertDedupStore, SeatTentativeCoalescerHandle,
+    SnapshotError, SnapshotStore,
 };
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
 use unieee_domain::{
-    CourseId, EnrollmentAction, EnrollmentEventStatus, EnrollmentEventType, EventId,
+    CourseId, EnrollmentAction, EnrollmentEventStatus, EnrollmentEventType, EventId, GateState,
     HotPathEnrollmentState, SectionId, StudentId, TermId,
 };
-use unieee_events::{EnrollmentCommandEvent, EnrollmentDeltaEvent, SectionCapacityUpdatedEvent};
+use unieee_events::{
+    EnrollmentCommandEvent, EnrollmentDeltaEvent, GateControlEvent, SectionCapacityUpdatedEvent,
+};
 
 #[tokio::test]
 async fn atomic_disk_snapshot_writes_verifies_checksum_and_detects_tampering() {
@@ -384,7 +386,31 @@ async fn fallback_keyset_paginated_replay_and_fresh_preload_when_snapshot_absent
     assert_eq!(snap.available_seats, 19);
     assert_eq!(engine2.student_snapshot(s1).unwrap().current_credits, 3);
     assert_eq!(engine2.student_snapshot(s2).unwrap().current_credits, 0);
-    assert!(engine2.export_preload_dataset(now).students.len() == 3);
+    // Guarded snapshot refuses export while GateState::Open, succeeds once Paused.
+    assert!(matches!(
+        engine2.try_export_preload_dataset(now),
+        Err(EngineError::SnapshotBlocked {
+            gate_state: GateState::Open,
+            in_flight: 0,
+        })
+    ));
+    engine2
+        .apply_gate_control(&GateControlEvent::new(
+            term_id,
+            GateState::Paused,
+            None,
+            engine2.epoch(),
+            now,
+        ))
+        .unwrap();
+    assert_eq!(
+        engine2
+            .try_export_preload_dataset(now)
+            .unwrap()
+            .students
+            .len(),
+        3
+    );
 
     // SnapshotStore::dir(), non-existent directory, and find_latest_verified recovery with term_id=None & rejoin_as_standby=false
     assert_eq!(store.dir(), dir.path());

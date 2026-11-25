@@ -277,6 +277,45 @@ pub struct BootstrapReport {
     pub kafka_resume_offsets: Vec<KafkaPartitionOffset>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineRuntimeOptions {
+    pub max_in_flight_kafka_publishes: usize,
+    pub idempotency_ttl: Duration,
+    pub idempotency_max_entries: usize,
+    pub idempotency_max_per_student: usize,
+    pub event_index_ttl: Duration,
+    pub dedup_retention: Duration,
+    pub status_pg_lookup_concurrency: usize,
+    pub status_negative_cache_ttl: Duration,
+    pub status_negative_cache_max_entries: usize,
+    pub drain_timeout: Duration,
+}
+
+impl Default for EngineRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            max_in_flight_kafka_publishes: 2048,
+            idempotency_ttl: Duration::from_secs(60),
+            idempotency_max_entries: 65_536,
+            idempotency_max_per_student: 16,
+            event_index_ttl: Duration::from_secs(1800),
+            dedup_retention: Duration::from_secs(86_400),
+            status_pg_lookup_concurrency: 16,
+            status_negative_cache_ttl: Duration::from_secs(10),
+            status_negative_cache_max_entries: 65_536,
+            drain_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    pub evicted_event_index: usize,
+    pub evicted_idempotency: usize,
+    pub evicted_negative_status: usize,
+    pub pruned_dedup_ids: usize,
+}
+
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error("enrollment engine is not ready (state={0:?})")]
@@ -285,6 +324,13 @@ pub enum EngineError {
     NodeStandby,
     #[error("rule violation {code:?}: {detail}")]
     RuleViolation { code: RuleErrorCode, detail: String },
+    #[error("cannot export snapshot while gate={gate_state:?} and in_flight={in_flight}")]
+    SnapshotBlocked {
+        gate_state: GateState,
+        in_flight: usize,
+    },
+    #[error("service unavailable ({code}): {detail}")]
+    ServiceUnavailable { code: &'static str, detail: String },
     #[error("forbidden: {0}")]
     Forbidden(String),
     #[error("domain error: {0}")]

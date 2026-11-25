@@ -1,4 +1,4 @@
-use crate::core::{BootstrapOptions, NodeRole, OidcVerifierConfig};
+use crate::core::{BootstrapOptions, EngineRuntimeOptions, NodeRole, OidcVerifierConfig};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -38,6 +38,14 @@ pub struct EngineConfig {
     pub replay_batch_size: i64,
     pub replay_throttle_ms: u64,
     pub internal_ops_token: Option<String>,
+    pub max_in_flight_kafka_publishes: usize,
+    pub idempotency_cache_ttl_secs: u64,
+    pub idempotency_cache_max_entries: usize,
+    pub event_index_ttl_secs: u64,
+    pub event_index_sweep_interval_secs: u64,
+    pub status_pg_lookup_concurrency: usize,
+    pub status_negative_cache_ttl_secs: u64,
+    pub drain_timeout_ms: u64,
 }
 
 impl EngineConfig {
@@ -150,6 +158,50 @@ impl EngineConfig {
         let replay_throttle_ms =
             parse_u64_or(non_empty("REPLAY_THROTTLE_MS"), "REPLAY_THROTTLE_MS", 30)?;
         let internal_ops_token = non_empty("INTERNAL_OPS_TOKEN");
+        let max_in_flight_kafka_publishes = parse_usize_min(
+            non_empty("MAX_IN_FLIGHT_KAFKA_PUBLISHES"),
+            "MAX_IN_FLIGHT_KAFKA_PUBLISHES",
+            2048,
+            1,
+        )?;
+        let idempotency_cache_ttl_secs = parse_u64_min(
+            non_empty("IDEMPOTENCY_CACHE_TTL_SECS"),
+            "IDEMPOTENCY_CACHE_TTL_SECS",
+            60,
+            1,
+        )?;
+        let idempotency_cache_max_entries = parse_usize_min(
+            non_empty("IDEMPOTENCY_CACHE_MAX_ENTRIES"),
+            "IDEMPOTENCY_CACHE_MAX_ENTRIES",
+            65_536,
+            1,
+        )?;
+        let event_index_ttl_secs = parse_u64_min(
+            non_empty("EVENT_INDEX_TTL_SECS"),
+            "EVENT_INDEX_TTL_SECS",
+            1800,
+            1,
+        )?;
+        let event_index_sweep_interval_secs = parse_u64_min(
+            non_empty("EVENT_INDEX_SWEEP_INTERVAL_SECS"),
+            "EVENT_INDEX_SWEEP_INTERVAL_SECS",
+            60,
+            1,
+        )?;
+        let status_pg_lookup_concurrency = parse_usize_min(
+            non_empty("STATUS_PG_LOOKUP_CONCURRENCY"),
+            "STATUS_PG_LOOKUP_CONCURRENCY",
+            16,
+            1,
+        )?;
+        let status_negative_cache_ttl_secs = parse_u64_min(
+            non_empty("STATUS_NEGATIVE_CACHE_TTL_SECS"),
+            "STATUS_NEGATIVE_CACHE_TTL_SECS",
+            10,
+            1,
+        )?;
+        let drain_timeout_ms =
+            parse_u64_min(non_empty("DRAIN_TIMEOUT_MS"), "DRAIN_TIMEOUT_MS", 5000, 100)?;
 
         Ok(Self {
             bind_addr,
@@ -174,6 +226,14 @@ impl EngineConfig {
             replay_batch_size,
             replay_throttle_ms,
             internal_ops_token,
+            max_in_flight_kafka_publishes,
+            idempotency_cache_ttl_secs,
+            idempotency_cache_max_entries,
+            event_index_ttl_secs,
+            event_index_sweep_interval_secs,
+            status_pg_lookup_concurrency,
+            status_negative_cache_ttl_secs,
+            drain_timeout_ms,
         })
     }
 
@@ -196,6 +256,22 @@ impl EngineConfig {
             rejoin_as_standby_on_recovery: self.rejoin_as_standby_on_recovery,
             replay_batch_size: self.replay_batch_size,
             replay_throttle: Duration::from_millis(self.replay_throttle_ms),
+        }
+    }
+
+    #[must_use]
+    pub fn to_runtime_options(&self) -> EngineRuntimeOptions {
+        EngineRuntimeOptions {
+            max_in_flight_kafka_publishes: self.max_in_flight_kafka_publishes,
+            idempotency_ttl: Duration::from_secs(self.idempotency_cache_ttl_secs),
+            idempotency_max_entries: self.idempotency_cache_max_entries,
+            idempotency_max_per_student: 16,
+            event_index_ttl: Duration::from_secs(self.event_index_ttl_secs),
+            dedup_retention: Duration::from_secs(86_400),
+            status_pg_lookup_concurrency: self.status_pg_lookup_concurrency,
+            status_negative_cache_ttl: Duration::from_secs(self.status_negative_cache_ttl_secs),
+            status_negative_cache_max_entries: 65_536,
+            drain_timeout: Duration::from_millis(self.drain_timeout_ms),
         }
     }
 }
@@ -236,4 +312,42 @@ fn parse_i64_or(raw: Option<String>, key: &'static str, default: i64) -> Result<
             reason: e.to_string(),
         }),
     }
+}
+
+fn parse_u64_min(
+    raw: Option<String>,
+    key: &'static str,
+    default: u64,
+    min: u64,
+) -> Result<u64, ConfigError> {
+    let val = parse_u64_or(raw, key, default)?;
+    if val < min {
+        return Err(ConfigError::InvalidValue {
+            key,
+            reason: format!("must be >= {min}"),
+        });
+    }
+    Ok(val)
+}
+
+fn parse_usize_min(
+    raw: Option<String>,
+    key: &'static str,
+    default: usize,
+    min: usize,
+) -> Result<usize, ConfigError> {
+    let val = match raw {
+        None => default,
+        Some(v) => v.parse::<usize>().map_err(|e| ConfigError::InvalidValue {
+            key,
+            reason: e.to_string(),
+        })?,
+    };
+    if val < min {
+        return Err(ConfigError::InvalidValue {
+            key,
+            reason: format!("must be >= {min}"),
+        });
+    }
+    Ok(val)
 }
