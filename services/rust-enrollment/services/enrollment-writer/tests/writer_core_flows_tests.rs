@@ -500,6 +500,7 @@ fn make_processor(
             max_db_retries: 2,
             db_retry_backoff: Duration::from_millis(1),
             cache_ttl_secs: 900,
+            event_status_ttl_secs: 3600,
         },
     )
 }

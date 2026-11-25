@@ -52,3 +52,20 @@ pub trait RedisWriterSink: Send + Sync {
 pub trait DlqPublisher: Send + Sync {
     async fn publish_dead_letter(&self, event: &DeadLetterEvent) -> Result<(), String>;
 }
+
+/// Publishes replayable copies of `RevertEvent` onto `unieee.enrollment.deltas` so restarting
+/// `enrollment-engine` nodes recover rejected commands directly from Kafka without PG queries.
+#[async_trait]
+pub trait DeltaRevertPublisher: Send + Sync {
+    async fn publish_revert_deltas(&self, events: &[RevertEvent]) -> Result<(), String>;
+}
+
+#[derive(Default)]
+pub struct NoopDeltaRevertPublisher;
+
+#[async_trait]
+impl DeltaRevertPublisher for NoopDeltaRevertPublisher {
+    async fn publish_revert_deltas(&self, _events: &[RevertEvent]) -> Result<(), String> {
+        Ok(())
+    }
+}

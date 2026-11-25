@@ -1122,6 +1122,7 @@ async fn covers_config_error_branches_api_errors_and_redis_kafka_adapter_helpers
     let k_handle = enrollment_engine::adapters::kafka::spawn_delta_and_standby_consumer(
         "127.0.0.1:1".to_owned(),
         "test-grp".to_owned(),
+        Vec::new(),
         Arc::clone(&engine),
         k_rx,
     );

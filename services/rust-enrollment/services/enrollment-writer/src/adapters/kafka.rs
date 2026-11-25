@@ -1,6 +1,6 @@
 use crate::core::{
-    compute_commit_offsets, BatchAccumulator, DlqPublisher, IncomingKafkaRecord, PartitionOffset,
-    WriterProcessor, WriterReadiness,
+    compute_commit_offsets, BatchAccumulator, DeltaRevertPublisher, DlqPublisher,
+    IncomingKafkaRecord, PartitionOffset, WriterProcessor, WriterReadiness,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -15,7 +15,8 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{error, warn};
 use unieee_events::{
-    encode_json, DeadLetterEvent, KAFKA_TOPIC_ENROLLMENT_COMMANDS, KAFKA_TOPIC_ENROLLMENT_DLQ,
+    encode_json, DeadLetterEvent, EnrollmentDeltaEvent, RevertEvent,
+    KAFKA_TOPIC_ENROLLMENT_COMMANDS, KAFKA_TOPIC_ENROLLMENT_DELTAS, KAFKA_TOPIC_ENROLLMENT_DLQ,
 };
 
 /// Builds a manual-commit Kafka consumer config (auto-commit and auto-offset-store disabled).
@@ -69,6 +70,31 @@ impl DlqPublisher for RdkafkaDlqPublisher {
             .await
             .map(|_| ())
             .map_err(|(err, _)| format!("Kafka DLQ send error: {err}"))
+    }
+}
+
+pub fn encode_revert_delta_payload(ev: &RevertEvent) -> Result<(String, String), String> {
+    let delta = EnrollmentDeltaEvent::Revert(ev.clone());
+    let key = delta.partition_key();
+    let payload =
+        encode_json(&delta).map_err(|e| format!("failed encoding Revert delta event: {e}"))?;
+    Ok((key, payload))
+}
+
+#[async_trait]
+impl DeltaRevertPublisher for RdkafkaDlqPublisher {
+    async fn publish_revert_deltas(&self, events: &[RevertEvent]) -> Result<(), String> {
+        for ev in events {
+            let (key, payload) = encode_revert_delta_payload(ev)?;
+            let record = FutureRecord::to(KAFKA_TOPIC_ENROLLMENT_DELTAS)
+                .payload(&payload)
+                .key(&key);
+            self.producer
+                .send(record, Duration::from_secs(3))
+                .await
+                .map_err(|(err, _)| format!("Kafka delta revert send error: {err}"))?;
+        }
+        Ok(())
     }
 }
 

@@ -312,6 +312,7 @@ impl EnrollmentEngine {
 
             match kafka_replay.replay_since(term_id, kafka_from_ms).await {
                 Ok(batch) => {
+                    let resume_offsets = batch.high_watermarks.clone();
                     let count = self.apply_kafka_replay_batch(batch);
                     self.set_readiness(EngineReadiness::Ready);
                     return Ok(BootstrapReport {
@@ -321,6 +322,7 @@ impl EnrollmentEngine {
                         replayed_events: count,
                         checkpoint_seq: self.checkpoint_seq(),
                         snapshot_sha256: checksum,
+                        kafka_resume_offsets: resume_offsets,
                     });
                 }
                 Err(kafka_err) => {
@@ -347,6 +349,7 @@ impl EnrollmentEngine {
                         replayed_events: count,
                         checkpoint_seq: self.checkpoint_seq(),
                         snapshot_sha256: checksum,
+                        kafka_resume_offsets: Vec::new(),
                     });
                 }
             }
@@ -365,7 +368,9 @@ impl EnrollmentEngine {
         self.hydrate_from_dataset(dataset, opts.configured_role)?;
 
         let mut replayed = 0usize;
+        let mut resume_offsets = Vec::new();
         if let Ok(tail) = kafka_replay.replay_since(term_id, kafka_from_ms).await {
+            resume_offsets = tail.high_watermarks.clone();
             replayed = self.apply_kafka_replay_batch(tail);
         }
         self.set_readiness(EngineReadiness::Ready);
@@ -377,6 +382,7 @@ impl EnrollmentEngine {
             replayed_events: replayed,
             checkpoint_seq: self.checkpoint_seq(),
             snapshot_sha256: meta.checksum_sha256,
+            kafka_resume_offsets: resume_offsets,
         })
     }
 
@@ -1037,27 +1043,44 @@ impl EnrollmentEngine {
             EnrollmentDeltaEvent::SectionCapacityUpdated(ev) => {
                 self.apply_section_capacity_delta(ev)
             }
-            EnrollmentDeltaEvent::Revert(_) | EnrollmentDeltaEvent::GateControl(_) => {
-                DeltaOutcome::WrongTerm
+            EnrollmentDeltaEvent::Revert(ev) => match self.apply_revert_in_ram(ev) {
+                RevertOutcome::Applied => DeltaOutcome::Applied,
+                RevertOutcome::DuplicateInRam => DeltaOutcome::DuplicateOrStale,
+                RevertOutcome::UnknownSectionOrStudent => {
+                    if ev.term_id != self.term_id() {
+                        DeltaOutcome::WrongTerm
+                    } else {
+                        DeltaOutcome::TargetNotFound
+                    }
+                }
+            },
+            EnrollmentDeltaEvent::GateControl(ev) => match self.apply_gate_control(ev) {
+                Ok(()) => DeltaOutcome::Applied,
+                Err(RuleErrorCode::StaleEpoch) => DeltaOutcome::DuplicateOrStale,
+                Err(_) => DeltaOutcome::WrongTerm,
+            },
+        }
+    }
+
+    fn advance_epoch_if_higher(&self, catalog: &TermCatalog, target_epoch: u64) {
+        let prev = self.epoch.fetch_max(target_epoch, Ordering::AcqRel);
+        if target_epoch > prev {
+            for slot in catalog.seat_table.as_slice() {
+                let _ = slot.advance_epoch(target_epoch);
             }
         }
     }
 
     pub fn apply_gate_control(&self, gate: &GateControlEvent) -> Result<(), RuleErrorCode> {
-        if gate.term_id != self.term_id() {
+        let catalog = self.catalog.load();
+        if gate.term_id != catalog.term_id {
             return Err(RuleErrorCode::NoActiveWindow);
         }
         let current_epoch = self.epoch();
         if gate.epoch < current_epoch {
             return Err(RuleErrorCode::StaleEpoch);
         }
-        if gate.epoch > current_epoch {
-            self.epoch.store(gate.epoch, Ordering::Release);
-            let catalog = self.catalog.load();
-            for slot in catalog.seat_table.as_slice() {
-                let _ = slot.advance_epoch(gate.epoch);
-            }
-        }
+        self.advance_epoch_if_higher(&catalog, gate.epoch);
         self.gate_state
             .store(encode_gate_state(gate.gate_state), Ordering::Release);
 
@@ -1099,9 +1122,7 @@ impl EnrollmentEngine {
         if cmd.term_id != catalog.term_id {
             return;
         }
-        if cmd.engine_epoch > self.epoch() {
-            self.epoch.store(cmd.engine_epoch, Ordering::Release);
-        }
+        self.advance_epoch_if_higher(&catalog, cmd.engine_epoch);
         let Some(section_meta) = catalog.sections_meta.get(&cmd.section_id) else {
             return;
         };
@@ -1201,6 +1222,7 @@ impl EnrollmentEngine {
         if rec.term_id != catalog.term_id {
             return;
         }
+        self.advance_epoch_if_higher(&catalog, rec.engine_epoch);
         if rec.seq > self.checkpoint_seq() {
             self.checkpoint_seq.store(rec.seq, Ordering::Release);
         }
@@ -1211,6 +1233,14 @@ impl EnrollmentEngine {
             return;
         };
         let action = map_event_type_to_action(rec.event_type);
+        let is_drop = matches!(
+            rec.event_type,
+            EnrollmentEventType::Drop | EnrollmentEventType::AdminDrop
+        );
+        let parsed_reason = rec
+            .reason_code
+            .as_deref()
+            .and_then(RuleErrorCode::from_code);
         let policy_state = self.policy_state.load();
 
         self.students.with_write(&rec.student_id, |opt_student| {
@@ -1224,16 +1254,31 @@ impl EnrollmentEngine {
                 EnrollmentEventStatus::Rejected | EnrollmentEventStatus::Reverted => {
                     if !student.reverted_event_ids.contains(&rec.event_id) {
                         student.reverted_event_ids.insert(rec.event_id);
-                        if action != EnrollmentAction::Drop {
-                            if let Some(pos) = student
-                                .active_enrollments
-                                .iter()
-                                .position(|e| e.last_event_id == rec.event_id)
-                            {
-                                student.active_enrollments.remove(pos);
-                                let _ = slot.try_release();
+                        if action == EnrollmentAction::Drop {
+                            if let Some(entry) = student.active_enrollments.iter_mut().find(|e| {
+                                e.section_id == rec.section_id
+                                    && e.last_event_id == rec.event_id
+                                    && e.state == HotPathEnrollmentState::DropPending
+                            }) {
+                                if entry.seat_released {
+                                    let _ = slot.try_reserve();
+                                }
+                                entry.seat_released = false;
+                                entry.state = HotPathEnrollmentState::Confirmed;
                                 student.recompute_schedule_and_credits(&catalog.sections_meta);
                             }
+                        } else if let Some(pos) = student.active_enrollments.iter().position(|e| {
+                            e.section_id == rec.section_id
+                                && e.last_event_id == rec.event_id
+                                && matches!(
+                                    e.state,
+                                    HotPathEnrollmentState::Reserved
+                                        | HotPathEnrollmentState::Confirmed
+                                )
+                        }) {
+                            student.active_enrollments.remove(pos);
+                            let _ = slot.try_release();
+                            student.recompute_schedule_and_credits(&catalog.sections_meta);
                         }
                     }
                     self.event_index.insert(
@@ -1246,7 +1291,7 @@ impl EnrollmentEngine {
                             course_id: section_meta.course_id,
                             action,
                             state: HotPathEnrollmentState::Reverted,
-                            reason_code: None,
+                            reason_code: parsed_reason,
                             engine_epoch: rec.engine_epoch,
                             updated_at: rec.created_at,
                         },
@@ -1254,17 +1299,16 @@ impl EnrollmentEngine {
                 }
                 EnrollmentEventStatus::Confirmed => {
                     if !already_processed {
-                        if matches!(
-                            rec.event_type,
-                            EnrollmentEventType::Drop | EnrollmentEventType::AdminDrop
-                        ) {
+                        if is_drop {
                             if let Some(pos) = student
                                 .active_enrollments
                                 .iter()
                                 .position(|e| e.section_id == rec.section_id)
                             {
-                                student.active_enrollments.remove(pos);
-                                let _ = slot.try_release();
+                                let removed = student.active_enrollments.remove(pos);
+                                if !removed.seat_released {
+                                    let _ = slot.try_release();
+                                }
                             }
                         } else {
                             let holds = student
@@ -1290,18 +1334,24 @@ impl EnrollmentEngine {
                         }
                         student.processed_event_ids.insert(rec.event_id);
                         student.recompute_schedule_and_credits(&catalog.sections_meta);
-                    } else if let Some(entry) = student
-                        .active_enrollments
-                        .iter_mut()
-                        .find(|e| e.last_event_id == rec.event_id)
-                    {
+                    } else if is_drop {
+                        if let Some(pos) = student.active_enrollments.iter().position(|e| {
+                            e.section_id == rec.section_id && e.last_event_id == rec.event_id
+                        }) {
+                            let removed = student.active_enrollments.remove(pos);
+                            if !removed.seat_released {
+                                let _ = slot.try_release();
+                            }
+                            student.recompute_schedule_and_credits(&catalog.sections_meta);
+                        }
+                    } else if let Some(entry) = student.active_enrollments.iter_mut().find(|e| {
+                        e.last_event_id == rec.event_id
+                            && e.state == HotPathEnrollmentState::Reserved
+                    }) {
                         entry.state = HotPathEnrollmentState::Confirmed;
                     }
 
-                    let final_state = if matches!(
-                        rec.event_type,
-                        EnrollmentEventType::Drop | EnrollmentEventType::AdminDrop
-                    ) {
+                    let final_state = if is_drop {
                         HotPathEnrollmentState::Dropped
                     } else {
                         HotPathEnrollmentState::Confirmed
@@ -1379,6 +1429,7 @@ impl EnrollmentEngine {
         impl ReplayItem {
             fn key(&self) -> (DateTime<Utc>, u8) {
                 match self {
+                    Self::Delta(EnrollmentDeltaEvent::Revert(r)) => (r.reverted_at, 2),
                     Self::Delta(d) => (d.occurred_at(), 0),
                     Self::Command(c) => (c.occurred_at, 1),
                 }

@@ -1,5 +1,6 @@
 use crate::core::{
-    CommandPublisher, EnrollmentEngine, KafkaReplayBatch, KafkaReplaySource, NodeRole,
+    CommandPublisher, EnrollmentEngine, KafkaPartitionOffset, KafkaReplayBatch, KafkaReplaySource,
+    NodeRole,
 };
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
@@ -134,11 +135,14 @@ fn replay_topics_blocking(
         let mut query_tpl = TopicPartitionList::new();
         let mut high_watermarks: std::collections::HashMap<i32, i64> =
             std::collections::HashMap::new();
+        let mut resume_offsets: std::collections::HashMap<i32, i64> =
+            std::collections::HashMap::new();
         for p in topic_meta.partitions() {
             let pid = p.id();
             let (_low, high) = consumer
                 .fetch_watermarks(topic, pid, Duration::from_secs(3))
                 .map_err(|e| format!("watermarks failed on {topic}:{pid}: {e}"))?;
+            resume_offsets.insert(pid, high.max(0));
             if high > 0 {
                 high_watermarks.insert(pid, high);
                 let _ = query_tpl.add_partition_offset(
@@ -148,49 +152,63 @@ fn replay_topics_blocking(
                 );
             }
         }
-        if high_watermarks.is_empty() {
-            continue;
-        }
+        if !high_watermarks.is_empty() {
+            let resolved_tpl = consumer
+                .offsets_for_times(query_tpl, Duration::from_secs(3))
+                .map_err(|e| format!("offsets_for_times failed on {topic}: {e}"))?;
+            let resolved_offsets: Vec<(i32, Offset)> = resolved_tpl
+                .elements()
+                .into_iter()
+                .map(|e| (e.partition(), e.offset()))
+                .collect();
+            let ranges = compute_partition_replay_ranges(&high_watermarks, &resolved_offsets);
+            if !ranges.is_empty() {
+                let mut assign_tpl = TopicPartitionList::new();
+                let mut remaining: std::collections::HashMap<i32, i64> =
+                    std::collections::HashMap::new();
+                for (pid, start_off, high) in ranges {
+                    let _ = assign_tpl.add_partition_offset(topic, pid, Offset::Offset(start_off));
+                    remaining.insert(pid, high);
+                    resume_offsets.insert(pid, start_off);
+                }
+                consumer
+                    .assign(&assign_tpl)
+                    .map_err(|e| format!("assign replay tpl failed: {e}"))?;
 
-        let resolved_tpl = consumer
-            .offsets_for_times(query_tpl, Duration::from_secs(3))
-            .map_err(|e| format!("offsets_for_times failed on {topic}: {e}"))?;
-        let resolved_offsets: Vec<(i32, Offset)> = resolved_tpl
-            .elements()
-            .into_iter()
-            .map(|e| (e.partition(), e.offset()))
-            .collect();
-        let ranges = compute_partition_replay_ranges(&high_watermarks, &resolved_offsets);
-        if ranges.is_empty() {
-            continue;
-        }
-        let mut assign_tpl = TopicPartitionList::new();
-        let mut remaining: std::collections::HashMap<i32, i64> = std::collections::HashMap::new();
-        for (pid, start_off, high) in ranges {
-            let _ = assign_tpl.add_partition_offset(topic, pid, Offset::Offset(start_off));
-            remaining.insert(pid, high);
-        }
-        consumer
-            .assign(&assign_tpl)
-            .map_err(|e| format!("assign replay tpl failed: {e}"))?;
-
-        let mut idle_polls = 0u32;
-        while !remaining.is_empty() && idle_polls < 20 {
-            match consumer.poll(Duration::from_millis(100)) {
-                Some(Ok(msg)) => {
-                    idle_polls = 0;
-                    let pid = msg.partition();
-                    if let Some(payload) = msg.payload() {
-                        collect_replay_payload(topic, payload, term_id, &mut batch);
-                    }
-                    if let Some(&high) = remaining.get(&pid) {
-                        if msg.offset() + 1 >= high {
-                            remaining.remove(&pid);
+                let mut idle_polls = 0u32;
+                while !remaining.is_empty() && idle_polls < 20 {
+                    match consumer.poll(Duration::from_millis(100)) {
+                        Some(Ok(msg)) => {
+                            idle_polls = 0;
+                            let pid = msg.partition();
+                            let next_off = msg.offset().saturating_add(1);
+                            resume_offsets.insert(pid, next_off);
+                            if let Some(payload) = msg.payload() {
+                                collect_replay_payload(topic, payload, term_id, &mut batch);
+                            }
+                            if let Some(&high) = remaining.get(&pid) {
+                                if next_off >= high {
+                                    resume_offsets.insert(pid, high);
+                                    remaining.remove(&pid);
+                                }
+                            }
                         }
+                        Some(Err(err)) => return Err(format!("Kafka replay poll error: {err}")),
+                        None => idle_polls += 1,
                     }
                 }
-                Some(Err(err)) => return Err(format!("Kafka replay poll error: {err}")),
-                None => idle_polls += 1,
+            }
+        }
+
+        let mut sorted_pids: Vec<i32> = resume_offsets.keys().copied().collect();
+        sorted_pids.sort_unstable();
+        for pid in sorted_pids {
+            if let Some(&offset) = resume_offsets.get(&pid) {
+                batch.high_watermarks.push(KafkaPartitionOffset {
+                    topic: topic.to_owned(),
+                    partition: pid,
+                    offset,
+                });
             }
         }
     }
@@ -265,23 +283,76 @@ pub fn decode_and_apply_kafka_message(
     }
 }
 
+pub fn build_live_assignment_tpl(
+    resume_offsets: &[KafkaPartitionOffset],
+) -> Result<TopicPartitionList, String> {
+    let mut tpl = TopicPartitionList::new();
+    for entry in resume_offsets {
+        tpl.add_partition_offset(&entry.topic, entry.partition, Offset::Offset(entry.offset))
+            .map_err(|e| format!("failed adding live resume offset to TPL: {e}"))?;
+    }
+    Ok(tpl)
+}
+
+pub async fn decode_and_apply_kafka_message_async(
+    engine: &EnrollmentEngine,
+    topic: &str,
+    payload: &[u8],
+) -> Result<(), String> {
+    match topic {
+        KAFKA_TOPIC_ENROLLMENT_DELTAS => {
+            let delta: EnrollmentDeltaEvent =
+                decode_json_slice(payload).map_err(|e| format!("bad delta payload: {e}"))?;
+            match &delta {
+                EnrollmentDeltaEvent::Revert(rev) => {
+                    let _ = engine.apply_revert_event(rev).await;
+                }
+                _ => {
+                    let _ = engine.apply_delta_event(&delta);
+                }
+            }
+            Ok(())
+        }
+        KAFKA_TOPIC_ENROLLMENT_COMMANDS => decode_and_apply_kafka_message(engine, topic, payload),
+        other => Err(format!("unexpected Kafka topic: {other}")),
+    }
+}
+
 pub fn spawn_delta_and_standby_consumer(
     brokers: String,
     group_id: String,
+    resume_offsets: Vec<KafkaPartitionOffset>,
     engine: Arc<EnrollmentEngine>,
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let consumer: StreamConsumer =
-            match build_consumer_config(&brokers, &group_id, "latest").create() {
-                Ok(c) => c,
+        let mut cfg = build_consumer_config(&brokers, &group_id, "latest");
+        if !resume_offsets.is_empty() {
+            // Manual partition assignment resumes from exact high-watermark without group rebalance.
+            cfg.set("enable.auto.commit", "false");
+        }
+        let consumer: StreamConsumer = match cfg.create() {
+            Ok(c) => c,
+            Err(err) => {
+                warn!(error = %err, "failed creating live Kafka delta/standby consumer");
+                return;
+            }
+        };
+
+        if !resume_offsets.is_empty() {
+            match build_live_assignment_tpl(&resume_offsets) {
+                Ok(tpl) => {
+                    if let Err(err) = consumer.assign(&tpl) {
+                        warn!(error = %err, "failed assigning live Kafka resume offsets");
+                        return;
+                    }
+                }
                 Err(err) => {
-                    warn!(error = %err, "failed creating live Kafka delta/standby consumer");
+                    warn!(error = %err, "invalid Kafka resume offsets");
                     return;
                 }
-            };
-
-        if let Err(err) = consumer.subscribe(&[
+            }
+        } else if let Err(err) = consumer.subscribe(&[
             KAFKA_TOPIC_ENROLLMENT_DELTAS,
             KAFKA_TOPIC_ENROLLMENT_COMMANDS,
         ]) {
@@ -300,7 +371,7 @@ pub fn spawn_delta_and_standby_consumer(
                     match recv {
                         Ok(msg) => {
                             if let Some(payload) = msg.payload() {
-                                if let Err(err) = decode_and_apply_kafka_message(&engine, msg.topic(), payload) {
+                                if let Err(err) = decode_and_apply_kafka_message_async(&engine, msg.topic(), payload).await {
                                     warn!(topic = msg.topic(), error = %err, "failed applying Kafka message");
                                 }
                             }

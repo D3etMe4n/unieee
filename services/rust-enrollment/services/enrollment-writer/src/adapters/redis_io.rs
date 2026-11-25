@@ -14,8 +14,10 @@ use std::time::Duration;
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 use tracing::warn;
+use unieee_domain::HotPathEnrollmentState;
 use unieee_events::{
-    encode_json, section_seats_cache_key, student_timetable_cache_key, term_sections_cache_key,
+    decode_json, encode_json, event_status_cache_key, section_seats_cache_key,
+    student_timetable_cache_key, term_sections_cache_key, EventStatusCachePayload,
     HotPathPubSubMessage, RevertEvent, SeatConfirmedEvent, REDIS_CHANNEL_ENROLLMENT_REVERT,
     REDIS_CHANNEL_GATE_CONTROL, REDIS_CHANNEL_SEAT_CONFIRMED,
 };
@@ -176,15 +178,43 @@ pub fn serialize_revert_events(events: &[RevertEvent]) -> Result<Vec<String>, St
         .collect()
 }
 
+#[must_use]
+pub fn revert_event_to_status_payload(ev: &RevertEvent) -> EventStatusCachePayload {
+    EventStatusCachePayload::new(
+        ev.event_id,
+        ev.term_id,
+        ev.student_id,
+        ev.section_id,
+        ev.course_id,
+        ev.action,
+        HotPathEnrollmentState::Reverted,
+        Some(ev.reason_code),
+        ev.engine_epoch,
+        ev.reverted_at,
+    )
+}
+
 #[derive(Clone)]
 pub struct RedisWriterAdapter {
     backend: RedisBackend,
+    event_status_ttl_secs: u64,
 }
 
 impl RedisWriterAdapter {
     #[must_use]
     pub const fn new(backend: RedisBackend) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            event_status_ttl_secs: 3600,
+        }
+    }
+
+    #[must_use]
+    pub fn with_event_status_ttl(backend: RedisBackend, event_status_ttl_secs: u64) -> Self {
+        Self {
+            backend,
+            event_status_ttl_secs: event_status_ttl_secs.max(1),
+        }
     }
 }
 
@@ -193,6 +223,7 @@ impl RedisWriterSink for RedisWriterAdapter {
     async fn apply_confirmed_batch(&self, update: &RedisBatchUpdate) -> Result<(), String> {
         if update.section_snapshots.is_empty()
             && update.confirmed_events.is_empty()
+            && update.event_statuses.is_empty()
             && update.timetable_invalidations.is_empty()
         {
             return Ok(());
@@ -200,6 +231,11 @@ impl RedisWriterSink for RedisWriterAdapter {
 
         let confirmed_payloads = serialize_confirmed_events(&update.confirmed_events)?;
         let ttl = update.cache_ttl_secs.max(1);
+        let status_ttl = if update.event_status_ttl_secs > 0 {
+            update.event_status_ttl_secs
+        } else {
+            self.event_status_ttl_secs
+        };
         let mut pipe = redis::pipe();
         let mut terms = BTreeSet::new();
 
@@ -235,6 +271,17 @@ impl RedisWriterSink for RedisWriterAdapter {
                 .ignore();
         }
 
+        for status in &update.event_statuses {
+            let status_json = encode_json(status)
+                .map_err(|e| format!("encode EventStatusCachePayload failed: {e}"))?;
+            pipe.cmd("SET")
+                .arg(event_status_cache_key(status.event_id))
+                .arg(status_json)
+                .arg("EX")
+                .arg(status_ttl)
+                .ignore();
+        }
+
         for payload in &confirmed_payloads {
             pipe.cmd("PUBLISH")
                 .arg(REDIS_CHANNEL_SEAT_CONFIRMED)
@@ -253,15 +300,45 @@ impl RedisWriterSink for RedisWriterAdapter {
             return Ok(());
         }
         let payloads = serialize_revert_events(events)?;
-        self.publish_raw_revert_payloads(&payloads).await
+        let status_ttl = self.event_status_ttl_secs.max(1);
+        let mut pipe = redis::pipe();
+        for (ev, payload) in events.iter().zip(payloads.iter()) {
+            let status_json = encode_json(&revert_event_to_status_payload(ev))
+                .map_err(|e| format!("encode revert status payload failed: {e}"))?;
+            pipe.cmd("SET")
+                .arg(event_status_cache_key(ev.event_id))
+                .arg(status_json)
+                .arg("EX")
+                .arg(status_ttl)
+                .ignore();
+            pipe.cmd("PUBLISH")
+                .arg(REDIS_CHANNEL_ENROLLMENT_REVERT)
+                .arg(payload)
+                .ignore();
+        }
+        let mut conn = self.backend.get_multiplexed_async_connection().await?;
+        pipe.query_async::<()>(&mut conn)
+            .await
+            .map_err(|e| format!("Redis revert pipeline PUBLISH failed: {e}"))
     }
 
     async fn publish_raw_revert_payloads(&self, payloads: &[String]) -> Result<(), String> {
         if payloads.is_empty() {
             return Ok(());
         }
+        let status_ttl = self.event_status_ttl_secs.max(1);
         let mut pipe = redis::pipe();
         for payload in payloads {
+            if let Ok(ev) = decode_json::<RevertEvent>(payload) {
+                if let Ok(status_json) = encode_json(&revert_event_to_status_payload(&ev)) {
+                    pipe.cmd("SET")
+                        .arg(event_status_cache_key(ev.event_id))
+                        .arg(status_json)
+                        .arg("EX")
+                        .arg(status_ttl)
+                        .ignore();
+                }
+            }
             pipe.cmd("PUBLISH")
                 .arg(REDIS_CHANNEL_ENROLLMENT_REVERT)
                 .arg(payload)

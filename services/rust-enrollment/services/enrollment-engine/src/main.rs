@@ -71,7 +71,10 @@ async fn main() -> anyhow::Result<()> {
     let snapshot_store = SnapshotStore::new(cfg.snapshot_dir.clone());
     let engine_bootstrap = Arc::clone(&engine);
     let bootstrap_opts = cfg.to_bootstrap_options();
-    tokio::spawn(async move {
+    let kafka_brokers = cfg.kafka_brokers.clone();
+    let kafka_group_id = cfg.kafka_group_id.clone();
+    let mut supervisor_shutdown = shutdown_rx.clone();
+    let supervisor_handle = tokio::spawn(async move {
         match engine_bootstrap
             .bootstrap_or_recover(
                 &snapshot_store,
@@ -82,24 +85,32 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         {
-            Ok(report) => info!(
-                ?report,
-                "enrollment-engine bootstrap completed; /readyz=200"
-            ),
+            Ok(report) => {
+                info!(
+                    ?report,
+                    "enrollment-engine bootstrap completed; launching live Redis/Kafka listeners; /readyz=200"
+                );
+                let pubsub_handle = spawn_pubsub_listener(
+                    redis_backend,
+                    Arc::clone(&engine_bootstrap),
+                    supervisor_shutdown.clone(),
+                );
+                let kafka_handle = spawn_delta_and_standby_consumer(
+                    kafka_brokers,
+                    kafka_group_id,
+                    report.kafka_resume_offsets.clone(),
+                    Arc::clone(&engine_bootstrap),
+                    supervisor_shutdown.clone(),
+                );
+                let _ = supervisor_shutdown.changed().await;
+                let _ = pubsub_handle.await;
+                let _ = kafka_handle.await;
+            }
             Err(err) => {
                 error!(error = %err, "enrollment-engine bootstrap failed; keeping /readyz=503")
             }
         }
     });
-
-    let pubsub_handle =
-        spawn_pubsub_listener(redis_backend, Arc::clone(&engine), shutdown_rx.clone());
-    let kafka_handle = spawn_delta_and_standby_consumer(
-        cfg.kafka_brokers.clone(),
-        cfg.kafka_group_id.clone(),
-        Arc::clone(&engine),
-        shutdown_rx,
-    );
 
     let router = build_router(AppState {
         engine,
@@ -117,10 +128,9 @@ async fn main() -> anyhow::Result<()> {
         .context("HTTP server error")?;
 
     let _ = shutdown_tx.send(true);
+    let _ = supervisor_handle.await;
     drop(coalescer_handle);
     drop(jwks_handle);
-    drop(pubsub_handle);
-    drop(kafka_handle);
     Ok(())
 }
 

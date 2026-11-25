@@ -1,3 +1,4 @@
+use crate::core::ports::KafkaPartitionOffset;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -273,6 +274,7 @@ pub struct BootstrapReport {
     pub replayed_events: usize,
     pub checkpoint_seq: i64,
     pub snapshot_sha256: String,
+    pub kafka_resume_offsets: Vec<KafkaPartitionOffset>,
 }
 
 #[derive(Debug, Error)]

@@ -15,8 +15,8 @@ pub use models::{
     StudentCourseAttempt, StudentState,
 };
 pub use ports::{
-    CommandPublisher, FallbackEventLogSource, JwksFetcher, KafkaReplayBatch, KafkaReplaySource,
-    PreloadSource, RevertDedupStore, TentativeSeatSink,
+    CommandPublisher, FallbackEventLogSource, JwksFetcher, KafkaPartitionOffset, KafkaReplayBatch,
+    KafkaReplaySource, PreloadSource, RevertDedupStore, TentativeSeatSink,
 };
 pub use snapshot::{DiskSnapshotMeta, LoadedDiskSnapshot, SnapshotError, SnapshotStore};
 pub use state_machine::EnrollmentEngine;

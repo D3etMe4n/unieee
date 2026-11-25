@@ -27,6 +27,7 @@ pub struct WriterConfig {
     pub max_db_retries: u32,
     pub db_retry_backoff_ms: u64,
     pub cache_ttl_secs: u64,
+    pub event_status_ttl_secs: u64,
 }
 
 impl WriterConfig {
@@ -102,6 +103,12 @@ impl WriterConfig {
             1,
         )?;
         let cache_ttl_secs = parse_u64_min(non_empty("CACHE_TTL_SECS"), "CACHE_TTL_SECS", 900, 1)?;
+        let event_status_ttl_secs = parse_u64_min(
+            non_empty("EVENT_STATUS_TTL_SECS"),
+            "EVENT_STATUS_TTL_SECS",
+            3600,
+            1,
+        )?;
 
         Ok(Self {
             bind_addr,
@@ -120,6 +127,7 @@ impl WriterConfig {
             max_db_retries,
             db_retry_backoff_ms,
             cache_ttl_secs,
+            event_status_ttl_secs,
         })
     }
 }

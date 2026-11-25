@@ -3,10 +3,18 @@ use async_trait::async_trait;
 use unieee_domain::{EventId, TermId};
 use unieee_events::{EnrollmentCommandEvent, EnrollmentDeltaEvent, SeatTentativeEvent};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KafkaPartitionOffset {
+    pub topic: String,
+    pub partition: i32,
+    pub offset: i64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KafkaReplayBatch {
     pub commands: Vec<EnrollmentCommandEvent>,
     pub deltas: Vec<EnrollmentDeltaEvent>,
+    pub high_watermarks: Vec<KafkaPartitionOffset>,
 }
 
 #[async_trait]

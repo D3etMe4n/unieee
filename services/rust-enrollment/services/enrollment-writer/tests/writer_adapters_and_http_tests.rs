@@ -486,8 +486,10 @@ async fn redis_sentinel_helpers_pipeline_cache_sync_and_gate_listener_work() {
         .apply_confirmed_batch(&RedisBatchUpdate {
             section_snapshots: vec![snap],
             confirmed_events: vec![confirmed],
+            event_statuses: Vec::new(),
             timetable_invalidations: vec![(student_id, term_id)],
             cache_ttl_secs: 900,
+            event_status_ttl_secs: 3600,
             updated_at: now,
         })
         .await
