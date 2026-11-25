@@ -2,7 +2,7 @@
 
 **Ngôn ngữ:** [English](../en/architecture.md) | **Tiếng Việt** | [Trung tâm Tài liệu](../README.vi.md)
 
-**unieee** kết hợp một **Spring Boot 4.1.2 Modular Monolith** (Warm/Cold Path chạy 24/7) với cụm **Rust Hot Path** đang trong lộ trình (bật theo chu kỳ mở cổng), xoay quanh **PostgreSQL** làm Source of Truth duy nhất và **Redis HA** chỉ đóng vai trò Read Cache & Pub/Sub.
+**unieee** kết hợp một **Spring Boot 4.1.3 Modular Monolith** (Warm/Cold Path chạy 24/7) với cụm **Rust Hot Path** đang trong lộ trình (bật theo chu kỳ mở cổng), xoay quanh **PostgreSQL** làm Source of Truth duy nhất và **Redis HA** chỉ đóng vai trò Read Cache & Pub/Sub.
 
 ---
 
@@ -10,7 +10,7 @@
 
 | Tiêu chí | Warm / Cold Path (`services/core-java/`) | Hot Path (`services/rust-enrollment/` — Phases 6–9) |
 | :--- | :--- | :--- |
-| **Nền tảng** | Java 21 (Virtual Threads), Spring Boot 4.1.2, Spring Modulith 2.1.2 | Rust, Axum, Tokio (`enrollment-engine`, `enrollment-writer`, `sse-gateway`) |
+| **Nền tảng** | Java 25 (Virtual Threads), Spring Boot 4.1.3, Spring Modulith 2.1.2 | Rust, Axum, Tokio (`enrollment-engine`, `enrollment-writer`, `sse-gateway`) |
 | **Phạm vi** | Chương trình khung, môn học, tiên quyết, học kỳ, lớp học phần, cấp phát Keycloak, khảo sát nguyện vọng, Policy Engine & export snapshot, đợt đăng ký, can thiệp Admin, đối soát, AI Advisor (Phase 10) | Giữ ghế tốc độ cao trong RAM, trừ ghế CAS lock-free, kiểm tra trùng lịch Bitmask `O(1)`, Kafka batch ingestion, SQL `UNNEST` batch commit + Revert, fan-out SSE thời gian thực |
 | **Vòng đời** | Chạy **24/7** (`core` Compose profile) | Bật trước giờ vàng (`prepare-registration` / `open-registration`) và drain sạch trước khi tắt (`close-registration`) |
 

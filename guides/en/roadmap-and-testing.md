@@ -46,5 +46,5 @@ Every Pull Request into `dev` or `main` must pass two GitHub Actions jobs:
    - Validates shell script syntax (`bash -n` / `sh -n`) and Keycloak realm JSON integrity (`registrationAllowed == false`, all 3 roles present).
    - Validates all 5 Compose configuration overlays (`compose.base.yml`, `compose.hotpath.yml`, `compose.letsencrypt.yml`, `compose.cloudflared.yml`).
    - Verifies that all relative links in `README.md` and `README.vi.md` resolve cleanly.
-2. **Spring Boot 4.1.2 Core & Modulith:**
+2. **Spring Boot 4.1.3 Core & Modulith:**
    - Runs `./gradlew check --no-daemon` against real Testcontainers PostgreSQL, enforcing `ModularityVerificationTest` and JaCoCo tiered coverage rules.

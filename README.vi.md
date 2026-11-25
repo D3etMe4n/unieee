@@ -33,10 +33,10 @@ Bộ tài liệu công khai dành cho người xem repository và cộng tác vi
 
 ## Kiến trúc Tổng quan
 
-- **Warm / Cold Path — Spring Boot 4.1.2 Modular Monolith (`services/core-java/`):**
+- **Warm / Cold Path — Spring Boot 4.1.3 Modular Monolith (`services/core-java/`):**
   - Tổ chức thành **4 Bounded Contexts** (`catalog`, `account`, `registration` và `ai_advisor` dự kiến ở Phase 10) trên shared kernel `common` với đồ thị phụ thuộc tuyến tính 1 chiều (Spring Modulith verify) và phân tách PostgreSQL Schema-per-Bounded-Context (`V001`–`V005`).
   - Quản lý học kỳ, khoa/ngành/chương trình khung, môn học & tiên quyết DFS, lớp học phần với lịch Bitmask 20 tuần, cấp phát tài khoản Keycloak, GPA trọng số tín chỉ, Admin Override có **Single-Writer Gate Guard** (`409 REGISTRATION_GATE_OPEN` khi `REGISTRATION_OPEN`), khảo sát nguyện vọng không giữ ghế, đợt mở cổng và **Policy Engine đa trường** kèm SHA-256 snapshot exporter (`unieee:cache:policy:{termId}:snapshot`).
-  - Dùng **Java 21 (Virtual Threads)**, **Spring Modulith** (Event Publication Registry + Cleanup Job), **Spring Data JPA**, **Flyway**, **Spring Security** (Keycloak OIDC 1.0 / OAuth 2.0 / JWT), **MapStruct** và **Spring AI** dự kiến (`ai_advisor`).
+  - Dùng **Java 25 (Virtual Threads)**, **Spring Modulith** (Event Publication Registry + Cleanup Job), **Spring Data JPA**, **Flyway**, **Spring Security** (Keycloak OIDC 1.0 / OAuth 2.0 / JWT), **MapStruct** và **Spring AI** dự kiến (`ai_advisor`).
 - **Hot Path — Cụm dịch vụ Rust (`services/rust-enrollment/` — Dự kiến Phases 6–9):**
   - **Enrollment State-Machine (`enrollment-engine`, Axum + Tokio):** Giữ state đăng ký trong RAM với cấu trúc dữ liệu căn lề *cache-line* (`#[repr(align(64))]`), sharding theo sinh viên, trừ ghế nguyên tử lock-free và kiểm tra trùng lịch `O(1)` bằng **Bitmask**; đẩy sự kiện sang **Kafka (KRaft)** và hỗ trợ phục hồi qua replay/Active–Standby failover.
   - **Writer / Commit Service (`enrollment-writer`):** Đọc batch từ Kafka, xác thực và ghi bền vững vào **PostgreSQL** (qua **PgBouncer**) bằng `UNNEST` + Atomic `UPDATE` + `CHECK` constraint; đồng bộ **Redis HA** (Read Cache & Pub/Sub) và phát sự kiện hoàn tác (**Revert**) nếu DB từ chối.
@@ -49,7 +49,7 @@ Bộ tài liệu công khai dành cho người xem repository và cộng tác vi
 
 ## Tiến độ Triển khai
 
-**Phases 1–5 đã hoàn thành và merge vào `dev`** (monorepo & hạ tầng container, nền tảng Spring Boot 4.1.2 Modulith, các Bounded Contexts `catalog`/`account`/`registration` cùng migrations `V001`–`V005`, khảo sát nguyện vọng, đợt mở cổng và Policy Engine đa trường + snapshot export). **Phases 6–12** (cụm Rust Hot Path, trợ lý Spring AI, diễn tập failover HA và load test k6) đang ở các bước tiếp theo — xem chi tiết tại [Lộ trình 12 Phases & Chiến lược Kiểm thử](./guides/vi/roadmap-and-testing.md).
+**Phases 1–5 đã hoàn thành và merge vào `dev`** (monorepo & hạ tầng container, nền tảng Spring Boot 4.1.3 Modulith, các Bounded Contexts `catalog`/`account`/`registration` cùng migrations `V001`–`V005`, khảo sát nguyện vọng, đợt mở cổng và Policy Engine đa trường + snapshot export). **Phases 6–12** (cụm Rust Hot Path, trợ lý Spring AI, diễn tập failover HA và load test k6) đang ở các bước tiếp theo — xem chi tiết tại [Lộ trình 12 Phases & Chiến lược Kiểm thử](./guides/vi/roadmap-and-testing.md).
 
 ---
 
@@ -65,7 +65,7 @@ Bộ tài liệu công khai dành cho người xem repository và cộng tác vi
 
 | Thành phần | Công nghệ |
 | :--- | :--- |
-| Core Monolith & AI | Java 21 (Virtual Threads), Spring Boot 4.1.2, Spring Modulith, Gradle Kotlin DSL, JPA, Flyway, MapStruct, Spring AI |
+| Core Monolith & AI | Java 25 (Virtual Threads), Spring Boot 4.1.3, Spring Modulith, Gradle Kotlin DSL, JPA, Flyway, MapStruct, Spring AI |
 | Hot Path Services | Rust, Axum, Tokio (`enrollment-engine`, `enrollment-writer`, `sse-gateway`) |
 | Database & Pooling | PostgreSQL (`CHECK` + Event Sourcing), PgBouncer |
 | Cache & Pub/Sub | Redis HA (Master–Replica + Sentinel, AOF/RDB) |
@@ -85,7 +85,7 @@ unieee/
 │   ├── en/                      # Tài liệu Tiếng Anh (cài đặt, kiến trúc, API, lộ trình)
 │   └── vi/                      # Tài liệu Tiếng Việt
 ├── services/
-│   ├── core-java/               # Spring Boot 4.1.2 Modular Monolith (common, catalog, account, registration)
+│   ├── core-java/               # Spring Boot 4.1.3 Modular Monolith (common, catalog, account, registration)
 │   └── rust-enrollment/         # Rust Cargo Workspace (crates/ + services/) [Phases 6-9]
 ├── infra/
 │   ├── compose.base.yml         # Stack cơ bản (core profile)

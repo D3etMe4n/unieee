@@ -15,7 +15,7 @@ Tài liệu này hướng dẫn cách khởi động hệ thống **unieee** tr�
 | :--- | :--- | :--- |
 | **Podman + Compose** *(mặc định)* | Podman 5.x + `podman compose` | Runtime mặc định ưu tiên trong [scripts/unieee.sh](../../scripts/unieee.sh). |
 | **Docker + Compose** *(fallback)* | Docker Engine + Compose v2 | Tự động chọn nếu không có Podman, hoặc ép buộc qua `--runtime docker`. |
-| **Java JDK** | Temurin / OpenJDK **21 (LTS)** | Cần khi chạy `./gradlew check` trực tiếp bên ngoài container. |
+| **Java JDK** | Temurin / OpenJDK **25 (LTS)** | Cần khi chạy `./gradlew check` trực tiếp bên ngoài container. |
 | **Tiện ích CLI** | `bash`, `curl`, `jq` | Dùng để kiểm thử nhanh API và đọc JSON. |
 
 ---
