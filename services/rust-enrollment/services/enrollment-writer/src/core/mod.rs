@@ -13,5 +13,7 @@ pub use models::{
     RedisSectionSeatsPayload, RedisTermSectionSummaryPayload, SectionSeatSnapshot,
     SingleEventOutcome, WriterError, WriterMetrics, WriterMetricsSnapshot, WriterReadiness,
 };
-pub use ports::{DlqPublisher, RedisWriterSink, WriterRepository};
+pub use ports::{
+    DeltaRevertPublisher, DlqPublisher, NoopDeltaRevertPublisher, RedisWriterSink, WriterRepository,
+};
 pub use processor::{EpochTracker, WriterProcessor, WriterProcessorConfig};

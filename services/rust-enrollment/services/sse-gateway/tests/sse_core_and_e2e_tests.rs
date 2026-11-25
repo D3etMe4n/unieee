@@ -8,7 +8,7 @@ use common::{make_test_verifier, RsaTestKeypair, SseFrameReader};
 use enrollment_engine::core::{
     spawn_coalescer as spawn_engine_coalescer, ActiveEnrollment, CommandPublisher,
     CoursePrerequisiteEdge, EngineReadiness, EnrollmentEngine, NodeRole, PreloadDataset,
-    RevertDedupStore, RevertOutcome, SectionMeta, StudentCourseAttempt, StudentState,
+    PublishError, RevertDedupStore, RevertOutcome, SectionMeta, StudentCourseAttempt, StudentState,
     TentativeSeatSink,
 };
 use enrollment_writer::core::{
@@ -47,7 +47,7 @@ struct EngineCommandBus {
 
 #[async_trait]
 impl CommandPublisher for EngineCommandBus {
-    async fn publish_command(&self, event: &EnrollmentCommandEvent) -> Result<(), String> {
+    async fn publish_command(&self, event: &EnrollmentCommandEvent) -> Result<(), PublishError> {
         self.commands.lock().await.push(event.clone());
         Ok(())
     }

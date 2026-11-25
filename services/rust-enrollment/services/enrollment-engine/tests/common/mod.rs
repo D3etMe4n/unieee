@@ -7,7 +7,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use enrollment_engine::core::{
     ActiveEnrollment, CommandPublisher, CoursePrerequisiteEdge, EnrollmentEngine,
     FallbackEventLogSource, JwksFetcher, KafkaReplayBatch, KafkaReplaySource, NodeRole,
-    PreloadDataset, PreloadSource, ReplayEventRecord, RevertDedupStore,
+    PreloadDataset, PreloadSource, PublishError, ReplayEventRecord, RevertDedupStore,
     SeatTentativeCoalescerHandle, SectionMeta, StudentCourseAttempt, StudentState,
     TentativeSeatSink,
 };
@@ -33,6 +33,10 @@ pub const ALL_TWENTY_WEEKS: &str = "11111111111111111111";
 
 pub struct MockCommandPublisher {
     pub fail: AtomicBool,
+    pub fail_indeterminate: AtomicBool,
+    pub pause_entered: Arc<tokio::sync::Notify>,
+    pub pause_release: Arc<tokio::sync::Notify>,
+    pub pause_next: AtomicBool,
     pub published: Mutex<Vec<EnrollmentCommandEvent>>,
 }
 
@@ -40,6 +44,10 @@ impl Default for MockCommandPublisher {
     fn default() -> Self {
         Self {
             fail: AtomicBool::new(false),
+            fail_indeterminate: AtomicBool::new(false),
+            pause_entered: Arc::new(tokio::sync::Notify::new()),
+            pause_release: Arc::new(tokio::sync::Notify::new()),
+            pause_next: AtomicBool::new(false),
             published: Mutex::new(Vec::new()),
         }
     }
@@ -47,9 +55,18 @@ impl Default for MockCommandPublisher {
 
 #[async_trait]
 impl CommandPublisher for MockCommandPublisher {
-    async fn publish_command(&self, event: &EnrollmentCommandEvent) -> Result<(), String> {
+    async fn publish_command(&self, event: &EnrollmentCommandEvent) -> Result<(), PublishError> {
+        if self.pause_next.swap(false, Ordering::AcqRel) {
+            self.pause_entered.notify_waiters();
+            self.pause_release.notified().await;
+        }
+        if self.fail_indeterminate.load(Ordering::Acquire) {
+            return Err(PublishError::Indeterminate(
+                "simulated Kafka MessageTimedOut".to_owned(),
+            ));
+        }
         if self.fail.load(Ordering::Acquire) {
-            return Err("simulated Kafka outage".to_owned());
+            return Err(PublishError::Definite("simulated Kafka outage".to_owned()));
         }
         self.published.lock().await.push(event.clone());
         Ok(())

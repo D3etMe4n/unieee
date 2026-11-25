@@ -73,6 +73,7 @@ pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn register_handler(
     State(state): State<AppState>,
     uri: Uri,
+    headers: HeaderMap,
     AuthenticatedUser(claims): AuthenticatedUser,
     ProblemJson(req): ProblemJson<RegisterRequest>,
 ) -> Result<(StatusCode, Json<EnrollmentAcceptedResponse>), ApiError> {
@@ -80,6 +81,7 @@ pub async fn register_handler(
     if !claims.has_role("STUDENT") {
         return Err(ApiError::from(AuthError::Forbidden).with_instance(instance));
     }
+    let idempotency_key = extract_idempotency_key(&headers, instance)?;
     validate_positive_section_id(req.section_id, instance)?;
     let student_id = state
         .engine
@@ -87,7 +89,13 @@ pub async fn register_handler(
         .map_err(|err| ApiError::from(err).with_instance(instance))?;
     let accepted = state
         .engine
-        .register(student_id, req.section_id, req.action, Utc::now())
+        .register_with_idempotency(
+            student_id,
+            req.section_id,
+            req.action,
+            idempotency_key.as_deref(),
+            Utc::now(),
+        )
         .await
         .map_err(|err| ApiError::from(err).with_instance(instance))?;
 
@@ -112,6 +120,7 @@ pub async fn register_handler(
 pub async fn drop_handler(
     State(state): State<AppState>,
     uri: Uri,
+    headers: HeaderMap,
     AuthenticatedUser(claims): AuthenticatedUser,
     ProblemJson(req): ProblemJson<DropRequest>,
 ) -> Result<(StatusCode, Json<EnrollmentAcceptedResponse>), ApiError> {
@@ -119,6 +128,7 @@ pub async fn drop_handler(
     if !claims.has_role("STUDENT") {
         return Err(ApiError::from(AuthError::Forbidden).with_instance(instance));
     }
+    let idempotency_key = extract_idempotency_key(&headers, instance)?;
     validate_positive_section_id(req.section_id, instance)?;
     let student_id = state
         .engine
@@ -126,7 +136,12 @@ pub async fn drop_handler(
         .map_err(|err| ApiError::from(err).with_instance(instance))?;
     let accepted = state
         .engine
-        .drop_section(student_id, req.section_id, Utc::now())
+        .drop_section_with_idempotency(
+            student_id,
+            req.section_id,
+            idempotency_key.as_deref(),
+            Utc::now(),
+        )
         .await
         .map_err(|err| ApiError::from(err).with_instance(instance))?;
 
@@ -178,7 +193,12 @@ pub async fn get_status_handler(
         None
     };
 
-    let Some(record) = state.engine.get_event_status(event_id) else {
+    let Some(record) = state
+        .engine
+        .get_event_status_with_fallback(event_id, Utc::now())
+        .await
+        .map_err(|err| ApiError::from(err).with_instance(instance))?
+    else {
         return Err(ApiError::not_found(
             "EVENT_NOT_FOUND",
             format!("Enrollment event {event_id} not found in active window"),
@@ -262,6 +282,34 @@ fn validate_positive_section_id(section_id: SectionId, instance: &str) -> Result
         ));
     }
     Ok(())
+}
+
+fn extract_idempotency_key(
+    headers: &HeaderMap,
+    instance: &str,
+) -> Result<Option<String>, ApiError> {
+    let Some(raw_val) = headers.get("Idempotency-Key") else {
+        return Ok(None);
+    };
+    let Ok(val_str) = raw_val.to_str() else {
+        return Err(ApiError::bad_request(
+            "INVALID_IDEMPOTENCY_KEY",
+            "Idempotency-Key header must contain valid UTF-8",
+        )
+        .with_instance(instance));
+    };
+    let trimmed = val_str.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > 128 || trimmed.chars().any(|c| c.is_control()) {
+        return Err(ApiError::bad_request(
+            "INVALID_IDEMPOTENCY_KEY",
+            "Idempotency-Key must be 1..=128 printable characters",
+        )
+        .with_instance(instance));
+    }
+    Ok(Some(trimmed.to_owned()))
 }
 
 async fn authenticate_bearer(

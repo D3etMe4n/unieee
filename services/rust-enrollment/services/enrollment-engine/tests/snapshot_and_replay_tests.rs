@@ -6,19 +6,21 @@ use common::{
     MockKafkaReplaySource, MockPreloadSource, MockRevertDedupStore,
 };
 use enrollment_engine::core::{
-    BootstrapOptions, BootstrapSourceKind, CommandPublisher, EngineReadiness, EnrollmentEngine,
-    NodeRole, ReplayEventRecord, RevertDedupStore, SeatTentativeCoalescerHandle, SnapshotError,
-    SnapshotStore,
+    BootstrapOptions, BootstrapSourceKind, CommandPublisher, EngineError, EngineReadiness,
+    EnrollmentEngine, NodeRole, ReplayEventRecord, RevertDedupStore, SeatTentativeCoalescerHandle,
+    SnapshotError, SnapshotStore,
 };
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
 use unieee_domain::{
-    CourseId, EnrollmentAction, EnrollmentEventStatus, EnrollmentEventType, EventId,
+    CourseId, EnrollmentAction, EnrollmentEventStatus, EnrollmentEventType, EventId, GateState,
     HotPathEnrollmentState, SectionId, StudentId, TermId,
 };
-use unieee_events::{EnrollmentCommandEvent, EnrollmentDeltaEvent, SectionCapacityUpdatedEvent};
+use unieee_events::{
+    EnrollmentCommandEvent, EnrollmentDeltaEvent, GateControlEvent, SectionCapacityUpdatedEvent,
+};
 
 #[tokio::test]
 async fn atomic_disk_snapshot_writes_verifies_checksum_and_detects_tampering() {
@@ -384,7 +386,31 @@ async fn fallback_keyset_paginated_replay_and_fresh_preload_when_snapshot_absent
     assert_eq!(snap.available_seats, 19);
     assert_eq!(engine2.student_snapshot(s1).unwrap().current_credits, 3);
     assert_eq!(engine2.student_snapshot(s2).unwrap().current_credits, 0);
-    assert!(engine2.export_preload_dataset(now).students.len() == 3);
+    // Guarded snapshot refuses export while GateState::Open, succeeds once Paused.
+    assert!(matches!(
+        engine2.try_export_preload_dataset(now),
+        Err(EngineError::SnapshotBlocked {
+            gate_state: GateState::Open,
+            in_flight: 0,
+        })
+    ));
+    engine2
+        .apply_gate_control(&GateControlEvent::new(
+            term_id,
+            GateState::Paused,
+            None,
+            engine2.epoch(),
+            now,
+        ))
+        .unwrap();
+    assert_eq!(
+        engine2
+            .try_export_preload_dataset(now)
+            .unwrap()
+            .students
+            .len(),
+        3
+    );
 
     // SnapshotStore::dir(), non-existent directory, and find_latest_verified recovery with term_id=None & rejoin_as_standby=false
     assert_eq!(store.dir(), dir.path());
@@ -418,4 +444,127 @@ async fn fallback_keyset_paginated_replay_and_fresh_preload_when_snapshot_absent
         .unwrap();
     assert_eq!(rep3.source, BootstrapSourceKind::DiskSnapshotKafkaReplay);
     assert_eq!(rep3.final_role, NodeRole::Active);
+}
+
+#[tokio::test]
+async fn kafka_replay_handles_revert_gate_control_and_zero_gap_resume_offsets() {
+    let dir = tempdir().unwrap();
+    let store = SnapshotStore::new(dir.path());
+    let now = Utc::now();
+    let term_id = TermId::new_v4();
+    let c1 = CourseId::new_v4();
+    let sid = StudentId::new_v4();
+
+    let dataset = make_dataset(
+        term_id,
+        vec![make_section(term_id, 55, c1, "CS55", 3, 5, 0, 2, 1, 2)],
+        Vec::new(),
+        vec![make_student(sid, "S55", Some("sub-55"), "K24", "CSE")],
+        now - ChronoDuration::minutes(2),
+    );
+    let win_id = dataset.active_window_id;
+    store
+        .write_atomic(
+            &dataset,
+            (now - ChronoDuration::minutes(2)).timestamp_millis(),
+        )
+        .unwrap();
+
+    let ev_reg = EventId::new_v7();
+    let pg_preload = Arc::new(MockPreloadSource::new(dataset));
+    let pg_fallback = Arc::new(MockFallbackEventLogSource::default());
+    let kafka_replay = Arc::new(MockKafkaReplaySource::default());
+    {
+        let mut batch = kafka_replay.batch.lock().await;
+        // Same timestamp `now`: GateControl (tie=0) -> Command(Register) (tie=1) -> Revert (tie=2)
+        batch
+            .deltas
+            .push(EnrollmentDeltaEvent::GateControl(GateControlEvent::new(
+                term_id,
+                GateState::Paused,
+                win_id,
+                4,
+                now,
+            )));
+        batch.deltas.push(EnrollmentDeltaEvent::Revert(
+            unieee_events::RevertEvent::new(
+                ev_reg,
+                term_id,
+                sid,
+                SectionId::new(55),
+                c1,
+                EnrollmentAction::Register,
+                unieee_domain::RuleErrorCode::DatabaseConstraintViolation,
+                "rejected in PG",
+                4,
+                now,
+            ),
+        ));
+        batch.commands.push(EnrollmentCommandEvent::new(
+            ev_reg,
+            term_id,
+            sid,
+            SectionId::new(55),
+            c1,
+            EnrollmentAction::Register,
+            4,
+            now,
+        ));
+        batch
+            .high_watermarks
+            .push(enrollment_engine::core::KafkaPartitionOffset {
+                topic: unieee_events::KAFKA_TOPIC_ENROLLMENT_COMMANDS.to_owned(),
+                partition: 0,
+                offset: 42,
+            });
+    }
+
+    let engine = EnrollmentEngine::new_awaiting_preload(
+        NodeRole::Active,
+        Arc::new(MockCommandPublisher::default()) as Arc<dyn CommandPublisher>,
+        SeatTentativeCoalescerHandle::disconnected(),
+        Arc::new(MockRevertDedupStore::default()) as Arc<dyn RevertDedupStore>,
+    );
+    let report = engine
+        .bootstrap_or_recover(
+            &store,
+            pg_preload.as_ref(),
+            kafka_replay.as_ref(),
+            pg_fallback.as_ref(),
+            BootstrapOptions {
+                term_id: Some(term_id),
+                term_code: None,
+                configured_role: NodeRole::Active,
+                rejoin_as_standby_on_recovery: true,
+                replay_batch_size: 5000,
+                replay_throttle: Duration::ZERO,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.source, BootstrapSourceKind::DiskSnapshotKafkaReplay);
+    assert_eq!(report.replayed_events, 3);
+    assert_eq!(report.kafka_resume_offsets.len(), 1);
+    assert_eq!(report.kafka_resume_offsets[0].offset, 42);
+    assert_eq!(engine.epoch(), 4);
+    assert_eq!(engine.seat_snapshot(SectionId::new(55)).unwrap().epoch, 4);
+    assert_eq!(
+        engine
+            .seat_snapshot(SectionId::new(55))
+            .unwrap()
+            .available_seats,
+        5
+    );
+    assert!(engine
+        .student_snapshot(sid)
+        .unwrap()
+        .active_enrollments
+        .is_empty());
+    assert_eq!(
+        engine.get_event_status(ev_reg).unwrap().state,
+        HotPathEnrollmentState::Reverted
+    );
+    assert_eq!(engine.gate_state(), GateState::Paused);
+    assert!(engine.try_export_preload_dataset(now).is_ok());
 }

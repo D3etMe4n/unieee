@@ -183,6 +183,12 @@ impl From<EngineError> for ApiError {
                     .unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
                 Self::new(status, code.as_str(), detail)
             }
+            EngineError::SnapshotBlocked { .. } => {
+                Self::new(StatusCode::CONFLICT, "SNAPSHOT_BLOCKED", err.to_string())
+            }
+            EngineError::ServiceUnavailable { code, detail } => {
+                Self::new(StatusCode::SERVICE_UNAVAILABLE, code, detail)
+            }
             EngineError::Forbidden(msg) => Self::new(StatusCode::FORBIDDEN, "FORBIDDEN", msg),
             EngineError::Domain(d) => {
                 Self::new(StatusCode::BAD_REQUEST, "DOMAIN_ERROR", d.to_string())

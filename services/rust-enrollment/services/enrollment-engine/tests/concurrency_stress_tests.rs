@@ -1,14 +1,20 @@
 mod common;
 
 use chrono::Utc;
-use common::{make_dataset, make_ready_engine, make_section, make_student};
-use enrollment_engine::core::{EngineError, NodeRole};
+use common::{make_dataset, make_default_policy, make_ready_engine, make_section, make_student};
+use enrollment_engine::core::{
+    EngineError, EngineRuntimeOptions, EnrollmentEngine, NodeRole, PublishError, RevertDedupStore,
+    SeatTentativeCoalescerHandle,
+};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Barrier;
 use unieee_domain::{
-    CourseId, EnrollmentAction, EventId, RuleErrorCode, SectionId, StudentId, TermId,
+    CourseId, EnrollmentAction, EventId, GateState, RegistrationWindowSnapshot, RuleErrorCode,
+    SectionId, StudentId, TermId, WindowId, WindowStatus,
 };
-use unieee_events::{EnrollmentDeltaEvent, SectionCapacityUpdatedEvent};
+use unieee_events::{EnrollmentDeltaEvent, GateControlEvent, SectionCapacityUpdatedEvent};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrency_100_students_racing_for_10_seats_zero_overbooking() {
@@ -186,4 +192,194 @@ async fn concurrency_parallel_register_and_hot_capacity_increase_preserves_seat_
     assert_eq!(snap.enrolled_count, ok_count);
     assert_eq!(snap.available_seats + snap.enrolled_count, 20);
     assert!((5..=20).contains(&ok_count));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn arcswap_rcu_gate_control_eliminates_torn_reads_under_concurrent_register() {
+    let now = Utc::now();
+    let term_id = TermId::new_v4();
+    let c1 = CourseId::new_v4();
+    let w1 = WindowId::new_v4();
+    let w2 = WindowId::new_v4();
+
+    let mut policy = make_default_policy(term_id, now);
+    policy.windows = vec![
+        RegistrationWindowSnapshot {
+            id: Some(w1),
+            name: "Wave 1".to_owned(),
+            status: WindowStatus::Active,
+            allowed_cohorts: Vec::new(),
+            allowed_faculties: Vec::new(),
+            allowed_actions: vec![EnrollmentAction::Register],
+            start_at: now - chrono::Duration::hours(1),
+            end_at: now + chrono::Duration::hours(4),
+        },
+        RegistrationWindowSnapshot {
+            id: Some(w2),
+            name: "Wave 2".to_owned(),
+            status: WindowStatus::Scheduled,
+            allowed_cohorts: Vec::new(),
+            allowed_faculties: Vec::new(),
+            allowed_actions: vec![EnrollmentAction::Register],
+            start_at: now - chrono::Duration::hours(1),
+            end_at: now + chrono::Duration::hours(4),
+        },
+    ];
+
+    let students: Vec<_> = (0..64)
+        .map(|i| {
+            make_student(
+                StudentId::new_v4(),
+                &format!("RCU{i:02}"),
+                None,
+                "K24",
+                "CSE",
+            )
+        })
+        .collect();
+    let student_ids: Vec<_> = students.iter().map(|s| s.student_id).collect();
+
+    let mut dataset = make_dataset(
+        term_id,
+        vec![make_section(term_id, 6001, c1, "CS600", 3, 200, 0, 1, 1, 2)],
+        Vec::new(),
+        students,
+        now,
+    );
+    dataset.active_window_id = Some(w1);
+    dataset.policy = policy;
+
+    let (engine, _, _) = make_ready_engine(dataset, NodeRole::Active);
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut reg_tasks = Vec::new();
+    let barrier = Arc::new(Barrier::new(65));
+
+    for sid in student_ids {
+        let eng = Arc::clone(&engine);
+        let b = Arc::clone(&barrier);
+        reg_tasks.push(tokio::spawn(async move {
+            b.wait().await;
+            for _ in 0..8 {
+                match eng
+                    .register(sid, SectionId::new(6001), EnrollmentAction::Register, now)
+                    .await
+                {
+                    Ok(_)
+                    | Err(EngineError::RuleViolation {
+                        code: RuleErrorCode::AlreadyEnrolledInCourse,
+                        ..
+                    }) => {}
+                    Err(other) => {
+                        panic!("torn read or unexpected error during RCU switch: {other:?}")
+                    }
+                }
+            }
+        }));
+    }
+
+    let eng_gate = Arc::clone(&engine);
+    let stop_gate = Arc::clone(&stop);
+    barrier.wait().await;
+    let switcher = tokio::spawn(async move {
+        let mut step = 0u64;
+        while !stop_gate.load(Ordering::Acquire) {
+            let target = if step.is_multiple_of(2) { w2 } else { w1 };
+            let _ = eng_gate.apply_gate_control(&GateControlEvent::new(
+                term_id,
+                GateState::Open,
+                Some(target),
+                eng_gate.epoch(),
+                now,
+            ));
+            step += 1;
+            tokio::task::yield_now().await;
+        }
+    });
+
+    for t in reg_tasks {
+        t.await.unwrap();
+    }
+    stop.store(true, Ordering::Release);
+    switcher.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_flight_drain_waits_for_active_publish_and_rejects_post_demote_requests() {
+    let now = Utc::now();
+    let term_id = TermId::new_v4();
+    let c1 = CourseId::new_v4();
+    let s1 = StudentId::new_v4();
+    let s2 = StudentId::new_v4();
+    let dataset = make_dataset(
+        term_id,
+        vec![make_section(term_id, 710, c1, "CS710", 3, 10, 0, 1, 1, 2)],
+        Vec::new(),
+        vec![
+            make_student(s1, "D1", None, "K24", "CSE"),
+            make_student(s2, "D2", None, "K24", "CSE"),
+        ],
+        now,
+    );
+
+    let pub_mock = Arc::new(common::MockCommandPublisher::default());
+    let dedup_mock = Arc::new(common::MockRevertDedupStore::default());
+    let engine = Arc::new(EnrollmentEngine::with_options(
+        NodeRole::Active,
+        Arc::clone(&pub_mock) as Arc<dyn enrollment_engine::core::CommandPublisher>,
+        SeatTentativeCoalescerHandle::disconnected(),
+        dedup_mock as Arc<dyn RevertDedupStore>,
+        EngineRuntimeOptions {
+            max_in_flight_kafka_publishes: 8,
+            ..Default::default()
+        },
+    ));
+    engine
+        .hydrate_from_dataset(dataset, NodeRole::Active)
+        .unwrap();
+    engine.set_readiness(enrollment_engine::core::EngineReadiness::Ready);
+
+    // Pause first register mid-Kafka publish
+    pub_mock.pause_next.store(true, Ordering::Release);
+    let entered = pub_mock.pause_entered.notified();
+    let eng1 = Arc::clone(&engine);
+    let h1 = tokio::spawn(async move {
+        eng1.register(s1, SectionId::new(710), EnrollmentAction::Register, now)
+            .await
+    });
+    entered.await;
+    assert_eq!(engine.in_flight_count(), 1);
+
+    // Demote & attempt short drain -> times out returning false while request is still blocked
+    assert!(
+        !engine
+            .demote_to_standby_and_drain(Duration::from_millis(30))
+            .await
+    );
+
+    // Requests arriving after demote are rejected cleanly even if handler briefly waited
+    assert!(matches!(
+        engine
+            .register(s2, SectionId::new(710), EnrollmentAction::Register, now)
+            .await,
+        Err(EngineError::NodeStandby)
+    ));
+    let _ = engine.promote_to_active();
+    let draining_task = tokio::spawn({
+        let eng = Arc::clone(&engine);
+        async move {
+            eng.apply_gate_control_and_drain(
+                &GateControlEvent::new(term_id, GateState::Draining, None, eng.epoch(), now),
+                Duration::from_secs(2),
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    pub_mock.pause_release.notify_waiters();
+
+    assert!(h1.await.unwrap().is_ok());
+    assert_eq!(draining_task.await.unwrap(), Ok(true));
+    assert_eq!(engine.in_flight_count(), 0);
+    // Keep PublishError imported cleanly
+    let _ = PublishError::Definite("unused".to_owned());
 }

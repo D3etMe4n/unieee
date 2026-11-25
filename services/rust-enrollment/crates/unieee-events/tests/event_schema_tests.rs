@@ -1,18 +1,19 @@
 use chrono::Utc;
 use rust_decimal::Decimal;
 use unieee_domain::{
-    CourseId, EnrollmentAction, EnrollmentEventStatus, EventId, GateState, RuleErrorCode,
-    SectionId, SectionStatus, StudentId, TermId, WindowId,
+    CourseId, EnrollmentAction, EnrollmentEventStatus, EventId, GateState, HotPathEnrollmentState,
+    RuleErrorCode, SectionId, SectionStatus, StudentId, TermId, WindowId,
 };
 use unieee_events::{
-    decode_json, decode_json_slice, encode_json, encode_json_bytes, policy_snapshot_cache_key,
-    revert_dedup_key, section_seats_cache_key, student_timetable_cache_key,
-    term_sections_cache_key, DeadLetterEvent, EnrollmentCommandEvent, EnrollmentDeltaEvent,
-    EventCodecError, GateControlEvent, HotPathPubSubMessage, RevertEvent, SeatConfirmedEvent,
-    SeatTentativeEvent, SectionCapacityUpdatedEvent, StudentStandingUpdatedEvent,
-    EVENT_SCHEMA_VERSION_V1, KAFKA_TOPIC_ENROLLMENT_COMMANDS, KAFKA_TOPIC_ENROLLMENT_DELTAS,
-    KAFKA_TOPIC_ENROLLMENT_DLQ, REDIS_CHANNEL_ENROLLMENT_REVERT, REDIS_CHANNEL_GATE_CONTROL,
-    REDIS_CHANNEL_SEAT_CONFIRMED, REDIS_CHANNEL_SEAT_TENTATIVE,
+    decode_json, decode_json_slice, encode_json, encode_json_bytes, event_status_cache_key,
+    policy_snapshot_cache_key, revert_dedup_key, section_seats_cache_key,
+    student_timetable_cache_key, term_sections_cache_key, DeadLetterEvent, EnrollmentCommandEvent,
+    EnrollmentDeltaEvent, EventCodecError, EventStatusCachePayload, GateControlEvent,
+    HotPathPubSubMessage, RevertEvent, SeatConfirmedEvent, SeatTentativeEvent,
+    SectionCapacityUpdatedEvent, StudentStandingUpdatedEvent, EVENT_SCHEMA_VERSION_V1,
+    KAFKA_TOPIC_ENROLLMENT_COMMANDS, KAFKA_TOPIC_ENROLLMENT_DELTAS, KAFKA_TOPIC_ENROLLMENT_DLQ,
+    REDIS_CHANNEL_ENROLLMENT_REVERT, REDIS_CHANNEL_GATE_CONTROL, REDIS_CHANNEL_SEAT_CONFIRMED,
+    REDIS_CHANNEL_SEAT_TENTATIVE,
 };
 
 #[test]
@@ -51,6 +52,10 @@ fn topic_and_redis_key_builders_match_database_and_cache_spec() {
     assert_eq!(
         revert_dedup_key(event_id),
         format!("unieee:revert:dedup:{event_id}")
+    );
+    assert_eq!(
+        event_status_cache_key(event_id),
+        format!("unieee:event:status:{event_id}")
     );
 }
 
@@ -235,7 +240,7 @@ fn hot_delta_sync_events_roundtrip_and_validate_schema_version() {
     );
     assert_eq!(standing.partition_key(), student_id.to_string());
     let delta_standing = EnrollmentDeltaEvent::StudentStandingUpdated(standing.clone());
-    assert_eq!(delta_standing.event_id(), standing_event_id);
+    assert_eq!(delta_standing.event_id(), Some(standing_event_id));
     assert_eq!(delta_standing.term_id(), term_id);
     assert_eq!(delta_standing.occurred_at(), now);
     assert_eq!(delta_standing.partition_key(), student_id.to_string());
@@ -259,7 +264,7 @@ fn hot_delta_sync_events_roundtrip_and_validate_schema_version() {
     );
     assert_eq!(cap.partition_key(), "888");
     let delta_cap = EnrollmentDeltaEvent::SectionCapacityUpdated(cap.clone());
-    assert_eq!(delta_cap.event_id(), cap_event_id);
+    assert_eq!(delta_cap.event_id(), Some(cap_event_id));
     assert_eq!(delta_cap.term_id(), term_id);
     assert_eq!(delta_cap.occurred_at(), now);
     assert_eq!(delta_cap.partition_key(), "888");
@@ -268,6 +273,63 @@ fn hot_delta_sync_events_roundtrip_and_validate_schema_version() {
     assert_eq!(
         decode_json_slice::<EnrollmentDeltaEvent>(&cap_bytes).unwrap(),
         delta_cap
+    );
+
+    let revert_id = EventId::new_v7();
+    let course_id = CourseId::new_v4();
+    let revert = RevertEvent::new(
+        revert_id,
+        term_id,
+        student_id,
+        SectionId::new(888),
+        course_id,
+        EnrollmentAction::Register,
+        RuleErrorCode::DatabaseConstraintViolation,
+        "PG CHECK failed",
+        3,
+        now,
+    );
+    let delta_revert = EnrollmentDeltaEvent::Revert(revert);
+    assert_eq!(delta_revert.event_id(), Some(revert_id));
+    assert_eq!(delta_revert.term_id(), term_id);
+    assert_eq!(delta_revert.partition_key(), student_id.to_string());
+    assert_eq!(delta_revert.occurred_at(), now);
+    let revert_json = encode_json(&delta_revert).unwrap();
+    assert!(revert_json.contains("\"deltaType\":\"REVERT\""));
+    assert_eq!(
+        decode_json::<EnrollmentDeltaEvent>(&revert_json).unwrap(),
+        delta_revert
+    );
+
+    let gate = GateControlEvent::new(term_id, GateState::Open, Some(WindowId::new_v4()), 4, now);
+    let delta_gate = EnrollmentDeltaEvent::GateControl(gate);
+    assert_eq!(delta_gate.event_id(), None);
+    assert_eq!(delta_gate.term_id(), term_id);
+    assert_eq!(delta_gate.partition_key(), term_id.to_string());
+    assert_eq!(delta_gate.occurred_at(), now);
+    let gate_json = encode_json(&delta_gate).unwrap();
+    assert!(gate_json.contains("\"deltaType\":\"GATE_CONTROL\""));
+    assert_eq!(
+        decode_json::<EnrollmentDeltaEvent>(&gate_json).unwrap(),
+        delta_gate
+    );
+
+    let cached_status = EventStatusCachePayload::new(
+        revert_id,
+        term_id,
+        student_id,
+        SectionId::new(888),
+        course_id,
+        EnrollmentAction::Register,
+        HotPathEnrollmentState::Reverted,
+        Some(RuleErrorCode::DatabaseConstraintViolation),
+        3,
+        now,
+    );
+    let status_json = encode_json(&cached_status).unwrap();
+    assert_eq!(
+        decode_json::<EventStatusCachePayload>(&status_json).unwrap(),
+        cached_status
     );
 
     let mut bad_standing = standing;

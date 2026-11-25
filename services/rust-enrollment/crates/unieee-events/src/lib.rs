@@ -17,10 +17,11 @@ pub use kafka::{
     StudentStandingUpdatedEvent,
 };
 pub use pubsub::{
-    GateControlEvent, HotPathPubSubMessage, RevertEvent, SeatConfirmedEvent, SeatTentativeEvent,
+    EventStatusCachePayload, GateControlEvent, HotPathPubSubMessage, RevertEvent,
+    SeatConfirmedEvent, SeatTentativeEvent,
 };
 pub use topics::{
-    policy_snapshot_cache_key, revert_dedup_key, section_seats_cache_key,
+    event_status_cache_key, policy_snapshot_cache_key, revert_dedup_key, section_seats_cache_key,
     student_timetable_cache_key, term_sections_cache_key, KAFKA_TOPIC_ENROLLMENT_COMMANDS,
     KAFKA_TOPIC_ENROLLMENT_DELTAS, KAFKA_TOPIC_ENROLLMENT_DLQ, REDIS_CHANNEL_ENROLLMENT_REVERT,
     REDIS_CHANNEL_GATE_CONTROL, REDIS_CHANNEL_SEAT_CONFIRMED, REDIS_CHANNEL_SEAT_TENTATIVE,

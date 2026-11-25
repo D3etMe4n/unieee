@@ -1,12 +1,13 @@
 use crate::core::coalescer::SeatTentativeCoalescerHandle;
 use crate::core::models::{
     ActiveEnrollment, BootstrapOptions, BootstrapReport, BootstrapSourceKind,
-    CoursePrerequisiteEdge, DeltaOutcome, EngineError, EngineReadiness, EnrollmentAccepted,
-    EventStatusRecord, NodeRole, PreloadDataset, ReplayEventRecord, RevertOutcome, SectionMeta,
-    StudentState,
+    CoursePrerequisiteEdge, DeltaOutcome, EngineError, EngineReadiness, EngineRuntimeOptions,
+    EnrollmentAccepted, EventStatusRecord, NodeRole, PreloadDataset, ReplayEventRecord,
+    RevertOutcome, SectionMeta, StudentState, SweepReport,
 };
 use crate::core::ports::{
-    CommandPublisher, FallbackEventLogSource, KafkaReplaySource, PreloadSource, RevertDedupStore,
+    CommandPublisher, EventStatusCacheReader, EventStatusFallbackStore, FallbackEventLogSource,
+    KafkaReplaySource, PreloadSource, PublishError, RevertDedupStore,
 };
 use crate::core::rules::{
     evaluate_credit_limit, evaluate_prerequisites, evaluate_retake_improve,
@@ -15,11 +16,14 @@ use crate::core::rules::{
 };
 use crate::core::snapshot::SnapshotStore;
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{watch, Notify, Semaphore};
+use tokio::task::JoinHandle;
 use tracing::warn;
 use unieee_cacheline::{SeatSlotTable, SectionSeatSlot, SectionSlotState, ShardedMap};
 use unieee_domain::{
@@ -98,21 +102,176 @@ fn empty_policy() -> PolicySnapshotPayload {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PolicyState {
+    policy: PolicySnapshotPayload,
+    active_window_id: Option<WindowId>,
+}
+
+struct InFlightGuard<'a> {
+    counter: &'a AtomicUsize,
+    notify: &'a Notify,
+}
+
+impl<'a> InFlightGuard<'a> {
+    fn enter(counter: &'a AtomicUsize, notify: &'a Notify) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self { counter, notify }
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        if self.counter.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.notify.notify_waiters();
+        }
+    }
+}
+
+struct IdempotencyEntry {
+    key: String,
+    accepted: EnrollmentAccepted,
+    expires_at: DateTime<Utc>,
+}
+
+struct IdempotencyCache {
+    entries: ShardedMap<StudentId, Vec<IdempotencyEntry>>,
+    total_entries: AtomicUsize,
+    ttl: ChronoDuration,
+    max_entries: usize,
+    max_per_student: usize,
+}
+
+impl IdempotencyCache {
+    fn new(ttl: Duration, max_entries: usize, max_per_student: usize) -> Self {
+        let ttl_chrono =
+            ChronoDuration::from_std(ttl).unwrap_or_else(|_| ChronoDuration::seconds(60));
+        Self {
+            entries: ShardedMap::new(),
+            total_entries: AtomicUsize::new(0),
+            ttl: ttl_chrono.max(ChronoDuration::milliseconds(1)),
+            max_entries: max_entries.max(1),
+            max_per_student: max_per_student.max(1),
+        }
+    }
+
+    fn get(
+        &self,
+        student_id: StudentId,
+        key: &str,
+        now: DateTime<Utc>,
+    ) -> Option<EnrollmentAccepted> {
+        self.entries.with_read(&student_id, |opt| {
+            opt.and_then(|list| {
+                list.iter()
+                    .find(|entry| entry.key == key && entry.expires_at > now)
+                    .map(|entry| entry.accepted.clone())
+            })
+        })
+    }
+
+    fn insert(
+        &self,
+        student_id: StudentId,
+        key: String,
+        accepted: EnrollmentAccepted,
+        now: DateTime<Utc>,
+    ) {
+        let expires_at = now + self.ttl;
+        self.entries.with_entry(student_id, Vec::new, |list| {
+            let before = list.len();
+            list.retain(|entry| entry.expires_at > now);
+            let removed_expired = before.saturating_sub(list.len());
+            if removed_expired > 0 {
+                let mut cur = self.total_entries.load(Ordering::Acquire);
+                while let Err(actual) = self.total_entries.compare_exchange_weak(
+                    cur,
+                    cur.saturating_sub(removed_expired),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    cur = actual;
+                }
+            }
+
+            if let Some(existing) = list.iter_mut().find(|entry| entry.key == key) {
+                existing.accepted = accepted;
+                existing.expires_at = expires_at;
+                return;
+            }
+
+            if list.len() >= self.max_per_student {
+                if let Some((oldest_idx, _)) = list
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, entry)| entry.expires_at)
+                {
+                    list.remove(oldest_idx);
+                    list.push(IdempotencyEntry {
+                        key,
+                        accepted,
+                        expires_at,
+                    });
+                }
+                return;
+            }
+
+            let cur_total = self.total_entries.load(Ordering::Acquire);
+            if cur_total < self.max_entries {
+                self.total_entries.fetch_add(1, Ordering::AcqRel);
+                list.push(IdempotencyEntry {
+                    key,
+                    accepted,
+                    expires_at,
+                });
+            }
+        });
+    }
+
+    fn clear(&self) {
+        self.entries.clear();
+        self.total_entries.store(0, Ordering::Release);
+    }
+
+    fn sweep(&self, now: DateTime<Utc>) -> usize {
+        let mut evicted = 0usize;
+        let mut remaining = 0usize;
+        self.entries.retain(|_, list| {
+            let before = list.len();
+            list.retain(|entry| entry.expires_at > now);
+            evicted = evicted.saturating_add(before.saturating_sub(list.len()));
+            remaining = remaining.saturating_add(list.len());
+            !list.is_empty()
+        });
+        self.total_entries.store(remaining, Ordering::Release);
+        evicted
+    }
+}
+
 pub struct EnrollmentEngine {
     catalog: ArcSwap<TermCatalog>,
     students: ShardedMap<StudentId, StudentState>,
     event_index: ShardedMap<EventId, EventStatusRecord>,
-    policy: RwLock<PolicySnapshotPayload>,
-    active_window_id: RwLock<Option<WindowId>>,
+    policy_state: ArcSwap<PolicyState>,
     applied_section_deltas: RwLock<HashSet<EventId>>,
     gate_state: AtomicU8,
     role: AtomicU8,
     readiness: AtomicU8,
     epoch: AtomicU64,
     checkpoint_seq: AtomicI64,
+    in_flight: AtomicUsize,
+    in_flight_zero: Notify,
+    publish_semaphore: Arc<Semaphore>,
+    status_pg_semaphore: Arc<Semaphore>,
+    idempotency_cache: IdempotencyCache,
+    status_negative_cache: ShardedMap<EventId, DateTime<Utc>>,
+    status_negative_count: AtomicUsize,
+    runtime_opts: EngineRuntimeOptions,
     command_publisher: Arc<dyn CommandPublisher>,
     coalescer: SeatTentativeCoalescerHandle,
     revert_dedup: Arc<dyn RevertDedupStore>,
+    event_status_cache: Option<Arc<dyn EventStatusCacheReader>>,
+    event_status_pg: Option<Arc<dyn EventStatusFallbackStore>>,
 }
 
 impl EnrollmentEngine {
@@ -123,21 +282,98 @@ impl EnrollmentEngine {
         coalescer: SeatTentativeCoalescerHandle,
         revert_dedup: Arc<dyn RevertDedupStore>,
     ) -> Self {
+        Self::with_options(
+            configured_role,
+            command_publisher,
+            coalescer,
+            revert_dedup,
+            EngineRuntimeOptions::default(),
+        )
+    }
+
+    #[must_use]
+    pub fn with_options(
+        configured_role: NodeRole,
+        command_publisher: Arc<dyn CommandPublisher>,
+        coalescer: SeatTentativeCoalescerHandle,
+        revert_dedup: Arc<dyn RevertDedupStore>,
+        runtime_opts: EngineRuntimeOptions,
+    ) -> Self {
+        let publish_permits = runtime_opts.max_in_flight_kafka_publishes.max(1);
+        let pg_lookup_permits = runtime_opts.status_pg_lookup_concurrency.max(1);
+        let idempotency_cache = IdempotencyCache::new(
+            runtime_opts.idempotency_ttl,
+            runtime_opts.idempotency_max_entries,
+            runtime_opts.idempotency_max_per_student,
+        );
         Self {
             catalog: ArcSwap::from_pointee(TermCatalog::empty()),
             students: ShardedMap::new(),
             event_index: ShardedMap::new(),
-            policy: RwLock::new(empty_policy()),
-            active_window_id: RwLock::new(None),
+            policy_state: ArcSwap::from_pointee(PolicyState {
+                policy: empty_policy(),
+                active_window_id: None,
+            }),
             applied_section_deltas: RwLock::new(HashSet::new()),
             gate_state: AtomicU8::new(encode_gate_state(GateState::Preloading)),
             role: AtomicU8::new(configured_role as u8),
             readiness: AtomicU8::new(EngineReadiness::AwaitingPreload as u8),
             epoch: AtomicU64::new(1),
             checkpoint_seq: AtomicI64::new(0),
+            in_flight: AtomicUsize::new(0),
+            in_flight_zero: Notify::new(),
+            publish_semaphore: Arc::new(Semaphore::new(publish_permits)),
+            status_pg_semaphore: Arc::new(Semaphore::new(pg_lookup_permits)),
+            idempotency_cache,
+            status_negative_cache: ShardedMap::new(),
+            status_negative_count: AtomicUsize::new(0),
+            runtime_opts,
             command_publisher,
             coalescer,
             revert_dedup,
+            event_status_cache: None,
+            event_status_pg: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_status_fallbacks(
+        mut self,
+        event_status_cache: Option<Arc<dyn EventStatusCacheReader>>,
+        event_status_pg: Option<Arc<dyn EventStatusFallbackStore>>,
+    ) -> Self {
+        self.event_status_cache = event_status_cache;
+        self.event_status_pg = event_status_pg;
+        self
+    }
+
+    #[must_use]
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
+    #[must_use]
+    pub const fn drain_timeout(&self) -> Duration {
+        self.runtime_opts.drain_timeout
+    }
+
+    pub async fn drain_in_flight(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.in_flight_zero.notified();
+            if self.in_flight.load(Ordering::SeqCst) == 0 {
+                return true;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return self.in_flight.load(Ordering::SeqCst) == 0;
+            }
+            if tokio::time::timeout(deadline - now, notified)
+                .await
+                .is_err()
+            {
+                return self.in_flight.load(Ordering::SeqCst) == 0;
+            }
         }
     }
 
@@ -226,6 +462,9 @@ impl EnrollmentEngine {
         let mut sub_to_student = HashMap::with_capacity(dataset.students.len());
         self.students.clear();
         self.event_index.clear();
+        self.idempotency_cache.clear();
+        self.status_negative_cache.clear();
+        self.status_negative_count.store(0, Ordering::Release);
         for mut student in dataset.students {
             student.recompute_schedule_and_credits(&sections_meta);
             if let Some(sub) = student
@@ -249,8 +488,10 @@ impl EnrollmentEngine {
         });
 
         self.catalog.store(catalog);
-        *self.policy.write() = dataset.policy;
-        *self.active_window_id.write() = dataset.active_window_id;
+        self.policy_state.store(Arc::new(PolicyState {
+            policy: dataset.policy,
+            active_window_id: dataset.active_window_id,
+        }));
         self.applied_section_deltas.write().clear();
         self.gate_state
             .store(encode_gate_state(dataset.gate_state), Ordering::Release);
@@ -303,6 +544,7 @@ impl EnrollmentEngine {
 
             match kafka_replay.replay_since(term_id, kafka_from_ms).await {
                 Ok(batch) => {
+                    let resume_offsets = batch.high_watermarks.clone();
                     let count = self.apply_kafka_replay_batch(batch);
                     self.set_readiness(EngineReadiness::Ready);
                     return Ok(BootstrapReport {
@@ -312,6 +554,7 @@ impl EnrollmentEngine {
                         replayed_events: count,
                         checkpoint_seq: self.checkpoint_seq(),
                         snapshot_sha256: checksum,
+                        kafka_resume_offsets: resume_offsets,
                     });
                 }
                 Err(kafka_err) => {
@@ -338,6 +581,7 @@ impl EnrollmentEngine {
                         replayed_events: count,
                         checkpoint_seq: self.checkpoint_seq(),
                         snapshot_sha256: checksum,
+                        kafka_resume_offsets: Vec::new(),
                     });
                 }
             }
@@ -356,7 +600,9 @@ impl EnrollmentEngine {
         self.hydrate_from_dataset(dataset, opts.configured_role)?;
 
         let mut replayed = 0usize;
+        let mut resume_offsets = Vec::new();
         if let Ok(tail) = kafka_replay.replay_since(term_id, kafka_from_ms).await {
+            resume_offsets = tail.high_watermarks.clone();
             replayed = self.apply_kafka_replay_batch(tail);
         }
         self.set_readiness(EngineReadiness::Ready);
@@ -368,6 +614,7 @@ impl EnrollmentEngine {
             replayed_events: replayed,
             checkpoint_seq: self.checkpoint_seq(),
             snapshot_sha256: meta.checksum_sha256,
+            kafka_resume_offsets: resume_offsets,
         })
     }
 
@@ -453,13 +700,42 @@ impl EnrollmentEngine {
         action: EnrollmentAction,
         now: DateTime<Utc>,
     ) -> Result<EnrollmentAccepted, EngineError> {
+        self.register_with_idempotency(student_id, section_id, action, None, now)
+            .await
+    }
+
+    pub async fn register_with_idempotency(
+        &self,
+        student_id: StudentId,
+        section_id: SectionId,
+        action: EnrollmentAction,
+        idempotency_key: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<EnrollmentAccepted, EngineError> {
         if action == EnrollmentAction::Drop {
             return Err(EngineError::RuleViolation {
                 code: RuleErrorCode::WindowActionNotAllowed,
                 detail: "Use /api/v1/enrollments/drop for DROP action".to_owned(),
             });
         }
+        // Track active mutating handler before checking readiness/role/gate to close demote TOCTOU window.
+        let _in_flight = InFlightGuard::enter(&self.in_flight, &self.in_flight_zero);
         self.ensure_ready_active_gate_open()?;
+
+        if let Some(key) = idempotency_key {
+            if let Some(cached) = self.idempotency_cache.get(student_id, key, now) {
+                return Ok(cached);
+            }
+        }
+
+        let _publish_permit = self
+            .publish_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| EngineError::RuleViolation {
+                code: RuleErrorCode::KafkaBackpressure,
+                detail: "Kafka publish pipeline saturated; retry shortly".to_owned(),
+            })?;
 
         let catalog = self.catalog.load_full();
         let Some(section_meta) = catalog.sections_meta.get(&section_id) else {
@@ -495,8 +771,6 @@ impl EnrollmentEngine {
             });
         }
 
-        let policy_snapshot = self.policy.read().clone();
-        let active_window_id = *self.active_window_id.read();
         let prereqs = catalog
             .prerequisites
             .get(&section_meta.course_id)
@@ -506,54 +780,66 @@ impl EnrollmentEngine {
         let event_id = EventId::new_v7();
         let mut engine_epoch = self.epoch();
 
-        let reservation_res = self.students.with_write(&student_id, |opt_student| {
-            let Some(student) = opt_student else {
-                return Err(RuleViolation::new(
-                    RuleErrorCode::StudentNotFound,
-                    format!("Student {student_id} not preloaded"),
-                ));
-            };
+        let reservation_res = {
+            // Scope ArcSwap Guard strictly before `.await` so future remains `Send` with zero heap clone.
+            let policy_state = self.policy_state.load();
+            self.students.with_write(&student_id, |opt_student| {
+                let Some(student) = opt_student else {
+                    return Err(RuleViolation::new(
+                        RuleErrorCode::StudentNotFound,
+                        format!("Student {student_id} not preloaded"),
+                    ));
+                };
 
-            evaluate_wave_eligibility(&policy_snapshot, active_window_id, student, action, now)?;
-            evaluate_tuition_and_standing(&policy_snapshot, student, action)?;
-            evaluate_retake_improve(
-                &policy_snapshot,
-                student,
-                section_meta.course_id,
-                &section_meta.course_code,
-                action,
-            )?;
-            evaluate_prerequisites(&policy_snapshot, student, prereqs, action)?;
-            evaluate_credit_limit(&policy_snapshot, student, section_meta.credits, action)?;
-            evaluate_schedule_conflict(
-                &policy_snapshot,
-                &student.schedule_bitmask,
-                &section_meta.bitmask,
-                &section_meta.section_code,
-                action,
-            )?;
+                evaluate_wave_eligibility(
+                    &policy_state.policy,
+                    policy_state.active_window_id,
+                    student,
+                    action,
+                    now,
+                )?;
+                evaluate_tuition_and_standing(&policy_state.policy, student, action)?;
+                evaluate_retake_improve(
+                    &policy_state.policy,
+                    student,
+                    section_meta.course_id,
+                    &section_meta.course_code,
+                    action,
+                )?;
+                evaluate_prerequisites(&policy_state.policy, student, prereqs, action)?;
+                evaluate_credit_limit(&policy_state.policy, student, section_meta.credits, action)?;
+                evaluate_schedule_conflict(
+                    &policy_state.policy,
+                    &student.schedule_bitmask,
+                    &section_meta.bitmask,
+                    &section_meta.section_code,
+                    action,
+                )?;
 
-            let reservation = slot
-                .try_reserve()
-                .map_err(|e| RuleViolation::new(e.to_rule_error_code(), e.to_string()))?;
-            engine_epoch = reservation.epoch;
+                let reservation = slot
+                    .try_reserve()
+                    .map_err(|e| RuleViolation::new(e.to_rule_error_code(), e.to_string()))?;
+                engine_epoch = reservation.epoch;
 
-            let credits_counted = policy_snapshot
-                .credit_limit
-                .counted_candidate_credits(action, section_meta.credits);
-            student.active_enrollments.push(ActiveEnrollment {
-                section_id,
-                course_id: section_meta.course_id,
-                credits_counted,
-                action,
-                state: HotPathEnrollmentState::Reserved,
-                last_event_id: event_id,
-            });
-            student.processed_event_ids.insert(event_id);
-            student.recompute_schedule_and_credits(&catalog.sections_meta);
+                let credits_counted = policy_state
+                    .policy
+                    .credit_limit
+                    .counted_candidate_credits(action, section_meta.credits);
+                student.active_enrollments.push(ActiveEnrollment {
+                    section_id,
+                    course_id: section_meta.course_id,
+                    credits_counted,
+                    action,
+                    state: HotPathEnrollmentState::Reserved,
+                    last_event_id: event_id,
+                    seat_released: false,
+                });
+                student.processed_event_ids.insert(event_id);
+                student.recompute_schedule_and_credits(&catalog.sections_meta);
 
-            Ok(reservation)
-        });
+                Ok(reservation)
+            })
+        };
 
         let reservation = match reservation_res {
             Ok(r) => r,
@@ -592,20 +878,37 @@ impl EnrollmentEngine {
             now,
         );
 
-        if let Err(err) = self.command_publisher.publish_command(&cmd).await {
-            warn!(
-                event_id = %event_id,
-                section_id = %section_id,
-                student_id = %student_id,
-                error = %err,
-                "Kafka publish failed after RAM seat reservation; rolling back RAM state"
-            );
-            self.rollback_failed_register(&catalog, slot, student_id, event_id, now);
-            return Err(EngineError::RuleViolation {
-                code: RuleErrorCode::KafkaPublishFailed,
-                detail: "Temporary messaging failure; seat reservation rolled back".to_owned(),
-            });
+        match self.command_publisher.publish_command(&cmd).await {
+            Ok(()) => {}
+            Err(PublishError::Definite(err)) => {
+                warn!(
+                    event_id = %event_id,
+                    section_id = %section_id,
+                    student_id = %student_id,
+                    error = %err,
+                    "definite Kafka publish failure after RAM seat reservation; rolling back RAM state"
+                );
+                self.rollback_failed_register(&catalog, slot, student_id, event_id, now);
+                return Err(EngineError::RuleViolation {
+                    code: RuleErrorCode::KafkaPublishFailed,
+                    detail: "Temporary messaging failure; seat reservation rolled back".to_owned(),
+                });
+            }
+            Err(PublishError::Indeterminate(err)) => {
+                warn!(
+                    event_id = %event_id,
+                    section_id = %section_id,
+                    student_id = %student_id,
+                    error = %err,
+                    "indeterminate Kafka publish outcome after RAM seat reservation; retaining RESERVED pending reconciliation"
+                );
+                return Err(EngineError::RuleViolation {
+                    code: RuleErrorCode::KafkaPublishFailed,
+                    detail: "Messaging delivery outcome indeterminate; seat reservation retained pending reconciliation".to_owned(),
+                });
+            }
         }
+        drop(_publish_permit);
 
         // Non-blocking enqueue into 50ms coalescer (0 Redis blocking round-trips on critical path)
         let _ = self.coalescer.enqueue_nonblocking(SeatTentativeEvent::new(
@@ -617,7 +920,7 @@ impl EnrollmentEngine {
             now,
         ));
 
-        Ok(EnrollmentAccepted {
+        let accepted = EnrollmentAccepted {
             event_id,
             term_id: catalog.term_id,
             student_id,
@@ -629,7 +932,12 @@ impl EnrollmentEngine {
             max_capacity: reservation.max_capacity,
             engine_epoch,
             accepted_at: now,
-        })
+        };
+        if let Some(key) = idempotency_key {
+            self.idempotency_cache
+                .insert(student_id, key.to_owned(), accepted.clone(), now);
+        }
+        Ok(accepted)
     }
 
     pub async fn drop_section(
@@ -638,7 +946,34 @@ impl EnrollmentEngine {
         section_id: SectionId,
         now: DateTime<Utc>,
     ) -> Result<EnrollmentAccepted, EngineError> {
+        self.drop_section_with_idempotency(student_id, section_id, None, now)
+            .await
+    }
+
+    pub async fn drop_section_with_idempotency(
+        &self,
+        student_id: StudentId,
+        section_id: SectionId,
+        idempotency_key: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<EnrollmentAccepted, EngineError> {
+        let _in_flight = InFlightGuard::enter(&self.in_flight, &self.in_flight_zero);
         self.ensure_ready_active_gate_open()?;
+
+        if let Some(key) = idempotency_key {
+            if let Some(cached) = self.idempotency_cache.get(student_id, key, now) {
+                return Ok(cached);
+            }
+        }
+
+        let _publish_permit = self
+            .publish_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| EngineError::RuleViolation {
+                code: RuleErrorCode::KafkaBackpressure,
+                detail: "Kafka publish pipeline saturated; retry shortly".to_owned(),
+            })?;
 
         let catalog = self.catalog.load_full();
         let Some(section_meta) = catalog.sections_meta.get(&section_id) else {
@@ -654,65 +989,66 @@ impl EnrollmentEngine {
             });
         };
 
-        let policy_snapshot = self.policy.read().clone();
-        let active_window_id = *self.active_window_id.read();
         let event_id = EventId::new_v7();
 
-        let drop_res = self.students.with_write(&student_id, |opt_student| {
-            let Some(student) = opt_student else {
-                return Err(RuleViolation::new(
-                    RuleErrorCode::StudentNotFound,
-                    format!("Student {student_id} not preloaded"),
-                ));
-            };
+        let drop_res = {
+            // Scope ArcSwap Guard strictly before `.await` so future remains `Send` with zero heap clone.
+            let policy_state = self.policy_state.load();
+            self.students.with_write(&student_id, |opt_student| {
+                let Some(student) = opt_student else {
+                    return Err(RuleViolation::new(
+                        RuleErrorCode::StudentNotFound,
+                        format!("Student {student_id} not preloaded"),
+                    ));
+                };
 
-            evaluate_wave_eligibility(
-                &policy_snapshot,
-                active_window_id,
-                student,
-                EnrollmentAction::Drop,
-                now,
-            )?;
+                evaluate_wave_eligibility(
+                    &policy_state.policy,
+                    policy_state.active_window_id,
+                    student,
+                    EnrollmentAction::Drop,
+                    now,
+                )?;
 
-            let Some(pos) = student.active_enrollments.iter().position(|e| {
-                e.section_id == section_id
-                    && matches!(
-                        e.state,
-                        HotPathEnrollmentState::Reserved | HotPathEnrollmentState::Confirmed
-                    )
-            }) else {
-                return Err(RuleViolation::new(
-                    RuleErrorCode::NotEnrolledInSection,
-                    format!(
-                        "Student does not hold an active enrollment for section {}",
-                        section_meta.section_code
-                    ),
-                ));
-            };
+                let Some(pos) = student.active_enrollments.iter().position(|e| {
+                    e.section_id == section_id
+                        && matches!(
+                            e.state,
+                            HotPathEnrollmentState::Reserved | HotPathEnrollmentState::Confirmed
+                        )
+                }) else {
+                    return Err(RuleViolation::new(
+                        RuleErrorCode::NotEnrolledInSection,
+                        format!(
+                            "Student does not hold an active enrollment for section {}",
+                            section_meta.section_code
+                        ),
+                    ));
+                };
 
-            let credits_to_deduct = student.active_enrollments[pos].credits_counted;
-            evaluate_credit_limit(
-                &policy_snapshot,
-                student,
-                credits_to_deduct,
-                EnrollmentAction::Drop,
-            )?;
+                let credits_to_deduct = student.active_enrollments[pos].credits_counted;
+                evaluate_credit_limit(
+                    &policy_state.policy,
+                    student,
+                    credits_to_deduct,
+                    EnrollmentAction::Drop,
+                )?;
 
-            let prev_state = student.active_enrollments[pos].state;
-            let prev_event_id = student.active_enrollments[pos].last_event_id;
-            let release = slot
-                .try_release()
-                .map_err(|e| RuleViolation::new(e.to_rule_error_code(), e.to_string()))?;
+                let prev_state = student.active_enrollments[pos].state;
+                let prev_event_id = student.active_enrollments[pos].last_event_id;
+                let entry_epoch = slot.epoch();
 
-            student.active_enrollments[pos].state = HotPathEnrollmentState::DropPending;
-            student.active_enrollments[pos].last_event_id = event_id;
-            student.processed_event_ids.insert(event_id);
-            student.recompute_schedule_and_credits(&catalog.sections_meta);
+                // Defer releasing RAM seat, schedule bitmask, and credits until Kafka ACKs the drop command.
+                student.active_enrollments[pos].state = HotPathEnrollmentState::DropPending;
+                student.active_enrollments[pos].last_event_id = event_id;
+                student.active_enrollments[pos].seat_released = false;
+                student.processed_event_ids.insert(event_id);
 
-            Ok((release, prev_state, prev_event_id))
-        });
+                Ok((entry_epoch, prev_state, prev_event_id))
+            })
+        };
 
-        let (release, prev_state, prev_event_id) = match drop_res {
+        let (entry_epoch, prev_state, prev_event_id) = match drop_res {
             Ok(v) => v,
             Err(violation) => {
                 return Err(EngineError::RuleViolation {
@@ -733,7 +1069,7 @@ impl EnrollmentEngine {
                 action: EnrollmentAction::Drop,
                 state: HotPathEnrollmentState::DropPending,
                 reason_code: None,
-                engine_epoch: release.epoch,
+                engine_epoch: entry_epoch,
                 updated_at: now,
             },
         );
@@ -745,44 +1081,95 @@ impl EnrollmentEngine {
             section_id,
             section_meta.course_id,
             EnrollmentAction::Drop,
-            release.epoch,
+            entry_epoch,
             now,
         );
 
-        if let Err(err) = self.command_publisher.publish_command(&cmd).await {
-            warn!(
-                event_id = %event_id,
-                section_id = %section_id,
-                student_id = %student_id,
-                error = %err,
-                "Kafka publish failed after RAM drop; rolling back to previous state"
-            );
-            self.rollback_failed_drop(
-                &catalog,
-                slot,
-                student_id,
-                section_id,
-                event_id,
-                prev_state,
-                prev_event_id,
-                now,
-            );
-            return Err(EngineError::RuleViolation {
-                code: RuleErrorCode::KafkaPublishFailed,
-                detail: "Temporary messaging failure; drop action rolled back".to_owned(),
-            });
+        match self.command_publisher.publish_command(&cmd).await {
+            Ok(()) => {}
+            Err(PublishError::Definite(err)) => {
+                warn!(
+                    event_id = %event_id,
+                    section_id = %section_id,
+                    student_id = %student_id,
+                    error = %err,
+                    "definite Kafka publish failure after marking DropPending; rolling back without touching seat slot"
+                );
+                self.rollback_failed_drop(
+                    &catalog,
+                    student_id,
+                    section_id,
+                    event_id,
+                    prev_state,
+                    prev_event_id,
+                    now,
+                );
+                return Err(EngineError::RuleViolation {
+                    code: RuleErrorCode::KafkaPublishFailed,
+                    detail: "Temporary messaging failure; drop action rolled back".to_owned(),
+                });
+            }
+            Err(PublishError::Indeterminate(err)) => {
+                warn!(
+                    event_id = %event_id,
+                    section_id = %section_id,
+                    student_id = %student_id,
+                    error = %err,
+                    "indeterminate Kafka publish outcome for DropPending; retaining seat_released=false pending reconciliation"
+                );
+                return Err(EngineError::RuleViolation {
+                    code: RuleErrorCode::KafkaPublishFailed,
+                    detail: "Messaging delivery outcome indeterminate; drop pending reconciliation"
+                        .to_owned(),
+                });
+            }
         }
+        drop(_publish_permit);
 
-        let _ = self.coalescer.enqueue_nonblocking(SeatTentativeEvent::new(
-            catalog.term_id,
-            section_id,
-            release.available_seats,
-            release.max_capacity,
-            release.epoch,
-            now,
-        ));
+        let mut tentative_release: Option<unieee_cacheline::SeatRelease> = None;
+        self.students.with_write(&student_id, |opt_student| {
+            let Some(student) = opt_student else {
+                return;
+            };
+            if let Some(entry) = student.active_enrollments.iter_mut().find(|e| {
+                e.section_id == section_id
+                    && e.last_event_id == event_id
+                    && e.state == HotPathEnrollmentState::DropPending
+                    && !e.seat_released
+            }) {
+                match slot.try_release() {
+                    Ok(rel) => {
+                        tentative_release = Some(rel);
+                    }
+                    Err(err) => {
+                        warn!(
+                            section_id = %section_id,
+                            error = %err,
+                            "seat slot release hit capacity ceiling after Kafka drop ACK"
+                        );
+                    }
+                }
+                entry.seat_released = true;
+                student.recompute_schedule_and_credits(&catalog.sections_meta);
+            }
+        });
 
-        Ok(EnrollmentAccepted {
+        let (available_seats, max_capacity, response_epoch) = if let Some(rel) = tentative_release {
+            let _ = self.coalescer.enqueue_nonblocking(SeatTentativeEvent::new(
+                catalog.term_id,
+                section_id,
+                rel.available_seats,
+                rel.max_capacity,
+                rel.epoch,
+                now,
+            ));
+            (rel.available_seats, rel.max_capacity, rel.epoch)
+        } else {
+            let snap = slot.snapshot();
+            (snap.available_seats, snap.max_capacity, snap.epoch)
+        };
+
+        let accepted = EnrollmentAccepted {
             event_id,
             term_id: catalog.term_id,
             student_id,
@@ -790,11 +1177,16 @@ impl EnrollmentEngine {
             course_id: section_meta.course_id,
             action: EnrollmentAction::Drop,
             status: HotPathEnrollmentState::DropPending,
-            available_seats: release.available_seats,
-            max_capacity: release.max_capacity,
-            engine_epoch: release.epoch,
+            available_seats,
+            max_capacity,
+            engine_epoch: response_epoch,
             accepted_at: now,
-        })
+        };
+        if let Some(key) = idempotency_key {
+            self.idempotency_cache
+                .insert(student_id, key.to_owned(), accepted.clone(), now);
+        }
+        Ok(accepted)
     }
 
     #[must_use]
@@ -802,11 +1194,203 @@ impl EnrollmentEngine {
         self.event_index.get_cloned(&event_id)
     }
 
+    pub async fn get_event_status_with_fallback(
+        &self,
+        event_id: EventId,
+        now: DateTime<Utc>,
+    ) -> Result<Option<EventStatusRecord>, EngineError> {
+        // Tier 1: Hot in-memory RAM index
+        if let Some(rec) = self.event_index.get_cloned(&event_id) {
+            return Ok(Some(rec));
+        }
+
+        // Tier 2: Short-lived negative cache protecting Redis/PG against random-UUID floods
+        let neg_hit = self
+            .status_negative_cache
+            .with_read(&event_id, |opt| opt.is_some_and(|exp| *exp > now));
+        if neg_hit {
+            return Ok(None);
+        }
+
+        // Tier 3: Redis `unieee:event:status:{eventId}` written by enrollment-writer
+        if let Some(redis_reader) = &self.event_status_cache {
+            match redis_reader.get_event_status(event_id).await {
+                Ok(Some(rec)) => return Ok(Some(rec)),
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(event_id = %event_id, error = %err, "Redis event status fallback failed; falling back to PostgreSQL");
+                }
+            }
+        }
+
+        // Tier 4: Concurrency-bounded PostgreSQL point lookup on `registration.enrollment_events`
+        let Some(pg_store) = &self.event_status_pg else {
+            return Ok(None);
+        };
+        let _pg_permit = self
+            .status_pg_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| EngineError::ServiceUnavailable {
+                code: "STATUS_LOOKUP_SATURATED",
+                detail: "Event status database lookup concurrency limit reached; retry shortly"
+                    .to_owned(),
+            })?;
+
+        match pg_store.find_event_by_id(event_id).await {
+            Ok(Some(rec)) => {
+                let course_id = self
+                    .catalog
+                    .load()
+                    .sections_meta
+                    .get(&rec.section_id)
+                    .map(|meta| meta.course_id)
+                    .unwrap_or_else(|| CourseId::from_uuid(uuid::Uuid::nil()));
+                let action = map_event_type_to_action(rec.event_type);
+                let state = match rec.status {
+                    EnrollmentEventStatus::Confirmed => {
+                        if matches!(
+                            rec.event_type,
+                            EnrollmentEventType::Drop | EnrollmentEventType::AdminDrop
+                        ) {
+                            HotPathEnrollmentState::Dropped
+                        } else {
+                            HotPathEnrollmentState::Confirmed
+                        }
+                    }
+                    EnrollmentEventStatus::Rejected | EnrollmentEventStatus::Reverted => {
+                        HotPathEnrollmentState::Reverted
+                    }
+                };
+                let reason_code = rec
+                    .reason_code
+                    .as_deref()
+                    .and_then(RuleErrorCode::from_code);
+                Ok(Some(EventStatusRecord {
+                    event_id: rec.event_id,
+                    term_id: rec.term_id,
+                    student_id: rec.student_id,
+                    section_id: rec.section_id,
+                    course_id,
+                    action,
+                    state,
+                    reason_code,
+                    engine_epoch: rec.engine_epoch,
+                    updated_at: rec.created_at,
+                }))
+            }
+            Ok(None) => {
+                let ttl = ChronoDuration::from_std(self.runtime_opts.status_negative_cache_ttl)
+                    .unwrap_or_else(|_| ChronoDuration::seconds(10));
+                let cur_count = self.status_negative_count.load(Ordering::Acquire);
+                if cur_count < self.runtime_opts.status_negative_cache_max_entries.max(1)
+                    && self
+                        .status_negative_cache
+                        .insert(event_id, now + ttl)
+                        .is_none()
+                {
+                    self.status_negative_count.fetch_add(1, Ordering::AcqRel);
+                }
+                Ok(None)
+            }
+            Err(err) => {
+                warn!(event_id = %event_id, error = %err, "PostgreSQL event status point-lookup failed");
+                Err(EngineError::Internal(err))
+            }
+        }
+    }
+
+    /// Periodically evicts settled `event_index` entries past TTL (`event_index_ttl`), expired
+    /// idempotency / negative-status entries, and UUIDv7 dedup IDs strictly older than >=24h.
+    pub fn sweep_expired_state(&self, now: DateTime<Utc>) -> SweepReport {
+        let event_ttl = ChronoDuration::from_std(self.runtime_opts.event_index_ttl)
+            .unwrap_or_else(|_| ChronoDuration::seconds(1800));
+        let evicted_event_index = self.event_index.retain(|_, rec| {
+            let is_settled = matches!(
+                rec.state,
+                HotPathEnrollmentState::Confirmed
+                    | HotPathEnrollmentState::Dropped
+                    | HotPathEnrollmentState::Reverted
+            );
+            if !is_settled {
+                return true;
+            }
+            now.signed_duration_since(rec.updated_at) < event_ttl
+        });
+
+        let evicted_idempotency = self.idempotency_cache.sweep(now);
+
+        let mut remaining_neg = 0usize;
+        let evicted_negative_status = self.status_negative_cache.retain(|_, expires_at| {
+            let keep = *expires_at > now;
+            if keep {
+                remaining_neg = remaining_neg.saturating_add(1);
+            }
+            keep
+        });
+        self.status_negative_count
+            .store(remaining_neg, Ordering::Release);
+
+        // Enforce strict >=24h floor so dedup sets are never pruned prematurely.
+        let min_dedup = Duration::from_secs(86_400);
+        let dedup_retention = self.runtime_opts.dedup_retention.max(min_dedup);
+        let dedup_chrono = ChronoDuration::from_std(dedup_retention)
+            .unwrap_or_else(|_| ChronoDuration::seconds(86_400));
+
+        let mut pruned_dedup_ids = 0usize;
+        self.students.for_each_write(|_, student| {
+            let pinned: HashSet<EventId> = student
+                .active_enrollments
+                .iter()
+                .map(|e| e.last_event_id)
+                .collect();
+
+            let before_proc = student.processed_event_ids.len();
+            student.processed_event_ids.retain(|id| {
+                pinned.contains(id)
+                    || id
+                        .v7_timestamp_utc()
+                        .is_none_or(|ts| now.signed_duration_since(ts) <= dedup_chrono)
+            });
+            pruned_dedup_ids = pruned_dedup_ids
+                .saturating_add(before_proc.saturating_sub(student.processed_event_ids.len()));
+
+            let before_rev = student.reverted_event_ids.len();
+            student.reverted_event_ids.retain(|id| {
+                pinned.contains(id)
+                    || id
+                        .v7_timestamp_utc()
+                        .is_none_or(|ts| now.signed_duration_since(ts) <= dedup_chrono)
+            });
+            pruned_dedup_ids = pruned_dedup_ids
+                .saturating_add(before_rev.saturating_sub(student.reverted_event_ids.len()));
+        });
+
+        {
+            let mut deltas = self.applied_section_deltas.write();
+            let before_deltas = deltas.len();
+            deltas.retain(|id| {
+                id.v7_timestamp_utc()
+                    .is_none_or(|ts| now.signed_duration_since(ts) <= dedup_chrono)
+            });
+            pruned_dedup_ids =
+                pruned_dedup_ids.saturating_add(before_deltas.saturating_sub(deltas.len()));
+        }
+
+        SweepReport {
+            evicted_event_index,
+            evicted_idempotency,
+            evicted_negative_status,
+            pruned_dedup_ids,
+        }
+    }
+
     pub fn apply_seat_confirmed(&self, ev: &SeatConfirmedEvent) {
         if ev.term_id != self.term_id() {
             return;
         }
         let catalog = self.catalog.load();
+        let mut tentative_to_emit: Option<SeatTentativeEvent> = None;
         self.students.with_write(&ev.student_id, |opt_student| {
             let Some(student) = opt_student else {
                 return;
@@ -821,13 +1405,31 @@ impl EnrollmentEngine {
                         student.active_enrollments[pos].state = HotPathEnrollmentState::Confirmed;
                     }
                     HotPathEnrollmentState::DropPending => {
+                        let already_released = student.active_enrollments[pos].seat_released;
                         student.active_enrollments.remove(pos);
+                        if !already_released {
+                            if let Some(slot) = catalog.seat_table.get(ev.section_id) {
+                                if let Ok(rel) = slot.try_release() {
+                                    tentative_to_emit = Some(SeatTentativeEvent::new(
+                                        ev.term_id,
+                                        ev.section_id,
+                                        rel.available_seats,
+                                        rel.max_capacity,
+                                        rel.epoch,
+                                        ev.confirmed_at,
+                                    ));
+                                }
+                            }
+                        }
                         student.recompute_schedule_and_credits(&catalog.sections_meta);
                     }
                     _ => {}
                 }
             }
         });
+        if let Some(ev_tentative) = tentative_to_emit {
+            let _ = self.coalescer.enqueue_nonblocking(ev_tentative);
+        }
         self.event_index.with_write(&ev.event_id, |opt_rec| {
             if let Some(rec) = opt_rec {
                 if rec.state == HotPathEnrollmentState::DropPending {
@@ -840,8 +1442,7 @@ impl EnrollmentEngine {
         });
     }
 
-    /// Apply RevertEvent with RAM-first idempotency in student shard BEFORE best-effort Redis dedup write.
-    pub async fn apply_revert_event(&self, revert: &RevertEvent) -> RevertOutcome {
+    pub(crate) fn apply_revert_in_ram(&self, revert: &RevertEvent) -> RevertOutcome {
         let catalog = self.catalog.load();
         if revert.term_id != catalog.term_id {
             return RevertOutcome::UnknownSectionOrStudent;
@@ -864,18 +1465,22 @@ impl EnrollmentEngine {
                 let mut reverted_drop = false;
                 if let Some(entry) = student.active_enrollments.iter_mut().find(|e| {
                     e.section_id == revert.section_id
+                        && e.last_event_id == revert.event_id
                         && e.state == HotPathEnrollmentState::DropPending
                 }) {
-                    if let Ok(res) = slot.try_reserve() {
-                        tentative_to_emit = Some(SeatTentativeEvent::new(
-                            revert.term_id,
-                            revert.section_id,
-                            res.remaining_seats,
-                            res.max_capacity,
-                            res.epoch,
-                            revert.reverted_at,
-                        ));
+                    if entry.seat_released {
+                        if let Ok(res) = slot.try_reserve() {
+                            tentative_to_emit = Some(SeatTentativeEvent::new(
+                                revert.term_id,
+                                revert.section_id,
+                                res.remaining_seats,
+                                res.max_capacity,
+                                res.epoch,
+                                revert.reverted_at,
+                            ));
+                        }
                     }
+                    entry.seat_released = false;
                     entry.state = HotPathEnrollmentState::Confirmed;
                     reverted_drop = true;
                 }
@@ -886,12 +1491,12 @@ impl EnrollmentEngine {
                 return RevertOutcome::Applied;
             }
 
-            // Register / Retake / Improve revert
-            if let Some(pos) = student
-                .active_enrollments
-                .iter()
-                .position(|e| e.section_id == revert.section_id)
-            {
+            // Register / Retake / Improve revert: match section_id, last_event_id, and Reserved state strictly.
+            if let Some(pos) = student.active_enrollments.iter().position(|e| {
+                e.section_id == revert.section_id
+                    && e.last_event_id == revert.event_id
+                    && e.state == HotPathEnrollmentState::Reserved
+            }) {
                 student.active_enrollments.remove(pos);
                 if let Ok(rel) = slot.try_release() {
                     tentative_to_emit = Some(SeatTentativeEvent::new(
@@ -910,11 +1515,6 @@ impl EnrollmentEngine {
         });
 
         if outcome == RevertOutcome::Applied {
-            let final_state = if revert.action == EnrollmentAction::Drop {
-                HotPathEnrollmentState::Confirmed
-            } else {
-                HotPathEnrollmentState::Reverted
-            };
             self.event_index.insert(
                 revert.event_id,
                 EventStatusRecord {
@@ -924,7 +1524,7 @@ impl EnrollmentEngine {
                     section_id: revert.section_id,
                     course_id: revert.course_id,
                     action: revert.action,
-                    state: final_state,
+                    state: HotPathEnrollmentState::Reverted,
                     reason_code: Some(revert.reason_code),
                     engine_epoch: revert.engine_epoch,
                     updated_at: revert.reverted_at,
@@ -934,7 +1534,15 @@ impl EnrollmentEngine {
             if let Some(ev) = tentative_to_emit {
                 let _ = self.coalescer.enqueue_nonblocking(ev);
             }
+        }
 
+        outcome
+    }
+
+    /// Apply RevertEvent with RAM-first idempotency in student shard BEFORE best-effort Redis dedup write.
+    pub async fn apply_revert_event(&self, revert: &RevertEvent) -> RevertOutcome {
+        let outcome = self.apply_revert_in_ram(revert);
+        if outcome == RevertOutcome::Applied {
             // Best-effort Redis dedup fallback key written strictly AFTER RAM-first idempotency update
             if let Err(err) = self
                 .revert_dedup
@@ -948,7 +1556,6 @@ impl EnrollmentEngine {
                 );
             }
         }
-
         outcome
     }
 
@@ -960,39 +1567,77 @@ impl EnrollmentEngine {
             EnrollmentDeltaEvent::SectionCapacityUpdated(ev) => {
                 self.apply_section_capacity_delta(ev)
             }
+            EnrollmentDeltaEvent::Revert(ev) => match self.apply_revert_in_ram(ev) {
+                RevertOutcome::Applied => DeltaOutcome::Applied,
+                RevertOutcome::DuplicateInRam => DeltaOutcome::DuplicateOrStale,
+                RevertOutcome::UnknownSectionOrStudent => {
+                    if ev.term_id != self.term_id() {
+                        DeltaOutcome::WrongTerm
+                    } else {
+                        DeltaOutcome::TargetNotFound
+                    }
+                }
+            },
+            EnrollmentDeltaEvent::GateControl(ev) => match self.apply_gate_control(ev) {
+                Ok(()) => DeltaOutcome::Applied,
+                Err(RuleErrorCode::StaleEpoch) => DeltaOutcome::DuplicateOrStale,
+                Err(_) => DeltaOutcome::WrongTerm,
+            },
+        }
+    }
+
+    fn advance_epoch_if_higher(&self, catalog: &TermCatalog, target_epoch: u64) {
+        let prev = self.epoch.fetch_max(target_epoch, Ordering::AcqRel);
+        if target_epoch > prev {
+            for slot in catalog.seat_table.as_slice() {
+                let _ = slot.advance_epoch(target_epoch);
+            }
         }
     }
 
     pub fn apply_gate_control(&self, gate: &GateControlEvent) -> Result<(), RuleErrorCode> {
-        if gate.term_id != self.term_id() {
+        let catalog = self.catalog.load();
+        if gate.term_id != catalog.term_id {
             return Err(RuleErrorCode::NoActiveWindow);
         }
         let current_epoch = self.epoch();
         if gate.epoch < current_epoch {
             return Err(RuleErrorCode::StaleEpoch);
         }
-        if gate.epoch > current_epoch {
-            self.epoch.store(gate.epoch, Ordering::Release);
-            let catalog = self.catalog.load();
-            for slot in catalog.seat_table.as_slice() {
-                let _ = slot.advance_epoch(gate.epoch);
-            }
-        }
+        self.advance_epoch_if_higher(&catalog, gate.epoch);
         self.gate_state
-            .store(encode_gate_state(gate.gate_state), Ordering::Release);
+            .store(encode_gate_state(gate.gate_state), Ordering::SeqCst);
 
-        *self.active_window_id.write() = gate.active_window_id;
-        if let Some(target_window_id) = gate.active_window_id {
-            let mut policy = self.policy.write();
-            for window in &mut policy.windows {
-                if window.id == Some(target_window_id) {
-                    window.status = WindowStatus::Active;
-                } else if window.status == WindowStatus::Active {
-                    window.status = WindowStatus::Closed;
+        self.policy_state.rcu(|current| {
+            let mut next_policy = current.policy.clone();
+            if let Some(target_window_id) = gate.active_window_id {
+                for window in &mut next_policy.windows {
+                    if window.id == Some(target_window_id) {
+                        window.status = WindowStatus::Active;
+                    } else if window.status == WindowStatus::Active {
+                        window.status = WindowStatus::Closed;
+                    }
                 }
             }
-        }
+            Arc::new(PolicyState {
+                policy: next_policy,
+                active_window_id: gate.active_window_id,
+            })
+        });
         Ok(())
+    }
+
+    pub async fn apply_gate_control_and_drain(
+        &self,
+        gate: &GateControlEvent,
+        timeout: Duration,
+    ) -> Result<bool, RuleErrorCode> {
+        self.apply_gate_control(gate)?;
+        if gate.gate_state == GateState::Draining {
+            Ok(self.drain_in_flight(timeout).await)
+        } else {
+            Ok(true)
+        }
     }
 
     pub fn promote_to_active(&self) -> u64 {
@@ -1001,12 +1646,17 @@ impl EnrollmentEngine {
         for slot in catalog.seat_table.as_slice() {
             let _ = slot.advance_epoch(next_epoch);
         }
-        self.role.store(NodeRole::Active as u8, Ordering::Release);
+        self.role.store(NodeRole::Active as u8, Ordering::SeqCst);
         next_epoch
     }
 
     pub fn demote_to_standby(&self) {
-        self.role.store(NodeRole::Standby as u8, Ordering::Release);
+        self.role.store(NodeRole::Standby as u8, Ordering::SeqCst);
+    }
+
+    pub async fn demote_to_standby_and_drain(&self, timeout: Duration) -> bool {
+        self.demote_to_standby();
+        self.drain_in_flight(timeout).await
     }
 
     pub fn apply_replayed_command(&self, cmd: &EnrollmentCommandEvent) {
@@ -1014,16 +1664,14 @@ impl EnrollmentEngine {
         if cmd.term_id != catalog.term_id {
             return;
         }
-        if cmd.engine_epoch > self.epoch() {
-            self.epoch.store(cmd.engine_epoch, Ordering::Release);
-        }
+        self.advance_epoch_if_higher(&catalog, cmd.engine_epoch);
         let Some(section_meta) = catalog.sections_meta.get(&cmd.section_id) else {
             return;
         };
         let Some(slot) = catalog.seat_table.get(cmd.section_id) else {
             return;
         };
-        let policy_snapshot = self.policy.read().clone();
+        let policy_state = self.policy_state.load();
 
         self.students.with_write(&cmd.student_id, |opt_student| {
             let Some(student) = opt_student else {
@@ -1046,6 +1694,7 @@ impl EnrollmentEngine {
                     student.active_enrollments[pos].state = HotPathEnrollmentState::DropPending;
                     student.active_enrollments[pos].last_event_id = cmd.event_id;
                     let _ = slot.try_release();
+                    student.active_enrollments[pos].seat_released = true;
                 }
                 student.processed_event_ids.insert(cmd.event_id);
                 student.recompute_schedule_and_credits(&catalog.sections_meta);
@@ -1076,7 +1725,8 @@ impl EnrollmentEngine {
             });
             if !already_holds {
                 let _ = slot.try_reserve();
-                let credits_counted = policy_snapshot
+                let credits_counted = policy_state
+                    .policy
                     .credit_limit
                     .counted_candidate_credits(cmd.action, section_meta.credits);
                 student.active_enrollments.push(ActiveEnrollment {
@@ -1086,6 +1736,7 @@ impl EnrollmentEngine {
                     action: cmd.action,
                     state: HotPathEnrollmentState::Reserved,
                     last_event_id: cmd.event_id,
+                    seat_released: false,
                 });
             }
             student.processed_event_ids.insert(cmd.event_id);
@@ -1113,6 +1764,7 @@ impl EnrollmentEngine {
         if rec.term_id != catalog.term_id {
             return;
         }
+        self.advance_epoch_if_higher(&catalog, rec.engine_epoch);
         if rec.seq > self.checkpoint_seq() {
             self.checkpoint_seq.store(rec.seq, Ordering::Release);
         }
@@ -1123,7 +1775,15 @@ impl EnrollmentEngine {
             return;
         };
         let action = map_event_type_to_action(rec.event_type);
-        let policy_snapshot = self.policy.read().clone();
+        let is_drop = matches!(
+            rec.event_type,
+            EnrollmentEventType::Drop | EnrollmentEventType::AdminDrop
+        );
+        let parsed_reason = rec
+            .reason_code
+            .as_deref()
+            .and_then(RuleErrorCode::from_code);
+        let policy_state = self.policy_state.load();
 
         self.students.with_write(&rec.student_id, |opt_student| {
             let Some(student) = opt_student else {
@@ -1136,16 +1796,31 @@ impl EnrollmentEngine {
                 EnrollmentEventStatus::Rejected | EnrollmentEventStatus::Reverted => {
                     if !student.reverted_event_ids.contains(&rec.event_id) {
                         student.reverted_event_ids.insert(rec.event_id);
-                        if action != EnrollmentAction::Drop {
-                            if let Some(pos) = student
-                                .active_enrollments
-                                .iter()
-                                .position(|e| e.last_event_id == rec.event_id)
-                            {
-                                student.active_enrollments.remove(pos);
-                                let _ = slot.try_release();
+                        if action == EnrollmentAction::Drop {
+                            if let Some(entry) = student.active_enrollments.iter_mut().find(|e| {
+                                e.section_id == rec.section_id
+                                    && e.last_event_id == rec.event_id
+                                    && e.state == HotPathEnrollmentState::DropPending
+                            }) {
+                                if entry.seat_released {
+                                    let _ = slot.try_reserve();
+                                }
+                                entry.seat_released = false;
+                                entry.state = HotPathEnrollmentState::Confirmed;
                                 student.recompute_schedule_and_credits(&catalog.sections_meta);
                             }
+                        } else if let Some(pos) = student.active_enrollments.iter().position(|e| {
+                            e.section_id == rec.section_id
+                                && e.last_event_id == rec.event_id
+                                && matches!(
+                                    e.state,
+                                    HotPathEnrollmentState::Reserved
+                                        | HotPathEnrollmentState::Confirmed
+                                )
+                        }) {
+                            student.active_enrollments.remove(pos);
+                            let _ = slot.try_release();
+                            student.recompute_schedule_and_credits(&catalog.sections_meta);
                         }
                     }
                     self.event_index.insert(
@@ -1158,7 +1833,7 @@ impl EnrollmentEngine {
                             course_id: section_meta.course_id,
                             action,
                             state: HotPathEnrollmentState::Reverted,
-                            reason_code: None,
+                            reason_code: parsed_reason,
                             engine_epoch: rec.engine_epoch,
                             updated_at: rec.created_at,
                         },
@@ -1166,17 +1841,16 @@ impl EnrollmentEngine {
                 }
                 EnrollmentEventStatus::Confirmed => {
                     if !already_processed {
-                        if matches!(
-                            rec.event_type,
-                            EnrollmentEventType::Drop | EnrollmentEventType::AdminDrop
-                        ) {
+                        if is_drop {
                             if let Some(pos) = student
                                 .active_enrollments
                                 .iter()
                                 .position(|e| e.section_id == rec.section_id)
                             {
-                                student.active_enrollments.remove(pos);
-                                let _ = slot.try_release();
+                                let removed = student.active_enrollments.remove(pos);
+                                if !removed.seat_released {
+                                    let _ = slot.try_release();
+                                }
                             }
                         } else {
                             let holds = student
@@ -1185,7 +1859,8 @@ impl EnrollmentEngine {
                                 .any(|e| e.section_id == rec.section_id);
                             if !holds {
                                 let _ = slot.try_reserve();
-                                let credits_counted = policy_snapshot
+                                let credits_counted = policy_state
+                                    .policy
                                     .credit_limit
                                     .counted_candidate_credits(action, section_meta.credits);
                                 student.active_enrollments.push(ActiveEnrollment {
@@ -1195,23 +1870,30 @@ impl EnrollmentEngine {
                                     action,
                                     state: HotPathEnrollmentState::Confirmed,
                                     last_event_id: rec.event_id,
+                                    seat_released: false,
                                 });
                             }
                         }
                         student.processed_event_ids.insert(rec.event_id);
                         student.recompute_schedule_and_credits(&catalog.sections_meta);
-                    } else if let Some(entry) = student
-                        .active_enrollments
-                        .iter_mut()
-                        .find(|e| e.last_event_id == rec.event_id)
-                    {
+                    } else if is_drop {
+                        if let Some(pos) = student.active_enrollments.iter().position(|e| {
+                            e.section_id == rec.section_id && e.last_event_id == rec.event_id
+                        }) {
+                            let removed = student.active_enrollments.remove(pos);
+                            if !removed.seat_released {
+                                let _ = slot.try_release();
+                            }
+                            student.recompute_schedule_and_credits(&catalog.sections_meta);
+                        }
+                    } else if let Some(entry) = student.active_enrollments.iter_mut().find(|e| {
+                        e.last_event_id == rec.event_id
+                            && e.state == HotPathEnrollmentState::Reserved
+                    }) {
                         entry.state = HotPathEnrollmentState::Confirmed;
                     }
 
-                    let final_state = if matches!(
-                        rec.event_type,
-                        EnrollmentEventType::Drop | EnrollmentEventType::AdminDrop
-                    ) {
+                    let final_state = if is_drop {
                         HotPathEnrollmentState::Dropped
                     } else {
                         HotPathEnrollmentState::Confirmed
@@ -1236,8 +1918,18 @@ impl EnrollmentEngine {
         });
     }
 
-    #[must_use]
-    pub fn export_preload_dataset(&self, now: DateTime<Utc>) -> PreloadDataset {
+    pub fn try_export_preload_dataset(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<PreloadDataset, EngineError> {
+        let gate_state = decode_gate_state(self.gate_state.load(Ordering::SeqCst));
+        let in_flight = self.in_flight.load(Ordering::SeqCst);
+        if gate_state == GateState::Open || in_flight > 0 {
+            return Err(EngineError::SnapshotBlocked {
+                gate_state,
+                in_flight,
+            });
+        }
         let catalog = self.catalog.load();
         let mut sections = Vec::with_capacity(catalog.sections_meta.len());
         for (sec_id, meta) in &catalog.sections_meta {
@@ -1265,19 +1957,27 @@ impl EnrollmentEngine {
             students.push(state.clone());
         });
 
-        PreloadDataset {
+        let policy_state = self.policy_state.load();
+        Ok(PreloadDataset {
             term_id: catalog.term_id,
             term_code: catalog.term_code.clone(),
             checkpoint_seq: self.checkpoint_seq(),
             engine_epoch: self.epoch(),
-            gate_state: self.gate_state(),
-            active_window_id: *self.active_window_id.read(),
-            policy: self.policy.read().clone(),
+            gate_state,
+            active_window_id: policy_state.active_window_id,
+            policy: policy_state.policy.clone(),
             sections,
             prerequisites,
             students,
             created_at: now,
-        }
+        })
+    }
+
+    pub fn export_preload_dataset(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<PreloadDataset, EngineError> {
+        self.try_export_preload_dataset(now)
     }
 
     fn apply_kafka_replay_batch(&self, batch: crate::core::ports::KafkaReplayBatch) -> usize {
@@ -1288,6 +1988,7 @@ impl EnrollmentEngine {
         impl ReplayItem {
             fn key(&self) -> (DateTime<Utc>, u8) {
                 match self {
+                    Self::Delta(EnrollmentDeltaEvent::Revert(r)) => (r.reverted_at, 2),
                     Self::Delta(d) => (d.occurred_at(), 0),
                     Self::Command(c) => (c.occurred_at, 1),
                 }
@@ -1382,13 +2083,15 @@ impl EnrollmentEngine {
         if readiness != EngineReadiness::Ready {
             return Err(EngineError::NotReady(readiness));
         }
-        if self.role() != NodeRole::Active {
+        let role = NodeRole::from_u8(self.role.load(Ordering::SeqCst)).unwrap_or(NodeRole::Standby);
+        if role != NodeRole::Active {
             return Err(EngineError::NodeStandby);
         }
-        if self.gate_state() != GateState::Open {
+        let gate_state = decode_gate_state(self.gate_state.load(Ordering::SeqCst));
+        if gate_state != GateState::Open {
             return Err(EngineError::RuleViolation {
                 code: RuleErrorCode::GateClosed,
-                detail: format!("Registration gate is currently {:?}", self.gate_state()),
+                detail: format!("Registration gate is currently {gate_state:?}"),
             });
         }
         Ok(())
@@ -1428,7 +2131,6 @@ impl EnrollmentEngine {
     fn rollback_failed_drop(
         &self,
         catalog: &TermCatalog,
-        slot: &SectionSeatSlot,
         student_id: StudentId,
         section_id: SectionId,
         event_id: EventId,
@@ -1438,14 +2140,15 @@ impl EnrollmentEngine {
     ) {
         self.students.with_write(&student_id, |opt_student| {
             if let Some(student) = opt_student {
-                if let Some(entry) = student
-                    .active_enrollments
-                    .iter_mut()
-                    .find(|e| e.section_id == section_id && e.last_event_id == event_id)
-                {
-                    let _ = slot.try_reserve();
+                if let Some(entry) = student.active_enrollments.iter_mut().find(|e| {
+                    e.section_id == section_id
+                        && e.last_event_id == event_id
+                        && e.state == HotPathEnrollmentState::DropPending
+                        && !e.seat_released
+                }) {
                     entry.state = prev_state;
                     entry.last_event_id = prev_event_id;
+                    entry.seat_released = false;
                     student.recompute_schedule_and_credits(&catalog.sections_meta);
                 }
             }
@@ -1489,4 +2192,30 @@ const fn map_event_type_to_action(event_type: EnrollmentEventType) -> Enrollment
         EnrollmentEventType::Retake => EnrollmentAction::Retake,
         EnrollmentEventType::Improve => EnrollmentAction::Improve,
     }
+}
+
+pub fn spawn_state_sweeper(
+    engine: Arc<EnrollmentEngine>,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    let tick_every = interval.max(Duration::from_millis(50));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(tick_every);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Consume immediate first tick so first sweep waits one interval.
+        let _ = ticker.tick().await;
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                _ = ticker.tick() => {
+                    let _ = engine.sweep_expired_state(Utc::now());
+                }
+            }
+        }
+    })
 }

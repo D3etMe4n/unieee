@@ -4,7 +4,9 @@ use crate::core::models::{
     SectionSeatSnapshot, SingleEventOutcome, WriterError, WriterMetrics, WriterMetricsSnapshot,
     WriterReadiness,
 };
-use crate::core::ports::{DlqPublisher, RedisWriterSink, WriterRepository};
+use crate::core::ports::{
+    DeltaRevertPublisher, DlqPublisher, NoopDeltaRevertPublisher, RedisWriterSink, WriterRepository,
+};
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -12,8 +14,14 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
-use unieee_domain::{EnrollmentEventStatus, EventId, SectionId, StudentId, TermId};
-use unieee_events::{EnrollmentCommandEvent, GateControlEvent, SeatConfirmedEvent};
+use unieee_domain::{
+    EnrollmentAction, EnrollmentEventStatus, EventId, HotPathEnrollmentState, SectionId, StudentId,
+    TermId,
+};
+use unieee_events::{
+    decode_json, EnrollmentCommandEvent, EventStatusCachePayload, GateControlEvent, RevertEvent,
+    SeatConfirmedEvent,
+};
 
 /// Monotonic per-term fencing tracker rejecting commands from superseded engine epochs.
 #[derive(Debug, Default)]
@@ -60,6 +68,7 @@ pub struct WriterProcessorConfig {
     pub max_db_retries: u32,
     pub db_retry_backoff: Duration,
     pub cache_ttl_secs: u64,
+    pub event_status_ttl_secs: u64,
 }
 
 impl Default for WriterProcessorConfig {
@@ -68,6 +77,7 @@ impl Default for WriterProcessorConfig {
             max_db_retries: 3,
             db_retry_backoff: Duration::from_millis(50),
             cache_ttl_secs: 900,
+            event_status_ttl_secs: 3600,
         }
     }
 }
@@ -76,6 +86,7 @@ pub struct WriterProcessor {
     repo: Arc<dyn WriterRepository>,
     redis: Arc<dyn RedisWriterSink>,
     dlq: Arc<dyn DlqPublisher>,
+    delta_reverts: Arc<dyn DeltaRevertPublisher>,
     epochs: EpochTracker,
     metrics: WriterMetrics,
     readiness: AtomicU8,
@@ -94,11 +105,18 @@ impl WriterProcessor {
             repo,
             redis,
             dlq,
+            delta_reverts: Arc::new(NoopDeltaRevertPublisher),
             epochs: EpochTracker::default(),
             metrics: WriterMetrics::default(),
             readiness: AtomicU8::new(WriterReadiness::Starting as u8),
             config,
         }
+    }
+
+    #[must_use]
+    pub fn with_delta_publisher(mut self, publisher: Arc<dyn DeltaRevertPublisher>) -> Self {
+        self.delta_reverts = publisher;
+        self
     }
 
     #[must_use]
@@ -208,6 +226,7 @@ impl WriterProcessor {
 
         let mut latest_sections: HashMap<SectionId, SectionSeatSnapshot> = HashMap::new();
         let mut timetable_set: HashSet<(StudentId, TermId)> = HashSet::new();
+        let mut confirmed_statuses: Vec<EventStatusCachePayload> = Vec::new();
 
         for (stale_cmd, current_epoch) in stale_events {
             let maybe_revert = self
@@ -232,6 +251,7 @@ impl WriterProcessor {
                     &mut report,
                     &mut latest_sections,
                     &mut timetable_set,
+                    &mut confirmed_statuses,
                 )
                 .await?;
             } else {
@@ -244,6 +264,7 @@ impl WriterProcessor {
                         for ev in &fast.committed_events {
                             self.epochs.observe(ev.term_id, ev.engine_epoch);
                             timetable_set.insert((ev.student_id, ev.term_id));
+                            confirmed_statuses.push(confirmed_command_to_status_payload(ev, now));
                             if let Some(snap) = latest_sections.get(&ev.section_id) {
                                 report.confirmed_events.push(SeatConfirmedEvent::new(
                                     ev.event_id,
@@ -271,6 +292,7 @@ impl WriterProcessor {
                             &mut report,
                             &mut latest_sections,
                             &mut timetable_set,
+                            &mut confirmed_statuses,
                         )
                         .await?;
                     }
@@ -291,35 +313,46 @@ impl WriterProcessor {
             .events_duplicate_skipped
             .fetch_add(report.duplicate_skipped_count as u64, Ordering::Relaxed);
 
-        // Best-effort post-commit Redis dispatch & outbox marking. PG commit is NEVER rolled back here.
+        // Best-effort post-commit Redis & Kafka delta dispatch + outbox marking. PG commit is NEVER rolled back here.
         if !report.reverted_events.is_empty() {
-            match self
+            let redis_res = self
                 .redis
                 .publish_revert_events(&report.reverted_events)
-                .await
-            {
-                Ok(()) => {
-                    let revert_ids: Vec<EventId> =
-                        report.reverted_events.iter().map(|r| r.event_id).collect();
-                    match self.repo.mark_revert_outbox_published(&revert_ids).await {
-                        Ok(marked) => {
-                            report.outbox_marked_published = marked as usize;
-                        }
-                        Err(err) => {
-                            warn!(
-                                error = %err,
-                                count = revert_ids.len(),
-                                "failed marking writer_revert_outbox published_at after immediate Redis publish"
-                            );
-                        }
+                .await;
+            if let Err(err) = &redis_res {
+                warn!(
+                    error = %err,
+                    count = report.reverted_events.len(),
+                    "immediate Redis RevertEvent publish failed; outbox sweeper will retry"
+                );
+            }
+
+            let kafka_res = self
+                .delta_reverts
+                .publish_revert_deltas(&report.reverted_events)
+                .await;
+            if let Err(err) = &kafka_res {
+                warn!(
+                    error = %err,
+                    count = report.reverted_events.len(),
+                    "immediate Kafka Revert delta publish failed; outbox sweeper will retry"
+                );
+            }
+
+            if redis_res.is_ok() && kafka_res.is_ok() {
+                let revert_ids: Vec<EventId> =
+                    report.reverted_events.iter().map(|r| r.event_id).collect();
+                match self.repo.mark_revert_outbox_published(&revert_ids).await {
+                    Ok(marked) => {
+                        report.outbox_marked_published = marked as usize;
                     }
-                }
-                Err(err) => {
-                    warn!(
-                        error = %err,
-                        count = report.reverted_events.len(),
-                        "immediate Redis RevertEvent publish failed; outbox sweeper will retry"
-                    );
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            count = revert_ids.len(),
+                            "failed marking writer_revert_outbox published_at after immediate revert publish"
+                        );
+                    }
                 }
             }
         }
@@ -328,8 +361,10 @@ impl WriterProcessor {
             let redis_update = RedisBatchUpdate {
                 section_snapshots: latest_sections.into_values().collect(),
                 confirmed_events: report.confirmed_events.clone(),
+                event_statuses: confirmed_statuses,
                 timetable_invalidations: timetable_set.into_iter().collect(),
                 cache_ttl_secs: self.config.cache_ttl_secs,
+                event_status_ttl_secs: self.config.event_status_ttl_secs,
                 updated_at: now,
             };
             if let Err(err) = self.redis.apply_confirmed_batch(&redis_update).await {
@@ -375,6 +410,7 @@ impl WriterProcessor {
         report: &mut BatchExecutionReport,
         latest_sections: &mut HashMap<SectionId, SectionSeatSnapshot>,
         timetable_set: &mut HashSet<(StudentId, TermId)>,
+        confirmed_statuses: &mut Vec<EventStatusCachePayload>,
     ) -> Result<(), WriterError> {
         for ev in events {
             let outcome = self
@@ -384,6 +420,7 @@ impl WriterProcessor {
                 SingleEventOutcome::Committed(snap) => {
                     self.epochs.observe(ev.term_id, ev.engine_epoch);
                     timetable_set.insert((ev.student_id, ev.term_id));
+                    confirmed_statuses.push(confirmed_command_to_status_payload(ev, now));
                     report.confirmed_events.push(SeatConfirmedEvent::new(
                         ev.event_id,
                         ev.term_id,
@@ -448,6 +485,22 @@ impl WriterProcessor {
         let payloads: Vec<String> = rows.iter().map(|r| r.payload_json.clone()).collect();
         self.redis.publish_raw_revert_payloads(&payloads).await?;
 
+        let decoded_reverts: Vec<RevertEvent> = payloads
+            .iter()
+            .filter_map(|raw| match decode_json::<RevertEvent>(raw) {
+                Ok(ev) => Some(ev),
+                Err(err) => {
+                    warn!(error = %err, "skipped non-RevertEvent outbox payload for Kafka delta replay copy");
+                    None
+                }
+            })
+            .collect();
+        if !decoded_reverts.is_empty() {
+            self.delta_reverts
+                .publish_revert_deltas(&decoded_reverts)
+                .await?;
+        }
+
         let ids: Vec<EventId> = rows.iter().map(|r| r.event_id).collect();
         let marked = self.repo.mark_revert_outbox_published(&ids).await?;
         self.metrics
@@ -455,4 +508,27 @@ impl WriterProcessor {
             .fetch_add(marked, Ordering::Relaxed);
         Ok(ids.len())
     }
+}
+
+fn confirmed_command_to_status_payload(
+    ev: &EnrollmentCommandEvent,
+    now: DateTime<Utc>,
+) -> EventStatusCachePayload {
+    let status = if ev.action == EnrollmentAction::Drop {
+        HotPathEnrollmentState::Dropped
+    } else {
+        HotPathEnrollmentState::Confirmed
+    };
+    EventStatusCachePayload::new(
+        ev.event_id,
+        ev.term_id,
+        ev.student_id,
+        ev.section_id,
+        ev.course_id,
+        ev.action,
+        status,
+        None,
+        ev.engine_epoch,
+        now,
+    )
 }

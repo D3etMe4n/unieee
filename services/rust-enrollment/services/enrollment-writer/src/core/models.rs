@@ -4,7 +4,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use unieee_domain::{CourseId, EventId, RuleErrorCode, SectionId, StudentId, TermId};
-use unieee_events::{DeadLetterEvent, EnrollmentCommandEvent, RevertEvent, SeatConfirmedEvent};
+use unieee_events::{
+    DeadLetterEvent, EnrollmentCommandEvent, EventStatusCachePayload, RevertEvent,
+    SeatConfirmedEvent,
+};
 
 /// Authoritative section capacity state returned by PostgreSQL after an atomic update.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,13 +195,15 @@ pub struct RedisTermSectionSummaryPayload {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Batched Redis read-cache and `unieee:seat:confirmed` Pub/Sub payload bundle.
+/// Batched Redis read-cache, event-status cache, and `unieee:seat:confirmed` Pub/Sub payload bundle.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RedisBatchUpdate {
     pub section_snapshots: Vec<SectionSeatSnapshot>,
     pub confirmed_events: Vec<SeatConfirmedEvent>,
+    pub event_statuses: Vec<EventStatusCachePayload>,
     pub timetable_invalidations: Vec<(StudentId, TermId)>,
     pub cache_ttl_secs: u64,
+    pub event_status_ttl_secs: u64,
     pub updated_at: DateTime<Utc>,
 }
 

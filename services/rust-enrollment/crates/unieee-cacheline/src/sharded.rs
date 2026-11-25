@@ -158,6 +158,27 @@ where
             }
         }
     }
+
+    pub fn for_each_write(&self, mut f: impl FnMut(&K, &mut V)) {
+        for shard in self.shards.iter() {
+            let mut guard = shard.write();
+            for (k, v) in guard.iter_mut() {
+                f(k, v);
+            }
+        }
+    }
+
+    /// Retains only entries matching `f`, locking one shard at a time, and returns count evicted.
+    pub fn retain(&self, mut f: impl FnMut(&K, &mut V) -> bool) -> usize {
+        let mut evicted = 0usize;
+        for shard in self.shards.iter() {
+            let mut guard = shard.write();
+            let before = guard.len();
+            guard.retain(|k, v| f(k, v));
+            evicted = evicted.saturating_add(before.saturating_sub(guard.len()));
+        }
+        evicted
+    }
 }
 
 struct FnvHasher(u64);

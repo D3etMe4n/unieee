@@ -12,7 +12,9 @@ use enrollment_writer::adapters::redis_io::{
     connect_redis_backend, spawn_gate_control_listener, RedisWriterAdapter,
 };
 use enrollment_writer::config::WriterConfig;
-use enrollment_writer::core::{WriterProcessor, WriterProcessorConfig, WriterReadiness};
+use enrollment_writer::core::{
+    DeltaRevertPublisher, WriterProcessor, WriterProcessorConfig, WriterReadiness,
+};
 use enrollment_writer::http::{build_router, WriterAppState};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,20 +38,28 @@ async fn main() -> anyhow::Result<()> {
             .map_err(anyhow::Error::msg)?,
     );
     let redis_backend = connect_redis_backend(&cfg).map_err(anyhow::Error::msg)?;
-    let redis_sink = Arc::new(RedisWriterAdapter::new(redis_backend.clone()));
+    let redis_sink = Arc::new(RedisWriterAdapter::with_event_status_ttl(
+        redis_backend.clone(),
+        cfg.event_status_ttl_secs,
+    ));
     let dlq_pub =
         Arc::new(RdkafkaDlqPublisher::new(&cfg.kafka_brokers).map_err(anyhow::Error::msg)?);
+    let delta_pub = Arc::clone(&dlq_pub) as Arc<dyn DeltaRevertPublisher>;
 
-    let processor = Arc::new(WriterProcessor::new(
-        pg_repo,
-        redis_sink,
-        dlq_pub,
-        WriterProcessorConfig {
-            max_db_retries: cfg.max_db_retries,
-            db_retry_backoff: Duration::from_millis(cfg.db_retry_backoff_ms),
-            cache_ttl_secs: cfg.cache_ttl_secs,
-        },
-    ));
+    let processor = Arc::new(
+        WriterProcessor::new(
+            pg_repo,
+            redis_sink,
+            dlq_pub,
+            WriterProcessorConfig {
+                max_db_retries: cfg.max_db_retries,
+                db_retry_backoff: Duration::from_millis(cfg.db_retry_backoff_ms),
+                cache_ttl_secs: cfg.cache_ttl_secs,
+                event_status_ttl_secs: cfg.event_status_ttl_secs,
+            },
+        )
+        .with_delta_publisher(delta_pub),
+    );
 
     if let Err(err) = processor.bootstrap_epochs().await {
         warn!(error = %err, "initial epoch bootstrap failed; continuing with epoch 0 floor");

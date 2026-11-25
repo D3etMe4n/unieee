@@ -1122,6 +1122,7 @@ async fn covers_config_error_branches_api_errors_and_redis_kafka_adapter_helpers
     let k_handle = enrollment_engine::adapters::kafka::spawn_delta_and_standby_consumer(
         "127.0.0.1:1".to_owned(),
         "test-grp".to_owned(),
+        Vec::new(),
         Arc::clone(&engine),
         k_rx,
     );
@@ -1561,4 +1562,513 @@ async fn adapters_pure_helpers_and_dispatchers_work_deterministically() {
     );
     assert_eq!(replay_batch.commands.len(), 1);
     assert_eq!(replay_batch.deltas.len(), 1);
+}
+
+struct MockStatusCache {
+    calls: std::sync::atomic::AtomicUsize,
+    fail: std::sync::atomic::AtomicBool,
+    records: tokio::sync::Mutex<
+        HashMap<unieee_domain::EventId, enrollment_engine::core::EventStatusRecord>,
+    >,
+}
+
+impl Default for MockStatusCache {
+    fn default() -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            records: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl enrollment_engine::core::EventStatusCacheReader for MockStatusCache {
+    async fn get_event_status(
+        &self,
+        event_id: unieee_domain::EventId,
+    ) -> Result<Option<enrollment_engine::core::EventStatusRecord>, String> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if self.fail.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("simulated Redis status read error".to_owned());
+        }
+        Ok(self.records.lock().await.get(&event_id).cloned())
+    }
+}
+
+struct MockStatusPg {
+    calls: std::sync::atomic::AtomicUsize,
+    fail: std::sync::atomic::AtomicBool,
+    pause_next: std::sync::atomic::AtomicBool,
+    pause_entered: Arc<tokio::sync::Notify>,
+    pause_release: Arc<tokio::sync::Notify>,
+    records: tokio::sync::Mutex<
+        HashMap<unieee_domain::EventId, enrollment_engine::core::ReplayEventRecord>,
+    >,
+}
+
+impl Default for MockStatusPg {
+    fn default() -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            pause_next: std::sync::atomic::AtomicBool::new(false),
+            pause_entered: Arc::new(tokio::sync::Notify::new()),
+            pause_release: Arc::new(tokio::sync::Notify::new()),
+            records: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl enrollment_engine::core::EventStatusFallbackStore for MockStatusPg {
+    async fn find_event_by_id(
+        &self,
+        event_id: unieee_domain::EventId,
+    ) -> Result<Option<enrollment_engine::core::ReplayEventRecord>, String> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if self
+            .pause_next
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.pause_entered.notify_waiters();
+            self.pause_release.notified().await;
+        }
+        if self.fail.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("simulated PG lookup failure".to_owned());
+        }
+        Ok(self.records.lock().await.get(&event_id).cloned())
+    }
+}
+
+#[tokio::test]
+async fn http_hardening_covers_backpressure_503_idempotency_key_and_3tier_status_fallback() {
+    let now = Utc::now();
+    let term_id = TermId::new_v4();
+    let c1 = CourseId::new_v4();
+    let s1_id = StudentId::new_v4();
+    let s2_id = StudentId::new_v4();
+
+    let sec = make_section(term_id, 801, c1, "CS801", 3, 10, 0, 1, 1, 2);
+    let dataset = make_dataset(
+        term_id,
+        vec![sec],
+        Vec::new(),
+        vec![
+            make_student(s1_id, "HB1", Some("sub-hb1"), "K24", "CSE"),
+            make_student(s2_id, "HB2", Some("sub-hb2"), "K24", "CSE"),
+        ],
+        now,
+    );
+
+    let keypair = RsaTestKeypair::generate("hb-k1");
+    let fetcher = Arc::new(MockJwksFetcher::with_ok(
+        serde_json::json!({ "keys": [keypair.jwk_json] }).to_string(),
+    ));
+    let verifier = Arc::new(OidcJwtVerifier::new(
+        fetcher,
+        OidcVerifierConfig {
+            issuers: vec!["https://idp.test".to_owned()],
+            audience: Some("unieee-web".to_owned()),
+            cache_ttl_secs: 30,
+            max_cached_tokens_per_shard: 64,
+        },
+    ));
+
+    let pub_mock = Arc::new(MockCommandPublisher::default());
+    let dedup_mock = Arc::new(MockRevertDedupStore::default());
+    let redis_status = Arc::new(MockStatusCache::default());
+    let pg_status = Arc::new(MockStatusPg::default());
+    let opts = enrollment_engine::core::EngineRuntimeOptions {
+        max_in_flight_kafka_publishes: 1,
+        status_pg_lookup_concurrency: 1,
+        status_negative_cache_ttl: std::time::Duration::from_secs(30),
+        ..Default::default()
+    };
+    let engine = Arc::new(
+        EnrollmentEngine::with_options(
+            NodeRole::Active,
+            Arc::clone(&pub_mock) as Arc<dyn CommandPublisher>,
+            SeatTentativeCoalescerHandle::disconnected(),
+            dedup_mock as Arc<dyn RevertDedupStore>,
+            opts,
+        )
+        .with_status_fallbacks(
+            Some(Arc::clone(&redis_status)
+                as Arc<dyn enrollment_engine::core::EventStatusCacheReader>),
+            Some(Arc::clone(&pg_status)
+                as Arc<dyn enrollment_engine::core::EventStatusFallbackStore>),
+        ),
+    );
+    engine
+        .hydrate_from_dataset(dataset, NodeRole::Active)
+        .unwrap();
+    engine.set_readiness(EngineReadiness::Ready);
+
+    let app = build_router(AppState {
+        engine: Arc::clone(&engine),
+        verifier: Arc::clone(&verifier),
+        internal_ops_token: None,
+    });
+    let tok_s1 = keypair.sign_jwt(
+        "sub-hb1",
+        "https://idp.test",
+        "unieee-web",
+        now.timestamp() + 600,
+        &["STUDENT"],
+        Some(s1_id),
+    );
+    let tok_s2 = keypair.sign_jwt(
+        "sub-hb2",
+        "https://idp.test",
+        "unieee-web",
+        now.timestamp() + 600,
+        &["STUDENT"],
+        Some(s2_id),
+    );
+    let tok_admin = keypair.sign_jwt(
+        "admin-hb",
+        "https://idp.test",
+        "unieee-web",
+        now.timestamp() + 600,
+        &["ACADEMIC_ADMIN"],
+        None,
+    );
+
+    // 1) Backpressure 503 when 1st register holds the single Kafka publish semaphore permit
+    pub_mock
+        .pause_next
+        .store(true, std::sync::atomic::Ordering::Release);
+    let entered = pub_mock.pause_entered.notified();
+    let app_req1 = app.clone();
+    let tok1 = tok_s1.clone();
+    let req1_handle = tokio::spawn(async move {
+        app_req1
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/enrollments/register")
+                    .header(header::AUTHORIZATION, format!("Bearer {tok1}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("Idempotency-Key", "idem-reg-1")
+                    .body(Body::from(r#"{"sectionId":801,"action":"REGISTER"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+    entered.await;
+
+    let bp_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/enrollments/register")
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s2}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"sectionId":801,"action":"REGISTER"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(
+        bp_resp,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "KAFKA_BACKPRESSURE",
+        "/api/v1/enrollments/register",
+    )
+    .await;
+
+    pub_mock.pause_release.notify_waiters();
+    let r1 = req1_handle.await.unwrap();
+    assert_eq!(r1.status(), StatusCode::ACCEPTED);
+    let b1: EnrollmentAcceptedResponse =
+        serde_json::from_slice(&r1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+
+    // 2) Client Idempotency-Key retry returns identical EnrollmentAccepted without publishing again
+    let retry_r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/enrollments/register")
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("Idempotency-Key", "idem-reg-1")
+                .body(Body::from(r#"{"sectionId":801,"action":"REGISTER"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry_r1.status(), StatusCode::ACCEPTED);
+    let b1_retry: EnrollmentAcceptedResponse =
+        serde_json::from_slice(&retry_r1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(b1_retry.event_id, b1.event_id);
+    assert_eq!(pub_mock.published.lock().await.len(), 1);
+
+    // Control char in Idempotency-Key -> 400 INVALID_IDEMPOTENCY_KEY
+    let bad_idem = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/enrollments/drop")
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("Idempotency-Key", &"x".repeat(130))
+                .body(Body::from(r#"{"sectionId":801}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(
+        bad_idem,
+        StatusCode::BAD_REQUEST,
+        "INVALID_IDEMPOTENCY_KEY",
+        "/api/v1/enrollments/drop",
+    )
+    .await;
+
+    // Drop with Idempotency-Key retry
+    let d1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/enrollments/drop")
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("Idempotency-Key", "idem-drop-1")
+                .body(Body::from(r#"{"sectionId":801}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(d1.status(), StatusCode::ACCEPTED);
+    let d1_body: EnrollmentAcceptedResponse =
+        serde_json::from_slice(&d1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let d1_retry = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/enrollments/drop")
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("Idempotency-Key", "idem-drop-1")
+                .body(Body::from(r#"{"sectionId":801}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(d1_retry.status(), StatusCode::ACCEPTED);
+    assert_eq!(pub_mock.published.lock().await.len(), 2);
+
+    // 3) 3-tier status fallback:
+    // 3a) Redis fallback hit + IDOR check (s2 forbidden, s1 & admin ok)
+    let redis_ev_id = unieee_domain::EventId::new_v7();
+    redis_status.records.lock().await.insert(
+        redis_ev_id,
+        enrollment_engine::core::EventStatusRecord {
+            event_id: redis_ev_id,
+            term_id,
+            student_id: s1_id,
+            section_id: SectionId::new(801),
+            course_id: c1,
+            action: EnrollmentAction::Drop,
+            state: HotPathEnrollmentState::Dropped,
+            reason_code: None,
+            engine_epoch: 1,
+            updated_at: now,
+        },
+    );
+    let redis_idor = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/enrollments/status/{redis_ev_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s2}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(
+        redis_idor,
+        StatusCode::FORBIDDEN,
+        "FORBIDDEN",
+        &format!("/api/v1/enrollments/status/{redis_ev_id}"),
+    )
+    .await;
+
+    let redis_ok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/enrollments/status/{redis_ev_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(redis_ok.status(), StatusCode::OK);
+    let r_body: EnrollmentStatusResponse =
+        serde_json::from_slice(&redis_ok.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(r_body.status, HotPathEnrollmentState::Dropped);
+    assert_eq!(
+        pg_status.calls.load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+
+    // 3b) Redis errors -> falls back cleanly to PostgreSQL point lookup
+    redis_status
+        .fail
+        .store(true, std::sync::atomic::Ordering::Release);
+    let pg_ev_id = unieee_domain::EventId::new_v7();
+    pg_status.records.lock().await.insert(
+        pg_ev_id,
+        enrollment_engine::core::ReplayEventRecord {
+            seq: 900,
+            event_id: pg_ev_id,
+            term_id,
+            student_id: s1_id,
+            section_id: SectionId::new(801),
+            event_type: EnrollmentEventType::Register,
+            status: EnrollmentEventStatus::Rejected,
+            reason_code: Some("SECTION_FULL".to_owned()),
+            engine_epoch: 1,
+            created_at: now,
+        },
+    );
+    let pg_ok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/enrollments/status/{pg_ev_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {tok_admin}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pg_ok.status(), StatusCode::OK);
+    let p_body: EnrollmentStatusResponse =
+        serde_json::from_slice(&pg_ok.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(p_body.status, HotPathEnrollmentState::Reverted);
+    assert_eq!(p_body.reason_code.as_deref(), Some("SECTION_FULL"));
+    assert_eq!(p_body.course_id, c1);
+    assert_eq!(
+        pg_status.calls.load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+
+    // 3c) Random missing UUID hits PG once, then negative cache prevents 2nd PG hit!
+    let missing_id = unieee_domain::EventId::new_v7();
+    for _ in 0..2 {
+        let nf = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/enrollments/status/{missing_id}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {tok_admin}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem_detail(
+            nf,
+            StatusCode::NOT_FOUND,
+            "EVENT_NOT_FOUND",
+            &format!("/api/v1/enrollments/status/{missing_id}"),
+        )
+        .await;
+    }
+    assert_eq!(
+        pg_status.calls.load(std::sync::atomic::Ordering::Acquire),
+        2
+    );
+
+    // 3d) PG lookup semaphore saturation returns 503 STATUS_LOOKUP_SATURATED
+    pg_status
+        .pause_next
+        .store(true, std::sync::atomic::Ordering::Release);
+    let pg_entered = pg_status.pause_entered.notified();
+    let blocked_id = unieee_domain::EventId::new_v7();
+    let app_pg1 = app.clone();
+    let admin_tok1 = tok_admin.clone();
+    let h_pg1 = tokio::spawn(async move {
+        app_pg1
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/enrollments/status/{blocked_id}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {admin_tok1}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+    pg_entered.await;
+
+    let other_id = unieee_domain::EventId::new_v7();
+    let sat_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/enrollments/status/{other_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {tok_admin}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(
+        sat_resp,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "STATUS_LOOKUP_SATURATED",
+        &format!("/api/v1/enrollments/status/{other_id}"),
+    )
+    .await;
+
+    pg_status.pause_release.notify_waiters();
+    let _ = h_pg1.await.unwrap();
+    let _ = d1_body;
+
+    // 4) Cover Kafka adapter helpers: classify_rdkafka_error, build_live_assignment_tpl, decode_event_status_payload
+    use rdkafka::error::{KafkaError, RDKafkaErrorCode};
+    assert!(matches!(
+        enrollment_engine::adapters::kafka::classify_rdkafka_error(&KafkaError::MessageProduction(
+            RDKafkaErrorCode::QueueFull
+        )),
+        enrollment_engine::core::PublishError::Definite(_)
+    ));
+    assert!(matches!(
+        enrollment_engine::adapters::kafka::classify_rdkafka_error(&KafkaError::MessageProduction(
+            RDKafkaErrorCode::MessageTimedOut
+        )),
+        enrollment_engine::core::PublishError::Indeterminate(_)
+    ));
+    assert!(matches!(
+        enrollment_engine::adapters::kafka::classify_rdkafka_error(&KafkaError::ClientCreation(
+            "bad".to_owned()
+        )),
+        enrollment_engine::core::PublishError::Definite(_)
+    ));
+    assert!(matches!(
+        enrollment_engine::adapters::kafka::classify_rdkafka_error(&KafkaError::Canceled),
+        enrollment_engine::core::PublishError::Indeterminate(_)
+    ));
+    let tpl = enrollment_engine::adapters::kafka::build_live_assignment_tpl(&[
+        enrollment_engine::core::KafkaPartitionOffset {
+            topic: unieee_events::KAFKA_TOPIC_ENROLLMENT_COMMANDS.to_owned(),
+            partition: 0,
+            offset: 12,
+        },
+    ])
+    .unwrap();
+    assert_eq!(tpl.count(), 1);
+    assert!(enrollment_engine::adapters::redis_io::decode_event_status_payload("{bad").is_err());
 }

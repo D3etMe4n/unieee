@@ -1075,6 +1075,7 @@ async fn covers_remaining_rule_error_branches_and_idempotent_replays() {
             action: EnrollmentAction::Register,
             state: HotPathEnrollmentState::Confirmed,
             last_event_id: EventId::new_v7(),
+            seat_released: false,
         });
     assert!(
         evaluate_prerequisites(&p2, &s_with_coreq, &coreq_only, EnrollmentAction::Register).is_ok()
@@ -1455,4 +1456,517 @@ async fn covers_remaining_rule_error_branches_and_idempotent_replays() {
             .enrolled_count,
         0
     );
+}
+
+#[tokio::test]
+async fn late_revert_after_reregister_and_drop_while_reserved_preserves_new_state() {
+    let now = Utc::now();
+    let term_id = TermId::new_v4();
+    let c1 = CourseId::new_v4();
+    let sid = StudentId::new_v4();
+    let ds = make_dataset(
+        term_id,
+        vec![make_section(term_id, 91, c1, "CS91", 3, 5, 0, 1, 1, 2)],
+        Vec::new(),
+        vec![make_student(sid, "LR1", Some("sub-lr1"), "K24", "CSE")],
+        now,
+    );
+    let (engine, _, _) = make_ready_engine(ds, NodeRole::Active);
+
+    // Register ev1, drop via ev2 (DropPending, seat_released = true)
+    let ev1 = engine
+        .register(sid, SectionId::new(91), EnrollmentAction::Register, now)
+        .await
+        .unwrap();
+    let _ev2 = engine
+        .drop_section(sid, SectionId::new(91), now)
+        .await
+        .unwrap();
+    assert_eq!(
+        engine
+            .seat_snapshot(SectionId::new(91))
+            .unwrap()
+            .available_seats,
+        5
+    );
+
+    // Case A: Late RevertEvent(ev1) arrives while ev2 is DropPending -> MUST NOT double-release seat or remove ev2!
+    let late_rev1 = RevertEvent::new(
+        ev1.event_id,
+        term_id,
+        sid,
+        SectionId::new(91),
+        c1,
+        EnrollmentAction::Register,
+        RuleErrorCode::DatabaseConstraintViolation,
+        "late revert ev1",
+        1,
+        now,
+    );
+    assert_eq!(
+        engine.apply_revert_event(&late_rev1).await,
+        RevertOutcome::Applied
+    );
+    assert_eq!(
+        engine
+            .seat_snapshot(SectionId::new(91))
+            .unwrap()
+            .available_seats,
+        5
+    );
+    let st = engine.student_snapshot(sid).unwrap();
+    assert_eq!(st.active_enrollments.len(), 1);
+    assert!(st.reverted_event_ids.contains(&ev1.event_id));
+    assert_eq!(
+        engine.get_event_status(ev1.event_id).unwrap().state,
+        HotPathEnrollmentState::Reverted
+    );
+
+    // Case B: Register ev3 after reverting ev2 -> late RevertEvent for prior ev1 does NOT remove ev3
+    let ev2_id = st.active_enrollments[0].last_event_id;
+    engine.apply_seat_confirmed(&SeatConfirmedEvent::new(
+        ev2_id,
+        term_id,
+        SectionId::new(91),
+        sid,
+        5,
+        5,
+        EnrollmentEventStatus::Confirmed,
+        now,
+    ));
+    let ev3 = engine
+        .register(sid, SectionId::new(91), EnrollmentAction::Register, now)
+        .await
+        .unwrap();
+    let unrelated_old = EventId::new_v7();
+    let late_rev_old = RevertEvent::new(
+        unrelated_old,
+        term_id,
+        sid,
+        SectionId::new(91),
+        c1,
+        EnrollmentAction::Register,
+        RuleErrorCode::DatabaseConstraintViolation,
+        "stale event",
+        1,
+        now,
+    );
+    assert_eq!(
+        engine.apply_revert_event(&late_rev_old).await,
+        RevertOutcome::Applied
+    );
+    assert_eq!(
+        engine
+            .seat_snapshot(SectionId::new(91))
+            .unwrap()
+            .available_seats,
+        4
+    );
+    assert_eq!(
+        engine.student_snapshot(sid).unwrap().active_enrollments[0].last_event_id,
+        ev3.event_id
+    );
+}
+
+#[tokio::test]
+async fn drop_defers_seat_release_until_kafka_ack_and_handles_indeterminate_and_fast_confirm() {
+    let now = Utc::now();
+    let term_id = TermId::new_v4();
+    let c1 = CourseId::new_v4();
+    let sid = StudentId::new_v4();
+    let ds = make_dataset(
+        term_id,
+        vec![make_section(term_id, 92, c1, "CS92", 3, 2, 0, 1, 1, 2)],
+        Vec::new(),
+        vec![make_student(sid, "DRP1", Some("sub-drp1"), "K24", "CSE")],
+        now,
+    );
+    let (engine, pub_mock, _) = make_ready_engine(ds, NodeRole::Active);
+
+    let reg = engine
+        .register(sid, SectionId::new(92), EnrollmentAction::Register, now)
+        .await
+        .unwrap();
+    engine.apply_seat_confirmed(&SeatConfirmedEvent::new(
+        reg.event_id,
+        term_id,
+        SectionId::new(92),
+        sid,
+        1,
+        2,
+        EnrollmentEventStatus::Confirmed,
+        now,
+    ));
+
+    // Pause drop_section inside Kafka publish: seat & credits & schedule MUST remain held until ACK!
+    pub_mock.pause_next.store(true, Ordering::Release);
+    let entered = pub_mock.pause_entered.notified();
+    let eng_drop = std::sync::Arc::clone(&engine);
+    let drop_task =
+        tokio::spawn(async move { eng_drop.drop_section(sid, SectionId::new(92), now).await });
+    entered.await;
+
+    assert_eq!(
+        engine
+            .seat_snapshot(SectionId::new(92))
+            .unwrap()
+            .available_seats,
+        1
+    );
+    let mid = engine.student_snapshot(sid).unwrap();
+    assert_eq!(mid.current_credits, 3);
+    assert!(!mid.schedule_bitmask.is_empty());
+    assert!(!mid.active_enrollments[0].seat_released);
+    // Concurrent register for same course is STILL blocked while DropPending awaits ACK
+    assert_eq!(
+        match engine
+            .register(sid, SectionId::new(92), EnrollmentAction::Register, now)
+            .await
+            .unwrap_err()
+        {
+            EngineError::RuleViolation { code, .. } => code,
+            other => panic!("unexpected: {other:?}"),
+        },
+        RuleErrorCode::AlreadyEnrolledInCourse
+    );
+
+    // Definite failure rolls back DropPending -> Confirmed without overbooking!
+    pub_mock.fail.store(true, Ordering::Release);
+    pub_mock.pause_release.notify_waiters();
+    assert!(drop_task.await.unwrap().is_err());
+    assert_eq!(
+        engine
+            .seat_snapshot(SectionId::new(92))
+            .unwrap()
+            .available_seats,
+        1
+    );
+    assert_eq!(
+        engine.student_snapshot(sid).unwrap().active_enrollments[0].state,
+        HotPathEnrollmentState::Confirmed
+    );
+
+    // Indeterminate Kafka error on Drop retains DropPending(seat_released=false), and fast SeatConfirmed releases once!
+    pub_mock.fail.store(false, Ordering::Release);
+    pub_mock.fail_indeterminate.store(true, Ordering::Release);
+    let indet_err = engine
+        .drop_section(sid, SectionId::new(92), now)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        indet_err,
+        EngineError::RuleViolation {
+            code: RuleErrorCode::KafkaPublishFailed,
+            ..
+        }
+    ));
+    let pending_st = engine.student_snapshot(sid).unwrap();
+    let pending_ev_id = pending_st.active_enrollments[0].last_event_id;
+    assert_eq!(
+        pending_st.active_enrollments[0].state,
+        HotPathEnrollmentState::DropPending
+    );
+    assert!(!pending_st.active_enrollments[0].seat_released);
+    assert_eq!(
+        engine
+            .seat_snapshot(SectionId::new(92))
+            .unwrap()
+            .available_seats,
+        1
+    );
+
+    // When SeatConfirmedEvent arrives after Indeterminate Drop, apply_seat_confirmed releases the seat & drops entry!
+    engine.apply_seat_confirmed(&SeatConfirmedEvent::new(
+        pending_ev_id,
+        term_id,
+        SectionId::new(92),
+        sid,
+        2,
+        2,
+        EnrollmentEventStatus::Confirmed,
+        now,
+    ));
+    assert_eq!(
+        engine
+            .seat_snapshot(SectionId::new(92))
+            .unwrap()
+            .available_seats,
+        2
+    );
+    assert!(engine
+        .student_snapshot(sid)
+        .unwrap()
+        .active_enrollments
+        .is_empty());
+
+    // Indeterminate Register retains Reserved & held seat until RevertEvent frees it
+    let indet_reg = engine
+        .register(sid, SectionId::new(92), EnrollmentAction::Register, now)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        indet_reg,
+        EngineError::RuleViolation {
+            code: RuleErrorCode::KafkaPublishFailed,
+            ..
+        }
+    ));
+    assert_eq!(
+        engine
+            .seat_snapshot(SectionId::new(92))
+            .unwrap()
+            .available_seats,
+        1
+    );
+    let kept_ev = engine.student_snapshot(sid).unwrap().active_enrollments[0].last_event_id;
+    assert_eq!(
+        engine
+            .apply_revert_event(&RevertEvent::new(
+                kept_ev,
+                term_id,
+                sid,
+                SectionId::new(92),
+                c1,
+                EnrollmentAction::Register,
+                RuleErrorCode::DatabaseConstraintViolation,
+                "indet reverted",
+                engine.epoch(),
+                now,
+            ))
+            .await,
+        RevertOutcome::Applied
+    );
+    assert_eq!(
+        engine
+            .seat_snapshot(SectionId::new(92))
+            .unwrap()
+            .available_seats,
+        2
+    );
+}
+
+#[tokio::test]
+async fn db_replay_handles_drop_confirmed_rejected_and_propagates_epoch_into_seat_table() {
+    let now = Utc::now();
+    let term_id = TermId::new_v4();
+    let c1 = CourseId::new_v4();
+    let sid = StudentId::new_v4();
+    let ds = make_dataset(
+        term_id,
+        vec![make_section(term_id, 93, c1, "CS93", 3, 5, 0, 1, 1, 2)],
+        Vec::new(),
+        vec![make_student(sid, "DBR1", Some("sub-dbr1"), "K24", "CSE")],
+        now,
+    );
+    let (engine, _, _) = make_ready_engine(ds, NodeRole::Standby);
+
+    let reg_id = EventId::new_v7();
+    engine.apply_replayed_command(&unieee_events::EnrollmentCommandEvent::new(
+        reg_id,
+        term_id,
+        sid,
+        SectionId::new(93),
+        c1,
+        EnrollmentAction::Register,
+        4,
+        now,
+    ));
+    assert_eq!(engine.epoch(), 4);
+    assert_eq!(engine.seat_snapshot(SectionId::new(93)).unwrap().epoch, 4);
+
+    // Drop command marks DropPending + seat_released=true -> DB Rejected Drop restores Confirmed & re-reserves seat!
+    let drop_id = EventId::new_v7();
+    engine.apply_replayed_command(&unieee_events::EnrollmentCommandEvent::new(
+        drop_id,
+        term_id,
+        sid,
+        SectionId::new(93),
+        c1,
+        EnrollmentAction::Drop,
+        5,
+        now,
+    ));
+    assert_eq!(
+        engine
+            .seat_snapshot(SectionId::new(93))
+            .unwrap()
+            .available_seats,
+        5
+    );
+    engine.apply_replayed_db_event(&enrollment_engine::core::ReplayEventRecord {
+        seq: 10,
+        event_id: drop_id,
+        term_id,
+        student_id: sid,
+        section_id: SectionId::new(93),
+        event_type: unieee_domain::EnrollmentEventType::Drop,
+        status: EnrollmentEventStatus::Rejected,
+        reason_code: Some("STALE_EPOCH".to_owned()),
+        engine_epoch: 6,
+        created_at: now,
+    });
+    assert_eq!(engine.epoch(), 6);
+    assert_eq!(engine.seat_snapshot(SectionId::new(93)).unwrap().epoch, 6);
+    assert_eq!(
+        engine
+            .seat_snapshot(SectionId::new(93))
+            .unwrap()
+            .available_seats,
+        4
+    );
+    assert_eq!(
+        engine.student_snapshot(sid).unwrap().active_enrollments[0].state,
+        HotPathEnrollmentState::Confirmed
+    );
+
+    // Another Drop already processed -> DB Confirmed Drop removes entry & recomputes credits (never flips to Confirmed!)
+    let drop2_id = EventId::new_v7();
+    engine.apply_replayed_command(&unieee_events::EnrollmentCommandEvent::new(
+        drop2_id,
+        term_id,
+        sid,
+        SectionId::new(93),
+        c1,
+        EnrollmentAction::Drop,
+        7,
+        now,
+    ));
+    engine.apply_replayed_db_event(&enrollment_engine::core::ReplayEventRecord {
+        seq: 11,
+        event_id: drop2_id,
+        term_id,
+        student_id: sid,
+        section_id: SectionId::new(93),
+        event_type: unieee_domain::EnrollmentEventType::AdminDrop,
+        status: EnrollmentEventStatus::Confirmed,
+        reason_code: None,
+        engine_epoch: 7,
+        created_at: now,
+    });
+    assert!(engine
+        .student_snapshot(sid)
+        .unwrap()
+        .active_enrollments
+        .is_empty());
+    assert_eq!(engine.student_snapshot(sid).unwrap().current_credits, 0);
+    assert_eq!(
+        engine.get_event_status(drop2_id).unwrap().state,
+        HotPathEnrollmentState::Dropped
+    );
+}
+
+#[tokio::test]
+async fn event_index_ttl_sweeper_and_safe_24h_uuidv7_dedup_pruning() {
+    let now = Utc::now();
+    let term_id = TermId::new_v4();
+    let c1 = CourseId::new_v4();
+    let sid = StudentId::new_v4();
+
+    // Even if dedup_retention is configured below 24h (e.g. 60s), engine MUST clamp >= 24h!
+    let opts = enrollment_engine::core::EngineRuntimeOptions {
+        event_index_ttl: std::time::Duration::from_secs(1800),
+        dedup_retention: std::time::Duration::from_secs(60),
+        ..Default::default()
+    };
+    let pub_mock = std::sync::Arc::new(common::MockCommandPublisher::default());
+    let dedup_mock = std::sync::Arc::new(common::MockRevertDedupStore::default());
+    let engine = std::sync::Arc::new(enrollment_engine::core::EnrollmentEngine::with_options(
+        NodeRole::Active,
+        pub_mock,
+        enrollment_engine::core::SeatTentativeCoalescerHandle::disconnected(),
+        dedup_mock,
+        opts,
+    ));
+
+    let sec = make_section(term_id, 94, c1, "CS94", 3, 10, 0, 1, 1, 2);
+    let mut student = make_student(sid, "SW1", Some("sub-sw1"), "K24", "CSE");
+    let old_unix_secs = u64::try_from((now - ChronoDuration::hours(25)).timestamp()).unwrap();
+    let old_v7_unpinned = EventId::from_uuid(uuid::Uuid::new_v7(uuid::Timestamp::from_unix(
+        uuid::NoContext,
+        old_unix_secs,
+        0,
+    )));
+    let borderline_unix_secs =
+        u64::try_from((now - ChronoDuration::hours(23)).timestamp()).unwrap();
+    let borderline_v7 = EventId::from_uuid(uuid::Uuid::new_v7(uuid::Timestamp::from_unix(
+        uuid::NoContext,
+        borderline_unix_secs,
+        0,
+    )));
+    let recent_v7 = EventId::new_v7();
+    let v4_legacy = EventId::new_v4();
+    student.processed_event_ids.insert(old_v7_unpinned);
+    student.processed_event_ids.insert(borderline_v7);
+    student.processed_event_ids.insert(recent_v7);
+    student.processed_event_ids.insert(v4_legacy);
+    student.reverted_event_ids.insert(old_v7_unpinned);
+    student.reverted_event_ids.insert(borderline_v7);
+    student.reverted_event_ids.insert(recent_v7);
+
+    let sid2 = StudentId::new_v4();
+    let acc_conf_sec = make_section(term_id, 95, CourseId::new_v4(), "CS95", 3, 10, 0, 2, 1, 2);
+    let ds = make_dataset(
+        term_id,
+        vec![sec, acc_conf_sec],
+        Vec::new(),
+        vec![student, make_student(sid2, "SW2", None, "K24", "CSE")],
+        now,
+    );
+    engine.hydrate_from_dataset(ds, NodeRole::Active).unwrap();
+    engine.set_readiness(EngineReadiness::Ready);
+
+    // Create 1 Reserved (unsettled) on sid and 1 Confirmed (settled) on sid2 in event_index
+    let acc1 = engine
+        .register(sid, SectionId::new(94), EnrollmentAction::Register, now)
+        .await
+        .unwrap();
+    let acc2 = engine
+        .register(sid2, SectionId::new(95), EnrollmentAction::Register, now)
+        .await
+        .unwrap();
+    engine.apply_seat_confirmed(&SeatConfirmedEvent::new(
+        acc2.event_id,
+        term_id,
+        SectionId::new(95),
+        sid2,
+        9,
+        10,
+        EnrollmentEventStatus::Confirmed,
+        now,
+    ));
+
+    // At now + 20m: neither settled nor unsettled evicted; >24h old_v7_unpinned pruned,
+    // while 23h20m borderline_v7 MUST be retained even though runtime dedup_retention was 60s!
+    let early = engine.sweep_expired_state(now + ChronoDuration::minutes(20));
+    assert_eq!(early.evicted_event_index, 0);
+    assert_eq!(early.pruned_dedup_ids, 2);
+    assert!(engine.get_event_status(acc2.event_id).is_some());
+    assert!(engine.get_event_status(acc1.event_id).is_some());
+
+    // At now + 65m: settled acc2 (Confirmed) is evicted, unsettled acc1 (Reserved) stays,
+    // and borderline_v7 (now 24h05m old) is pruned while recent_v7 and v4_legacy stay!
+    let report = engine.sweep_expired_state(now + ChronoDuration::minutes(65));
+    assert_eq!(report.evicted_event_index, 1);
+    assert!(engine.get_event_status(acc2.event_id).is_none());
+    assert!(engine.get_event_status(acc1.event_id).is_some());
+    assert_eq!(report.pruned_dedup_ids, 2);
+    let st_after = engine.student_snapshot(sid).unwrap();
+    assert!(!st_after.processed_event_ids.contains(&old_v7_unpinned));
+    assert!(!st_after.processed_event_ids.contains(&borderline_v7));
+    assert!(st_after.processed_event_ids.contains(&recent_v7));
+    assert!(st_after.processed_event_ids.contains(&v4_legacy));
+    assert!(!st_after.reverted_event_ids.contains(&old_v7_unpinned));
+    assert!(!st_after.reverted_event_ids.contains(&borderline_v7));
+    assert!(st_after.reverted_event_ids.contains(&recent_v7));
+
+    // Also exercise spawn_state_sweeper background task tick & shutdown
+    let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
+    let sweeper = enrollment_engine::core::spawn_state_sweeper(
+        std::sync::Arc::clone(&engine),
+        std::time::Duration::from_millis(50),
+        sd_rx,
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    let _ = sd_tx.send(true);
+    let _ = sweeper.await;
 }

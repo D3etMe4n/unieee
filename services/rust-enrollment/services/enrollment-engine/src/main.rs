@@ -10,10 +10,14 @@ use enrollment_engine::adapters::kafka::{
 };
 use enrollment_engine::adapters::postgres::PgPreloadAndReplayAdapter;
 use enrollment_engine::adapters::redis_io::{
-    connect_redis_backend, spawn_pubsub_listener, RedisRevertDedupStore, RedisTentativeSink,
+    connect_redis_backend, spawn_pubsub_listener, RedisEventStatusReader, RedisRevertDedupStore,
+    RedisTentativeSink,
 };
 use enrollment_engine::config::EngineConfig;
-use enrollment_engine::core::{spawn_coalescer, EnrollmentEngine, OidcJwtVerifier, SnapshotStore};
+use enrollment_engine::core::{
+    spawn_coalescer, spawn_state_sweeper, EnrollmentEngine, EventStatusCacheReader,
+    EventStatusFallbackStore, OidcJwtVerifier, SnapshotStore,
+};
 use enrollment_engine::http::build_router;
 use enrollment_engine::http::handlers::AppState;
 use std::sync::Arc;
@@ -43,18 +47,25 @@ async fn main() -> anyhow::Result<()> {
 
     let tentative_sink = Arc::new(RedisTentativeSink::new(redis_backend.clone()));
     let revert_dedup = Arc::new(RedisRevertDedupStore::new(redis_backend.clone()));
+    let event_status_cache = Arc::new(RedisEventStatusReader::new(redis_backend.clone()))
+        as Arc<dyn EventStatusCacheReader>;
+    let event_status_pg = Arc::new(pg_adapter.clone()) as Arc<dyn EventStatusFallbackStore>;
     let (coalescer, coalescer_handle) = spawn_coalescer(
         tentative_sink,
         Duration::from_millis(cfg.coalesce_window_ms),
         4096,
     );
 
-    let engine = Arc::new(EnrollmentEngine::new_awaiting_preload(
-        cfg.node_role,
-        kafka_pub,
-        coalescer,
-        revert_dedup,
-    ));
+    let engine = Arc::new(
+        EnrollmentEngine::with_options(
+            cfg.node_role,
+            kafka_pub,
+            coalescer,
+            revert_dedup,
+            cfg.to_runtime_options(),
+        )
+        .with_status_fallbacks(Some(event_status_cache), Some(event_status_pg)),
+    );
 
     let jwks_fetcher = Arc::new(
         ReqwestJwksFetcher::new(cfg.oidc_jwks_uri.clone(), Duration::from_secs(5))
@@ -67,11 +78,19 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(cfg.jwks_refresh_interval_secs),
         shutdown_rx.clone(),
     );
+    let sweeper_handle = spawn_state_sweeper(
+        Arc::clone(&engine),
+        Duration::from_secs(cfg.event_index_sweep_interval_secs),
+        shutdown_rx.clone(),
+    );
 
     let snapshot_store = SnapshotStore::new(cfg.snapshot_dir.clone());
     let engine_bootstrap = Arc::clone(&engine);
     let bootstrap_opts = cfg.to_bootstrap_options();
-    tokio::spawn(async move {
+    let kafka_brokers = cfg.kafka_brokers.clone();
+    let kafka_group_id = cfg.kafka_group_id.clone();
+    let mut supervisor_shutdown = shutdown_rx.clone();
+    let supervisor_handle = tokio::spawn(async move {
         match engine_bootstrap
             .bootstrap_or_recover(
                 &snapshot_store,
@@ -82,25 +101,35 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         {
-            Ok(report) => info!(
-                ?report,
-                "enrollment-engine bootstrap completed; /readyz=200"
-            ),
+            Ok(report) => {
+                info!(
+                    ?report,
+                    "enrollment-engine bootstrap completed; launching live Redis/Kafka listeners; /readyz=200"
+                );
+                let pubsub_handle = spawn_pubsub_listener(
+                    redis_backend,
+                    Arc::clone(&engine_bootstrap),
+                    supervisor_shutdown.clone(),
+                );
+                let kafka_handle = spawn_delta_and_standby_consumer(
+                    kafka_brokers,
+                    kafka_group_id,
+                    report.kafka_resume_offsets.clone(),
+                    Arc::clone(&engine_bootstrap),
+                    supervisor_shutdown.clone(),
+                );
+                let _ = supervisor_shutdown.changed().await;
+                let _ = pubsub_handle.await;
+                let _ = kafka_handle.await;
+            }
             Err(err) => {
                 error!(error = %err, "enrollment-engine bootstrap failed; keeping /readyz=503")
             }
         }
     });
 
-    let pubsub_handle =
-        spawn_pubsub_listener(redis_backend, Arc::clone(&engine), shutdown_rx.clone());
-    let kafka_handle = spawn_delta_and_standby_consumer(
-        cfg.kafka_brokers.clone(),
-        cfg.kafka_group_id.clone(),
-        Arc::clone(&engine),
-        shutdown_rx,
-    );
-
+    let shutdown_engine = Arc::clone(&engine);
+    let drain_timeout = cfg.to_runtime_options().drain_timeout;
     let router = build_router(AppState {
         engine,
         verifier,
@@ -116,11 +145,14 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("HTTP server error")?;
 
+    let _ = shutdown_engine
+        .demote_to_standby_and_drain(drain_timeout)
+        .await;
     let _ = shutdown_tx.send(true);
+    let _ = supervisor_handle.await;
+    let _ = sweeper_handle.await;
     drop(coalescer_handle);
     drop(jwks_handle);
-    drop(pubsub_handle);
-    drop(kafka_handle);
     Ok(())
 }
 

@@ -17,6 +17,8 @@ use uuid::Uuid;
 fn ids_validate_uuid_v7_and_postgres_bigint_bounds() {
     let event_id = EventId::new_v7();
     assert!(event_id.is_v7());
+    assert!(event_id.v7_timestamp_utc().is_some());
+    assert!(EventId::new_v4().v7_timestamp_utc().is_none());
     let roundtrip: EventId = event_id.to_string().parse().unwrap();
     assert_eq!(roundtrip, event_id);
     assert_eq!(Uuid::from(event_id), event_id.as_uuid());
@@ -307,6 +309,8 @@ fn enums_and_hot_path_state_machine_enforce_contracts() {
             "KAFKA_PUBLISH_FAILED",
             503,
         ),
+        (RuleErrorCode::KafkaBackpressure, "KAFKA_BACKPRESSURE", 503),
+        (RuleErrorCode::KafkaBackpressure, "KAFKA_BACKPRESSURE", 503),
         (
             RuleErrorCode::DatabaseConstraintViolation,
             "DATABASE_CONSTRAINT_VIOLATION",
@@ -316,7 +320,10 @@ fn enums_and_hot_path_state_machine_enforce_contracts() {
     for (err, expected_code, expected_status) in rule_errors {
         assert_eq!(err.as_str(), expected_code);
         assert_eq!(err.http_status_code(), expected_status);
+        assert_eq!(RuleErrorCode::from_code(expected_code), Some(err));
     }
+    assert_eq!(RuleErrorCode::from_code(""), None);
+    assert_eq!(RuleErrorCode::from_code("UNKNOWN_RULE_XYZ"), None);
 }
 
 #[test]

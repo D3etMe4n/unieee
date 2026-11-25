@@ -50,10 +50,21 @@ pub enum RuleErrorCode {
     StaleEpoch,
     DuplicateEventId,
     KafkaPublishFailed,
+    KafkaBackpressure,
     DatabaseConstraintViolation,
 }
 
 impl RuleErrorCode {
+    /// Parse an uppercase screaming-snake rule code string (e.g. from PostgreSQL `reason_code`).
+    #[must_use]
+    pub fn from_code(raw: &str) -> Option<Self> {
+        let normalized = raw.trim().to_ascii_uppercase();
+        if normalized.is_empty() {
+            return None;
+        }
+        serde_json::from_value(serde_json::Value::String(normalized)).ok()
+    }
+
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
@@ -92,6 +103,7 @@ impl RuleErrorCode {
             Self::StaleEpoch => "STALE_EPOCH",
             Self::DuplicateEventId => "DUPLICATE_EVENT_ID",
             Self::KafkaPublishFailed => "KAFKA_PUBLISH_FAILED",
+            Self::KafkaBackpressure => "KAFKA_BACKPRESSURE",
             Self::DatabaseConstraintViolation => "DATABASE_CONSTRAINT_VIOLATION",
         }
     }
@@ -108,7 +120,7 @@ impl RuleErrorCode {
             | Self::DuplicateEventId
             | Self::SeatCapacityOverflow
             | Self::DatabaseConstraintViolation => 409,
-            Self::GateClosed | Self::KafkaPublishFailed => 503,
+            Self::GateClosed | Self::KafkaPublishFailed | Self::KafkaBackpressure => 503,
             _ => 422,
         }
     }

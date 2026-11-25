@@ -476,8 +476,20 @@ async fn redis_sentinel_helpers_pipeline_cache_sync_and_gate_listener_work() {
     env.insert("REDIS_URL", format!("redis://{addr}"));
     let cfg = WriterConfig::from_lookup(|k| env.get(k).cloned()).unwrap();
     let backend = connect_redis_backend(&cfg).unwrap();
-    let adapter = RedisWriterAdapter::new(backend.clone());
+    let adapter = RedisWriterAdapter::with_event_status_ttl(backend.clone(), 3600);
 
+    let event_status_item = unieee_events::EventStatusCachePayload::new(
+        confirmed.event_id,
+        term_id,
+        student_id,
+        SectionId::new(10),
+        CourseId::new_v4(),
+        EnrollmentAction::Register,
+        unieee_domain::HotPathEnrollmentState::Confirmed,
+        None,
+        1,
+        now,
+    );
     adapter
         .apply_confirmed_batch(&RedisBatchUpdate::default())
         .await
@@ -486,15 +498,29 @@ async fn redis_sentinel_helpers_pipeline_cache_sync_and_gate_listener_work() {
         .apply_confirmed_batch(&RedisBatchUpdate {
             section_snapshots: vec![snap],
             confirmed_events: vec![confirmed],
+            event_statuses: vec![event_status_item],
             timetable_invalidations: vec![(student_id, term_id)],
             cache_ttl_secs: 900,
+            event_status_ttl_secs: 3600,
             updated_at: now,
         })
         .await
         .unwrap();
     adapter.publish_revert_events(&[]).await.unwrap();
-    adapter.publish_revert_events(&[revert]).await.unwrap();
+    adapter
+        .publish_revert_events(std::slice::from_ref(&revert))
+        .await
+        .unwrap();
     adapter.publish_raw_revert_payloads(&[]).await.unwrap();
+    let raw_revert_json = encode_json(&revert).unwrap();
+    adapter
+        .publish_raw_revert_payloads(&[raw_revert_json])
+        .await
+        .unwrap();
+    let (delta_key, delta_payload) =
+        enrollment_writer::adapters::kafka::encode_revert_delta_payload(&revert).unwrap();
+    assert_eq!(delta_key, revert.student_id.to_string());
+    assert!(delta_payload.contains("\"deltaType\":\"REVERT\""));
 
     let proc = Arc::new(WriterProcessor::new(
         Arc::new(StubRepo::new(Vec::new())),

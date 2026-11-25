@@ -1,3 +1,4 @@
+use crate::core::ports::KafkaPartitionOffset;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -118,6 +119,8 @@ pub struct ActiveEnrollment {
     pub action: EnrollmentAction,
     pub state: HotPathEnrollmentState,
     pub last_event_id: EventId,
+    #[serde(default)]
+    pub seat_released: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,10 +156,12 @@ impl StudentState {
         let mut mask = ScheduleBitmask::empty();
         let mut credits = 0i32;
         for item in &self.active_enrollments {
-            if matches!(
-                item.state,
-                HotPathEnrollmentState::Reserved | HotPathEnrollmentState::Confirmed
-            ) {
+            let holds_seat_and_schedule = match item.state {
+                HotPathEnrollmentState::Reserved | HotPathEnrollmentState::Confirmed => true,
+                HotPathEnrollmentState::DropPending => !item.seat_released,
+                HotPathEnrollmentState::Reverted | HotPathEnrollmentState::Dropped => false,
+            };
+            if holds_seat_and_schedule {
                 credits = credits.saturating_add(item.credits_counted);
                 if let Some(meta) = sections.get(&item.section_id) {
                     mask.add_in_place(&meta.bitmask);
@@ -269,6 +274,46 @@ pub struct BootstrapReport {
     pub replayed_events: usize,
     pub checkpoint_seq: i64,
     pub snapshot_sha256: String,
+    pub kafka_resume_offsets: Vec<KafkaPartitionOffset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineRuntimeOptions {
+    pub max_in_flight_kafka_publishes: usize,
+    pub idempotency_ttl: Duration,
+    pub idempotency_max_entries: usize,
+    pub idempotency_max_per_student: usize,
+    pub event_index_ttl: Duration,
+    pub dedup_retention: Duration,
+    pub status_pg_lookup_concurrency: usize,
+    pub status_negative_cache_ttl: Duration,
+    pub status_negative_cache_max_entries: usize,
+    pub drain_timeout: Duration,
+}
+
+impl Default for EngineRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            max_in_flight_kafka_publishes: 2048,
+            idempotency_ttl: Duration::from_secs(60),
+            idempotency_max_entries: 65_536,
+            idempotency_max_per_student: 16,
+            event_index_ttl: Duration::from_secs(1800),
+            dedup_retention: Duration::from_secs(86_400),
+            status_pg_lookup_concurrency: 16,
+            status_negative_cache_ttl: Duration::from_secs(10),
+            status_negative_cache_max_entries: 65_536,
+            drain_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    pub evicted_event_index: usize,
+    pub evicted_idempotency: usize,
+    pub evicted_negative_status: usize,
+    pub pruned_dedup_ids: usize,
 }
 
 #[derive(Debug, Error)]
@@ -279,6 +324,13 @@ pub enum EngineError {
     NodeStandby,
     #[error("rule violation {code:?}: {detail}")]
     RuleViolation { code: RuleErrorCode, detail: String },
+    #[error("cannot export snapshot while gate={gate_state:?} and in_flight={in_flight}")]
+    SnapshotBlocked {
+        gate_state: GateState,
+        in_flight: usize,
+    },
+    #[error("service unavailable ({code}): {detail}")]
+    ServiceUnavailable { code: &'static str, detail: String },
     #[error("forbidden: {0}")]
     Forbidden(String),
     #[error("domain error: {0}")]
