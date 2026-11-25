@@ -183,11 +183,15 @@ impl IdempotencyCache {
             list.retain(|entry| entry.expires_at > now);
             let removed_expired = before.saturating_sub(list.len());
             if removed_expired > 0 {
-                let _ =
-                    self.total_entries
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                            Some(cur.saturating_sub(removed_expired))
-                        });
+                let mut cur = self.total_entries.load(Ordering::Acquire);
+                while let Err(actual) = self.total_entries.compare_exchange_weak(
+                    cur,
+                    cur.saturating_sub(removed_expired),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    cur = actual;
+                }
             }
 
             if let Some(existing) = list.iter_mut().find(|entry| entry.key == key) {
