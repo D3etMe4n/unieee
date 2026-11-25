@@ -1116,3 +1116,92 @@ async fn end_to_end_engine_to_writer_revert_and_confirm_loop_preserves_zero_over
         HotPathEnrollmentState::Dropped
     );
 }
+
+#[derive(Default)]
+struct MockDeltaRevertPublisher {
+    fail: AtomicBool,
+    published: Mutex<Vec<RevertEvent>>,
+}
+
+#[async_trait]
+impl enrollment_writer::core::DeltaRevertPublisher for MockDeltaRevertPublisher {
+    async fn publish_revert_deltas(&self, events: &[RevertEvent]) -> Result<(), String> {
+        if self.fail.load(Ordering::Acquire) {
+            return Err("simulated Kafka delta publish failure".to_owned());
+        }
+        self.published.lock().await.extend(events.iter().cloned());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn writer_publishes_revert_deltas_and_caches_event_statuses_on_confirm_and_reject() {
+    let repo = Arc::new(FakePgWriterRepository::default());
+    let redis = Arc::new(MockRedisWriterSink::default());
+    let dlq = Arc::new(MockDlqPublisher::default());
+    let delta_pub = Arc::new(MockDeltaRevertPublisher::default());
+    let proc = make_processor(Arc::clone(&repo), Arc::clone(&redis), Arc::clone(&dlq))
+        .with_delta_publisher(
+            Arc::clone(&delta_pub) as Arc<dyn enrollment_writer::core::DeltaRevertPublisher>
+        );
+
+    let term = TermId::new_v4();
+    let c_ok = CourseId::new_v4();
+    let c_full = CourseId::new_v4();
+    let s1 = StudentId::new_v4();
+    let s2 = StudentId::new_v4();
+    repo.insert_section(SectionId::new(901), term, c_ok, "CS901", 10, 0, "OPEN")
+        .await;
+    repo.insert_section(SectionId::new(902), term, c_full, "CS902", 1, 1, "OPEN")
+        .await;
+
+    let c1 = make_cmd(term, s1, 901, c_ok, EnrollmentAction::Register, 1);
+    let c2 = make_cmd(term, s2, 902, c_full, EnrollmentAction::Register, 1);
+    let report = proc
+        .process_commands(&[c1.clone(), c2.clone()], Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(report.confirmed_count, 1);
+    assert_eq!(report.rejected_count, 1);
+    assert_eq!(report.outbox_marked_published, 1);
+
+    // Confirmed event status cached with Status = Confirmed
+    let batches = redis.confirmed_batches.lock().await;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].event_statuses.len(), 1);
+    assert_eq!(batches[0].event_statuses[0].event_id, c1.event_id);
+    assert_eq!(
+        batches[0].event_statuses[0].status,
+        HotPathEnrollmentState::Confirmed
+    );
+    assert_eq!(batches[0].event_status_ttl_secs, 3600);
+
+    // Rejected event published BOTH to Redis Pub/Sub AND Kafka unieee.enrollment.deltas
+    let deltas = delta_pub.published.lock().await;
+    assert_eq!(deltas.len(), 1);
+    assert_eq!(deltas[0].event_id, c2.event_id);
+    drop(deltas);
+    drop(batches);
+
+    // Simulate Kafka delta failure during immediate reject -> outbox remains unpublished -> sweep retries BOTH Redis & Kafka!
+    delta_pub.fail.store(true, Ordering::Release);
+    let c3 = make_cmd(
+        term,
+        StudentId::new_v4(),
+        902,
+        c_full,
+        EnrollmentAction::Register,
+        1,
+    );
+    let rep2 = proc
+        .process_commands(std::slice::from_ref(&c3), Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(rep2.outbox_marked_published, 0);
+    assert!(proc.sweep_outbox_once(50).await.is_err());
+
+    delta_pub.fail.store(false, Ordering::Release);
+    let swept = proc.sweep_outbox_once(50).await.unwrap();
+    assert_eq!(swept, 1);
+    assert_eq!(delta_pub.published.lock().await.len(), 2);
+}
