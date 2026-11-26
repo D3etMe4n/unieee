@@ -234,6 +234,25 @@ pub struct EnrollmentAccepted {
     pub accepted_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreloadSummarySnapshot {
+    pub ready: bool,
+    pub state: &'static str,
+    pub role: &'static str,
+    pub gate_state: GateState,
+    pub term_id: TermId,
+    pub term_code: String,
+    pub epoch: u64,
+    pub checkpoint_seq: i64,
+    pub section_count: usize,
+    pub student_count: usize,
+    pub total_max_capacity: i64,
+    pub total_enrolled_seats: i64,
+    pub total_available_seats: i64,
+    pub seat_checksum_sha256: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevertOutcome {
     Applied,

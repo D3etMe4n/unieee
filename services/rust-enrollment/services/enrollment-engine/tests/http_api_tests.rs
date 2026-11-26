@@ -241,6 +241,24 @@ async fn http_api_covers_register_drop_status_idor_healthz_readyz_and_promote() 
     )
     .await;
 
+    let not_ready_summary = app
+        .clone()
+        .oneshot(
+            Request::get("/internal/preload-summary")
+                .header("x-internal-ops-token", "ops-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(
+        not_ready_summary,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "ENGINE_NOT_READY",
+        "/internal/preload-summary",
+    )
+    .await;
+
     // 3. Hydrate as STANDBY -> /readyz = 200, writes rejected 503 NODE_STANDBY until /internal/promote
     engine
         .hydrate_from_dataset(dataset, NodeRole::Standby)
@@ -299,6 +317,53 @@ async fn http_api_covers_register_drop_status_idor_healthz_readyz_and_promote() 
         serde_json::from_slice(&promote.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(prom_body["role"], "ACTIVE");
     assert_eq!(prom_body["epoch"], 2);
+
+    let bad_summary = app
+        .clone()
+        .oneshot(
+            Request::get("/internal/preload-summary")
+                .header("x-internal-ops-token", "wrong")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(
+        bad_summary,
+        StatusCode::FORBIDDEN,
+        "FORBIDDEN",
+        "/internal/preload-summary",
+    )
+    .await;
+
+    let summary_resp = app
+        .clone()
+        .oneshot(
+            Request::get("/internal/preload-summary")
+                .header("x-internal-ops-token", "ops-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary_resp.status(), StatusCode::OK);
+    let summary_body: serde_json::Value =
+        serde_json::from_slice(&summary_resp.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(summary_body["ready"], true);
+    assert_eq!(summary_body["role"], "ACTIVE");
+    assert_eq!(summary_body["sectionCount"], 1);
+    assert_eq!(summary_body["totalMaxCapacity"], 2);
+    assert_eq!(summary_body["totalEnrolledSeats"], 0);
+    assert_eq!(summary_body["totalAvailableSeats"], 2);
+    assert_eq!(
+        summary_body["seatChecksumSha256"].as_str().map(str::len),
+        Some(64)
+    );
+    assert_eq!(
+        summary_body["seatChecksumSha256"],
+        serde_json::json!(enrollment_engine::core::snapshot::sha256_hex(b"701:2:0\n"))
+    );
 
     // Non-student role forbidden on register & drop (403 RFC 9457)
     let lec_reg = app

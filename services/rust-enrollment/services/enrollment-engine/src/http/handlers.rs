@@ -1,4 +1,7 @@
-use crate::core::{AuthError, EngineReadiness, EnrollmentEngine, OidcJwtVerifier, VerifiedClaims};
+use crate::core::{
+    AuthError, EngineReadiness, EnrollmentEngine, OidcJwtVerifier, PreloadSummarySnapshot,
+    VerifiedClaims,
+};
 use crate::http::dto::{
     DropRequest, EnrollmentAcceptedResponse, EnrollmentStatusResponse, HealthResponse,
     PromoteResponse, ReadinessResponse, RegisterRequest,
@@ -232,6 +235,41 @@ pub async fn promote_handler(
     headers: HeaderMap,
 ) -> Result<Json<PromoteResponse>, ApiError> {
     let instance = uri.path();
+    verify_internal_ops_token(&state, &headers, instance)?;
+
+    let next_epoch = state.engine.promote_to_active();
+    Ok(Json(PromoteResponse {
+        role: state.engine.role().as_str(),
+        epoch: next_epoch,
+    }))
+}
+
+pub async fn preload_summary_handler(
+    State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Json<PreloadSummarySnapshot>, ApiError> {
+    let instance = uri.path();
+    verify_internal_ops_token(&state, &headers, instance)?;
+
+    let readiness = state.engine.readiness();
+    if readiness != EngineReadiness::Ready {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ENGINE_NOT_READY",
+            format!("Engine is not ready (state={})", readiness.as_str()),
+        )
+        .with_instance(instance));
+    }
+
+    Ok(Json(state.engine.preload_summary()))
+}
+
+fn verify_internal_ops_token(
+    state: &AppState,
+    headers: &HeaderMap,
+    instance: &str,
+) -> Result<(), ApiError> {
     if let Some(expected_token) = state.internal_ops_token.as_deref() {
         let provided = headers
             .get("x-internal-ops-token")
@@ -246,12 +284,7 @@ pub async fn promote_handler(
             .with_instance(instance));
         }
     }
-
-    let next_epoch = state.engine.promote_to_active();
-    Ok(Json(PromoteResponse {
-        role: state.engine.role().as_str(),
-        epoch: next_epoch,
-    }))
+    Ok(())
 }
 
 pub async fn fallback_not_found(uri: Uri) -> ApiError {
