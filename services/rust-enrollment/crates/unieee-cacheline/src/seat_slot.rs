@@ -13,6 +13,15 @@ pub enum SectionSlotState {
 }
 
 impl SectionSlotState {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Open => "OPEN",
+            Self::Frozen => "FROZEN",
+            Self::Closed => "CLOSED",
+        }
+    }
+
     pub fn from_u8(raw: u8) -> Result<Self, SeatOpError> {
         match raw {
             0 => Ok(Self::Open),

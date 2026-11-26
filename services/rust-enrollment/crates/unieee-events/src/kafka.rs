@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use unieee_domain::{
-    CourseId, EnrollmentAction, EventId, SectionId, SectionStatus, StudentId, TermId,
+    CourseId, EnrollmentAction, EventId, RuleErrorCode, SectionId, SectionStatus, StudentId, TermId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,5 +274,148 @@ impl VersionedEvent for EnrollmentDeltaEvent {
             Self::Revert(e) => e.schema_version,
             Self::GateControl(e) => e.schema_version,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum EnrollmentOutcomeStatus {
+    Confirmed,
+    Reverted,
+}
+
+impl EnrollmentOutcomeStatus {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Confirmed => "CONFIRMED",
+            Self::Reverted => "REVERTED",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnrollmentOutcomeEvent {
+    pub schema_version: u16,
+    pub event_id: EventId,
+    pub term_id: TermId,
+    pub student_id: StudentId,
+    pub section_id: SectionId,
+    pub course_id: CourseId,
+    pub action: EnrollmentAction,
+    pub status: EnrollmentOutcomeStatus,
+    pub reason_code: Option<RuleErrorCode>,
+    pub reason_detail: Option<String>,
+    pub engine_epoch: u64,
+    pub processed_at: DateTime<Utc>,
+}
+
+impl EnrollmentOutcomeEvent {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn confirmed(
+        event_id: EventId,
+        term_id: TermId,
+        student_id: StudentId,
+        section_id: SectionId,
+        course_id: CourseId,
+        action: EnrollmentAction,
+        engine_epoch: u64,
+        processed_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            schema_version: EVENT_SCHEMA_VERSION_V1,
+            event_id,
+            term_id,
+            student_id,
+            section_id,
+            course_id,
+            action,
+            status: EnrollmentOutcomeStatus::Confirmed,
+            reason_code: None,
+            reason_detail: None,
+            engine_epoch,
+            processed_at,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn reverted(
+        event_id: EventId,
+        term_id: TermId,
+        student_id: StudentId,
+        section_id: SectionId,
+        course_id: CourseId,
+        action: EnrollmentAction,
+        reason_code: RuleErrorCode,
+        reason_detail: impl Into<String>,
+        engine_epoch: u64,
+        processed_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            schema_version: EVENT_SCHEMA_VERSION_V1,
+            event_id,
+            term_id,
+            student_id,
+            section_id,
+            course_id,
+            action,
+            status: EnrollmentOutcomeStatus::Reverted,
+            reason_code: Some(reason_code),
+            reason_detail: Some(reason_detail.into()),
+            engine_epoch,
+            processed_at,
+        }
+    }
+
+    #[must_use]
+    pub fn from_revert(revert: &RevertEvent) -> Self {
+        Self {
+            schema_version: EVENT_SCHEMA_VERSION_V1,
+            event_id: revert.event_id,
+            term_id: revert.term_id,
+            student_id: revert.student_id,
+            section_id: revert.section_id,
+            course_id: revert.course_id,
+            action: revert.action,
+            status: EnrollmentOutcomeStatus::Reverted,
+            reason_code: Some(revert.reason_code),
+            reason_detail: Some(revert.reason_detail.clone()),
+            engine_epoch: revert.engine_epoch,
+            processed_at: revert.reverted_at,
+        }
+    }
+
+    #[must_use]
+    pub fn to_revert_event(&self) -> Option<RevertEvent> {
+        if self.status != EnrollmentOutcomeStatus::Reverted {
+            return None;
+        }
+        Some(RevertEvent::new(
+            self.event_id,
+            self.term_id,
+            self.student_id,
+            self.section_id,
+            self.course_id,
+            self.action,
+            self.reason_code
+                .unwrap_or(RuleErrorCode::DatabaseConstraintViolation),
+            self.reason_detail.as_deref().unwrap_or(""),
+            self.engine_epoch,
+            self.processed_at,
+        ))
+    }
+
+    #[must_use]
+    pub fn partition_key(&self) -> String {
+        self.student_id.to_string()
+    }
+}
+
+impl VersionedEvent for EnrollmentOutcomeEvent {
+    fn schema_version(&self) -> u16 {
+        self.schema_version
     }
 }
