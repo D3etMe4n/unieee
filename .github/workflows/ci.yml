@@ -37,7 +37,7 @@ jobs:
 
       - name: Validate shell script syntax
         run: |
-          bash -n scripts/unieee.sh scripts/lib/*.sh tests/e2e/run-e2e.sh
+          bash -n scripts/unieee.sh scripts/lib/*.sh tests/e2e/run-e2e.sh tests/load/run-benchmarks.sh
           sh -n infra/pgbouncer/entrypoint.sh infra/redis/entrypoint-sentinel.sh infra/letsencrypt/entrypoint.sh infra/reverse-proxy/10-detect-resolver.envsh infra/reverse-proxy/20-enrollment-healthcheck.sh
 
       - name: Validate Keycloak realm & Nginx hardening configuration
