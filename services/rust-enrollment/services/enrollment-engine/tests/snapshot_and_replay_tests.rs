@@ -486,8 +486,9 @@ async fn kafka_replay_handles_revert_gate_control_and_zero_gap_resume_offsets() 
                 4,
                 now,
             )));
-        batch.deltas.push(EnrollmentDeltaEvent::Revert(
-            unieee_events::RevertEvent::new(
+        batch
+            .outcomes
+            .push(unieee_events::EnrollmentOutcomeEvent::reverted(
                 ev_reg,
                 term_id,
                 sid,
@@ -498,8 +499,7 @@ async fn kafka_replay_handles_revert_gate_control_and_zero_gap_resume_offsets() 
                 "rejected in PG",
                 4,
                 now,
-            ),
-        ));
+            ));
         batch.commands.push(EnrollmentCommandEvent::new(
             ev_reg,
             term_id,

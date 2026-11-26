@@ -1195,7 +1195,7 @@ async fn covers_config_error_branches_api_errors_and_redis_kafka_adapter_helpers
     let _ = k_tx.send(true);
     let _ = tokio::time::timeout(std::time::Duration::from_millis(300), k_handle).await;
 
-    // Cover Revert & SeatTentative dispatchers + fast-fail ECONNREFUSED on Redis & Postgres adapters
+    // Cover ignored Redis Pub/Sub Revert & SeatTentative + fast-fail ECONNREFUSED on Redis & Postgres adapters
     let revert_json = encode_json(&unieee_events::RevertEvent::new(
         unieee_domain::EventId::new_v7(),
         term_id,
@@ -1215,6 +1215,26 @@ async fn covers_config_error_branches_api_errors_and_redis_kafka_adapter_helpers
         &revert_json,
     )
     .await;
+    let revert_outcome_json = encode_json(&unieee_events::EnrollmentOutcomeEvent::reverted(
+        unieee_domain::EventId::new_v7(),
+        term_id,
+        student_id,
+        SectionId::new(42),
+        course_id,
+        EnrollmentAction::Register,
+        unieee_domain::RuleErrorCode::DatabaseConstraintViolation,
+        "test",
+        1,
+        now,
+    ))
+    .unwrap();
+    enrollment_engine::adapters::kafka::decode_and_apply_kafka_message_async(
+        &engine,
+        unieee_events::KAFKA_TOPIC_ENROLLMENT_OUTCOMES,
+        revert_outcome_json.as_bytes(),
+    )
+    .await
+    .unwrap();
     let tent_json = encode_json(&SeatTentativeEvent::new(
         term_id,
         SectionId::new(42),
@@ -1514,8 +1534,9 @@ async fn adapters_pure_helpers_and_dispatchers_work_deterministically() {
     dispatch_pubsub_payload(&engine, REDIS_CHANNEL_GATE_CONTROL, &gate_json).await;
     assert_eq!(engine.gate_state(), GateState::Paused);
 
+    let conf_event_id = unieee_domain::EventId::new_v7();
     let conf_json = encode_json(&SeatConfirmedEvent::new(
-        unieee_domain::EventId::new_v7(),
+        conf_event_id,
         term_id,
         SectionId::new(42),
         student_id,
@@ -1525,7 +1546,34 @@ async fn adapters_pure_helpers_and_dispatchers_work_deterministically() {
         now,
     ))
     .unwrap();
+    // Redis Pub/Sub SeatConfirmed must be ignored by engine state machine
     dispatch_pubsub_payload(&engine, REDIS_CHANNEL_SEAT_CONFIRMED, &conf_json).await;
+
+    // Cover Kafka outcomes decoder (Confirmed & Reverted) + replay collection on outcomes topic
+    let outcome_ev = unieee_events::EnrollmentOutcomeEvent::confirmed(
+        conf_event_id,
+        term_id,
+        student_id,
+        SectionId::new(42),
+        course_id,
+        EnrollmentAction::Register,
+        engine.epoch(),
+        now,
+    );
+    let outcome_json = encode_json(&outcome_ev).unwrap();
+    enrollment_engine::adapters::kafka::decode_and_apply_kafka_message_async(
+        &engine,
+        unieee_events::KAFKA_TOPIC_ENROLLMENT_OUTCOMES,
+        outcome_json.as_bytes(),
+    )
+    .await
+    .unwrap();
+    decode_and_apply_kafka_message(
+        &engine,
+        unieee_events::KAFKA_TOPIC_ENROLLMENT_OUTCOMES,
+        outcome_json.as_bytes(),
+    )
+    .unwrap();
 
     // Cover EngineConfig::to_verifier_config / to_bootstrap_options, build_policy_from_fallback_rows, and Kafka replay helpers
     let mut cfg_env = HashMap::new();
@@ -1620,6 +1668,12 @@ async fn adapters_pure_helpers_and_dispatchers_work_deterministically() {
         &mut replay_batch,
     );
     collect_replay_payload(
+        unieee_events::KAFKA_TOPIC_ENROLLMENT_OUTCOMES,
+        outcome_json.as_bytes(),
+        term_id,
+        &mut replay_batch,
+    );
+    collect_replay_payload(
         unieee_events::KAFKA_TOPIC_ENROLLMENT_COMMANDS,
         b"{bad",
         term_id,
@@ -1627,6 +1681,7 @@ async fn adapters_pure_helpers_and_dispatchers_work_deterministically() {
     );
     assert_eq!(replay_batch.commands.len(), 1);
     assert_eq!(replay_batch.deltas.len(), 1);
+    assert_eq!(replay_batch.outcomes.len(), 1);
 }
 
 struct MockStatusCache {
@@ -2136,4 +2191,320 @@ async fn http_hardening_covers_backpressure_503_idempotency_key_and_3tier_status
     .unwrap();
     assert_eq!(tpl.count(), 1);
     assert!(enrollment_engine::adapters::redis_io::decode_event_status_payload("{bad").is_err());
+}
+
+#[tokio::test]
+async fn http_api_hotpath_read_endpoints_seats_and_me_enforce_rbac_idor_and_standby_reads() {
+    use enrollment_engine::http::dto::{MyEnrollmentsResponse, SectionSeatResponse};
+
+    let now = Utc::now();
+    let term_id = TermId::new_v4();
+    let c1 = CourseId::new_v4();
+    let c2 = CourseId::new_v4();
+    let s1_id = StudentId::new_v4();
+    let s2_id = StudentId::new_v4();
+
+    let sec1 = make_section(term_id, 801, c1, "CS801", 3, 20, 4, 1, 1, 2);
+    let sec2 = make_section(term_id, 802, c2, "CS802", 4, 15, 0, 3, 1, 2);
+    let dataset = make_dataset(
+        term_id,
+        vec![sec1, sec2],
+        Vec::new(),
+        vec![
+            make_student(s1_id, "SV801", Some("sub-r1"), "K24", "CSE"),
+            make_student(s2_id, "SV802", Some("sub-r2"), "K24", "CSE"),
+        ],
+        now,
+    );
+
+    let keypair = RsaTestKeypair::generate("read-k1");
+    let fetcher = Arc::new(MockJwksFetcher::with_ok(
+        serde_json::json!({ "keys": [keypair.jwk_json] }).to_string(),
+    ));
+    let verifier = Arc::new(OidcJwtVerifier::new(
+        fetcher,
+        OidcVerifierConfig {
+            issuers: vec!["https://idp.test".to_owned()],
+            audience: Some("unieee-web".to_owned()),
+            cache_ttl_secs: 30,
+            max_cached_tokens_per_shard: 64,
+        },
+    ));
+
+    let active_engine = Arc::new(EnrollmentEngine::new_awaiting_preload(
+        NodeRole::Active,
+        Arc::new(MockCommandPublisher::default()) as Arc<dyn CommandPublisher>,
+        SeatTentativeCoalescerHandle::disconnected(),
+        Arc::new(MockRevertDedupStore::default()) as Arc<dyn RevertDedupStore>,
+    ));
+    active_engine
+        .hydrate_from_dataset(dataset.clone(), NodeRole::Active)
+        .unwrap();
+    active_engine.set_readiness(EngineReadiness::Ready);
+
+    let standby_engine = Arc::new(EnrollmentEngine::new_awaiting_preload(
+        NodeRole::Standby,
+        Arc::new(MockCommandPublisher::default()) as Arc<dyn CommandPublisher>,
+        SeatTentativeCoalescerHandle::disconnected(),
+        Arc::new(MockRevertDedupStore::default()) as Arc<dyn RevertDedupStore>,
+    ));
+    standby_engine
+        .hydrate_from_dataset(dataset, NodeRole::Standby)
+        .unwrap();
+    standby_engine.set_readiness(EngineReadiness::Ready);
+
+    let accepted = active_engine
+        .register(s1_id, SectionId::new(801), EnrollmentAction::Register, now)
+        .await
+        .unwrap();
+    let outcome = unieee_events::EnrollmentOutcomeEvent::confirmed(
+        accepted.event_id,
+        term_id,
+        s1_id,
+        SectionId::new(801),
+        c1,
+        EnrollmentAction::Register,
+        active_engine.epoch(),
+        now,
+    );
+    active_engine.apply_outcome_event(&outcome).await;
+    standby_engine.apply_replayed_command(&unieee_events::EnrollmentCommandEvent::new(
+        accepted.event_id,
+        term_id,
+        s1_id,
+        SectionId::new(801),
+        c1,
+        EnrollmentAction::Register,
+        active_engine.epoch(),
+        now,
+    ));
+    standby_engine.apply_outcome_event(&outcome).await;
+
+    let active_app = build_router(AppState {
+        engine: Arc::clone(&active_engine),
+        verifier: Arc::clone(&verifier),
+        internal_ops_token: None,
+    });
+    let standby_app = build_router(AppState {
+        engine: Arc::clone(&standby_engine),
+        verifier: Arc::clone(&verifier),
+        internal_ops_token: None,
+    });
+
+    let exp = now.timestamp() + 300;
+    let tok_s1 = keypair.sign_jwt(
+        "sub-r1",
+        "https://idp.test",
+        "unieee-web",
+        exp,
+        &["STUDENT"],
+        None,
+    );
+    let tok_lecturer = keypair.sign_jwt(
+        "sub-lec",
+        "https://idp.test",
+        "unieee-web",
+        exp,
+        &["LECTURER"],
+        None,
+    );
+    let tok_admin = keypair.sign_jwt(
+        "sub-adm",
+        "https://idp.test",
+        "unieee-web",
+        exp,
+        &["ACADEMIC_ADMIN"],
+        None,
+    );
+    let tok_guest = keypair.sign_jwt(
+        "sub-guest",
+        "https://idp.test",
+        "unieee-web",
+        exp,
+        &["GUEST"],
+        None,
+    );
+
+    // 1. /seats works on BOTH ACTIVE and STANDBY for STUDENT, LECTURER, and ACADEMIC_ADMIN
+    for (app_ref, role_tok) in [
+        (&standby_app, &tok_s1),
+        (&standby_app, &tok_lecturer),
+        (&active_app, &tok_admin),
+    ] {
+        let resp = app_ref
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/enrollments/seats?termId={term_id}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {role_tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let seats: Vec<SectionSeatResponse> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(seats.len(), 2);
+        assert_eq!(seats[0].section_id, SectionId::new(801));
+        assert_eq!(seats[0].available_seats, 15);
+        assert_eq!(seats[0].max_capacity, 20);
+        assert_eq!(seats[0].status, SectionStatus::Open);
+    }
+
+    // 2. /seats auth/validation/error matrix (401 without JWT, 403 guest, 400 missing/bad termId, 404 wrong term)
+    let no_auth = standby_app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/enrollments/seats?termId={term_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(
+        no_auth,
+        StatusCode::UNAUTHORIZED,
+        "UNAUTHORIZED",
+        "/api/v1/enrollments/seats",
+    )
+    .await;
+
+    let guest_seats = standby_app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/enrollments/seats?termId={term_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {tok_guest}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(
+        guest_seats,
+        StatusCode::FORBIDDEN,
+        "FORBIDDEN",
+        "/api/v1/enrollments/seats",
+    )
+    .await;
+
+    let missing_term = standby_app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/enrollments/seats")
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(
+        missing_term,
+        StatusCode::BAD_REQUEST,
+        "INVALID_TERM_ID",
+        "/api/v1/enrollments/seats",
+    )
+    .await;
+
+    let bad_term = standby_app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/enrollments/seats?termId=not-a-uuid")
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(
+        bad_term,
+        StatusCode::BAD_REQUEST,
+        "INVALID_TERM_ID",
+        "/api/v1/enrollments/seats",
+    )
+    .await;
+
+    let unknown_term = standby_app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/enrollments/seats?termId={}",
+                TermId::new_v4()
+            ))
+            .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(
+        unknown_term,
+        StatusCode::NOT_FOUND,
+        "TERM_NOT_FOUND",
+        "/api/v1/enrollments/seats",
+    )
+    .await;
+
+    // 3. /me works on STANDBY & ACTIVE for STUDENT, blocks non-STUDENT, and ignores query studentId (anti-IDOR)
+    for app_ref in [&standby_app, &active_app] {
+        let me_resp = app_ref
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/enrollments/me?termId={term_id}&studentId={s2_id}"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(me_resp.status(), StatusCode::OK);
+        let bytes = me_resp.into_body().collect().await.unwrap().to_bytes();
+        let me: MyEnrollmentsResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(me.term_id, term_id);
+        assert_eq!(me.student_id, s1_id);
+        assert_eq!(me.current_credits, 3);
+        assert_eq!(me.items.len(), 1);
+        assert_eq!(me.items[0].section_id, SectionId::new(801));
+        assert_eq!(me.items[0].status, HotPathEnrollmentState::Confirmed);
+        assert_eq!(me.items[0].last_event_id, accepted.event_id);
+    }
+
+    let lec_me = standby_app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/enrollments/me?termId={term_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {tok_lecturer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(
+        lec_me,
+        StatusCode::FORBIDDEN,
+        "FORBIDDEN",
+        "/api/v1/enrollments/me",
+    )
+    .await;
+
+    // 4. Syncing node returns 503 ENGINE_NOT_READY on both /seats and /me
+    standby_engine.set_readiness(EngineReadiness::Syncing);
+    let syncing_seats = standby_app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/enrollments/seats?termId={term_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(
+        syncing_seats,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "ENGINE_NOT_READY",
+        "/api/v1/enrollments/seats",
+    )
+    .await;
 }

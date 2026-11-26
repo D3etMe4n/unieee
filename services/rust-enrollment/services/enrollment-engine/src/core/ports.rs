@@ -2,7 +2,9 @@ use crate::core::models::{EventStatusRecord, PreloadDataset, ReplayEventRecord};
 use async_trait::async_trait;
 use thiserror::Error;
 use unieee_domain::{EventId, TermId};
-use unieee_events::{EnrollmentCommandEvent, EnrollmentDeltaEvent, SeatTentativeEvent};
+use unieee_events::{
+    EnrollmentCommandEvent, EnrollmentDeltaEvent, EnrollmentOutcomeEvent, SeatTentativeEvent,
+};
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PublishError {
@@ -25,6 +27,7 @@ pub struct KafkaPartitionOffset {
 pub struct KafkaReplayBatch {
     pub commands: Vec<EnrollmentCommandEvent>,
     pub deltas: Vec<EnrollmentDeltaEvent>,
+    pub outcomes: Vec<EnrollmentOutcomeEvent>,
     pub high_watermarks: Vec<KafkaPartitionOffset>,
 }
 
