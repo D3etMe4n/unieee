@@ -1,5 +1,6 @@
 package vn.edu.unieee.registration.internal.service.query;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -13,8 +14,12 @@ import vn.edu.unieee.account.AccountFacade;
 import vn.edu.unieee.account.dto.LecturerProfileResponse;
 import vn.edu.unieee.account.dto.StudentProfileResponse;
 import vn.edu.unieee.catalog.CatalogFacade;
+import vn.edu.unieee.catalog.dto.AcademicTermResponse;
 import vn.edu.unieee.catalog.dto.CourseSectionDetailResponse;
 import vn.edu.unieee.catalog.dto.CourseSectionSummaryResponse;
+import vn.edu.unieee.common.cache.ReadCacheProperties;
+import vn.edu.unieee.common.cache.ReadThroughCache;
+import vn.edu.unieee.common.cache.RedisCacheKeys;
 import vn.edu.unieee.common.exception.AccessDeniedBusinessException;
 import vn.edu.unieee.common.security.CurrentUser;
 import vn.edu.unieee.common.security.SecurityContextHelper;
@@ -35,18 +40,35 @@ import vn.edu.unieee.registration.internal.repository.EnrollmentRepository.Secti
 @RequiredArgsConstructor
 public class EnrollmentQueryService {
 
+    private static final String REGISTRATION_OPEN_STATUS = "REGISTRATION_OPEN";
+
     private final EnrollmentRepository enrollmentRepository;
     private final EnrollmentEventRepository eventRepository;
     private final CatalogFacade catalogFacade;
     private final AccountFacade accountFacade;
     private final RegistrationMapper mapper;
+    private final ReadThroughCache readThroughCache;
+    private final ReadCacheProperties readCacheProperties;
 
     @Transactional(readOnly = true)
     public List<EnrollmentResponse> getStudentTimetable(UUID termId) {
         if (!catalogFacade.existsTerm(termId)) {
             throw new RegistrationNotFoundException("ACADEMIC_TERM_NOT_FOUND", "Academic term not found: " + termId);
         }
+        AcademicTermResponse term = catalogFacade.getTermById(termId);
         StudentProfileResponse student = accountFacade.getMyStudentProfile();
+        Duration ttl = REGISTRATION_OPEN_STATUS.equals(term.status())
+            ? readCacheProperties.getTimetableOpenTtl()
+            : readCacheProperties.getTimetableClosedTtl();
+        return readThroughCache.getOrLoadList(
+            RedisCacheKeys.studentTimetable(student.id(), termId),
+            EnrollmentResponse.class,
+            ttl,
+            () -> loadStudentTimetableFromDb(student, termId)
+        );
+    }
+
+    private List<EnrollmentResponse> loadStudentTimetableFromDb(StudentProfileResponse student, UUID termId) {
         List<Enrollment> enrollments = enrollmentRepository
             .findByStudentIdAndTermIdAndStatusOrderByCreatedAtAsc(student.id(), termId, EnrollmentStatus.CONFIRMED);
         if (enrollments.isEmpty()) {
@@ -95,7 +117,7 @@ public class EnrollmentQueryService {
         if (!catalogFacade.existsTerm(termId)) {
             throw new RegistrationNotFoundException("ACADEMIC_TERM_NOT_FOUND", "Academic term not found: " + termId);
         }
-        List<CourseSectionSummaryResponse> sections = catalogFacade.listSectionsByTerm(termId);
+        List<CourseSectionSummaryResponse> sections = catalogFacade.listSectionsByTermAuthoritative(termId);
         Map<Long, Long> actualCounts = enrollmentRepository.countConfirmedBySectionForTerm(termId).stream()
             .collect(Collectors.toMap(SectionCountProjection::getSectionId, SectionCountProjection::getConfirmedCount));
 

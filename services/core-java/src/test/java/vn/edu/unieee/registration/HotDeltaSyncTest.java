@@ -159,7 +159,7 @@ class HotDeltaSyncTest {
         verifyNoInteractions(catalogFacade, accountFacade);
 
         when(publisher.isEnabled()).thenReturn(true);
-        when(catalogFacade.listTerms()).thenReturn(List.of(
+        when(catalogFacade.listTermsAuthoritative()).thenReturn(List.of(
             new AcademicTermResponse(closedTermId, "2026-0", "Closed", LocalDate.now(), LocalDate.now(), "REGISTRATION_CLOSED"),
             new AcademicTermResponse(openTermId, "2026-1", "Open", LocalDate.now(), LocalDate.now(), "REGISTRATION_OPEN")
         ));
@@ -183,7 +183,7 @@ class HotDeltaSyncTest {
             assertThat(p.academicStatus()).isEqualTo("ACTIVE");
         });
 
-        when(catalogFacade.getTermById(closedTermId)).thenReturn(
+        when(catalogFacade.getTermByIdAuthoritative(closedTermId)).thenReturn(
             new AcademicTermResponse(closedTermId, "2026-0", "Closed", LocalDate.now(), LocalDate.now(), "SECTION_FINALIZED")
         );
         listener.onCourseSectionCapacityUpdated(
@@ -191,10 +191,10 @@ class HotDeltaSyncTest {
         );
         verify(publisher, never()).publishSectionCapacityDelta(any());
 
-        when(catalogFacade.getTermById(openTermId)).thenReturn(
+        when(catalogFacade.getTermByIdAuthoritative(openTermId)).thenReturn(
             new AcademicTermResponse(openTermId, "2026-1", "Open", LocalDate.now(), LocalDate.now(), "REGISTRATION_OPEN")
         );
-        when(catalogFacade.getSectionById(701L)).thenReturn(new CourseSectionDetailResponse(
+        when(catalogFacade.getSectionByIdAuthoritative(701L)).thenReturn(new CourseSectionDetailResponse(
             701L, openTermId, UUID.randomUUID(), "CS101", "Intro CS", 3, null,
             "SEC-1", 1, 80, 10, 70, "0".repeat(640), "OPEN", null, List.of()
         ));
@@ -228,7 +228,7 @@ class HotDeltaSyncTest {
         UUID termId = UUID.randomUUID();
         UUID courseId = UUID.randomUUID();
         when(catalogFacade.existsTerm(termId)).thenReturn(true);
-        when(catalogFacade.listSectionsByTerm(termId)).thenReturn(List.of(
+        when(catalogFacade.listSectionsByTermAuthoritative(termId)).thenReturn(List.of(
             new CourseSectionSummaryResponse(101L, termId, courseId, "CS101", "Intro", 3, null, "SEC-101", 1, 60, 15, 45, "OPEN")
         ));
 

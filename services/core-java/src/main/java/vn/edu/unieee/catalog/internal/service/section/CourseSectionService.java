@@ -14,8 +14,11 @@ import vn.edu.unieee.catalog.dto.CourseSectionSummaryResponse;
 import vn.edu.unieee.catalog.dto.CreateCourseSectionRequest;
 import vn.edu.unieee.catalog.dto.ScheduleSlotRequest;
 import vn.edu.unieee.catalog.dto.UpdateCourseSectionRequest;
+import vn.edu.unieee.catalog.event.CatalogSectionChangedEvent;
 import vn.edu.unieee.catalog.event.CourseSectionCapacityUpdatedEvent;
+import vn.edu.unieee.catalog.event.CourseSectionScheduleUpdatedEvent;
 import vn.edu.unieee.catalog.event.CourseSectionStatusChangedEvent;
+import vn.edu.unieee.catalog.internal.cache.CatalogSectionSeatOverlay;
 import vn.edu.unieee.catalog.internal.domain.course.Course;
 import vn.edu.unieee.catalog.internal.domain.section.CourseSection;
 import vn.edu.unieee.catalog.internal.domain.section.CourseSection.ScheduleSlotInput;
@@ -27,6 +30,9 @@ import vn.edu.unieee.catalog.internal.mapper.CatalogMapper;
 import vn.edu.unieee.catalog.internal.repository.AcademicTermRepository;
 import vn.edu.unieee.catalog.internal.repository.CourseRepository;
 import vn.edu.unieee.catalog.internal.repository.CourseSectionRepository;
+import vn.edu.unieee.common.cache.ReadCacheProperties;
+import vn.edu.unieee.common.cache.ReadThroughCache;
+import vn.edu.unieee.common.cache.RedisCacheKeys;
 
 @Service
 @RequiredArgsConstructor
@@ -37,6 +43,9 @@ public class CourseSectionService {
     private final CourseRepository courseRepository;
     private final CatalogMapper mapper;
     private final ApplicationEventPublisher eventPublisher;
+    private final ReadThroughCache readThroughCache;
+    private final ReadCacheProperties readCacheProperties;
+    private final CatalogSectionSeatOverlay seatOverlay;
 
     @Transactional
     public CourseSectionDetailResponse createSection(CreateCourseSectionRequest request) {
@@ -74,11 +83,28 @@ public class CourseSectionService {
         }
 
         CourseSection saved = sectionRepository.saveAndFlush(section);
+        eventPublisher.publishEvent(new CatalogSectionChangedEvent(
+            saved.getId(),
+            saved.getTermId(),
+            false,
+            Instant.now()
+        ));
         return mapper.toSectionDetailResponse(saved);
     }
 
     @Transactional(readOnly = true)
     public CourseSectionDetailResponse getSectionById(Long sectionId) {
+        CourseSectionDetailResponse cached = readThroughCache.getOrLoad(
+            RedisCacheKeys.catalogSectionDetail(sectionId),
+            CourseSectionDetailResponse.class,
+            readCacheProperties.getSectionsStaticTtl(),
+            () -> mapper.toSectionDetailResponse(findWithDetailsOrThrow(sectionId))
+        );
+        return seatOverlay.overlayDetail(cached);
+    }
+
+    @Transactional(readOnly = true)
+    public CourseSectionDetailResponse getSectionByIdAuthoritative(Long sectionId) {
         return mapper.toSectionDetailResponse(findWithDetailsOrThrow(sectionId));
     }
 
@@ -87,9 +113,10 @@ public class CourseSectionService {
         if (sectionIds == null || sectionIds.isEmpty()) {
             return List.of();
         }
-        return sectionRepository.findWithDetailsByIdIn(sectionIds).stream()
+        List<CourseSectionSummaryResponse> raw = sectionRepository.findWithDetailsByIdIn(sectionIds).stream()
             .map(mapper::toSectionSummaryResponse)
             .toList();
+        return seatOverlay.overlaySummariesByIds(raw);
     }
 
     @Transactional(readOnly = true)
@@ -97,13 +124,25 @@ public class CourseSectionService {
         if (sectionIds == null || sectionIds.isEmpty()) {
             return List.of();
         }
-        return sectionRepository.findWithDetailsByIdIn(sectionIds).stream()
+        List<CourseSectionDetailResponse> raw = sectionRepository.findWithDetailsByIdIn(sectionIds).stream()
             .map(mapper::toSectionDetailResponse)
             .toList();
+        return seatOverlay.overlayDetails(raw);
     }
 
     @Transactional(readOnly = true)
     public List<CourseSectionSummaryResponse> listSectionsByTerm(UUID termId) {
+        List<CourseSectionSummaryResponse> staticList = readThroughCache.getOrLoadList(
+            RedisCacheKeys.catalogTermSections(termId),
+            CourseSectionSummaryResponse.class,
+            readCacheProperties.getSectionsStaticTtl(),
+            () -> listSectionsByTermAuthoritative(termId)
+        );
+        return seatOverlay.overlaySummaries(termId, staticList);
+    }
+
+    @Transactional(readOnly = true)
+    public List<CourseSectionSummaryResponse> listSectionsByTermAuthoritative(UUID termId) {
         return sectionRepository.findByTermIdOrderBySectionCodeAsc(termId).stream()
             .map(mapper::toSectionSummaryResponse)
             .toList();
@@ -122,10 +161,11 @@ public class CourseSectionService {
         CourseSection section = findWithDetailsOrThrow(sectionId);
         boolean capacityChanged = section.getMinCapacity() != request.minCapacity()
             || section.getMaxCapacity() != request.maxCapacity();
+        boolean scheduleUpdated = request.scheduleSlots() != null && !request.scheduleSlots().isEmpty();
 
         section.updateCapacity(request.minCapacity(), request.maxCapacity());
 
-        if (request.scheduleSlots() != null && !request.scheduleSlots().isEmpty()) {
+        if (scheduleUpdated) {
             section.replaceSchedules(toSlotInputs(request.scheduleSlots()));
         }
 
@@ -137,7 +177,7 @@ public class CourseSectionService {
                 section.getScheduleBitmaskHex()
             );
             section.assignLecturer(request.lecturerId());
-        } else if (section.getLecturerId() != null && request.scheduleSlots() != null && !request.scheduleSlots().isEmpty()) {
+        } else if (section.getLecturerId() != null && scheduleUpdated) {
             ensureLecturerHasNoConflict(
                 section.getTermId(),
                 section.getLecturerId(),
@@ -147,6 +187,7 @@ public class CourseSectionService {
         }
 
         CourseSection saved = sectionRepository.saveAndFlush(section);
+        Instant now = Instant.now();
         if (capacityChanged) {
             eventPublisher.publishEvent(new CourseSectionCapacityUpdatedEvent(
                 saved.getId(),
@@ -155,9 +196,22 @@ public class CourseSectionService {
                 saved.getMinCapacity(),
                 saved.getMaxCapacity(),
                 saved.getEnrolledCount(),
-                Instant.now()
+                now
             ));
         }
+        if (scheduleUpdated) {
+            eventPublisher.publishEvent(new CourseSectionScheduleUpdatedEvent(
+                saved.getId(),
+                saved.getTermId(),
+                now
+            ));
+        }
+        eventPublisher.publishEvent(new CatalogSectionChangedEvent(
+            saved.getId(),
+            saved.getTermId(),
+            true,
+            now
+        ));
         return mapper.toSectionDetailResponse(saved);
     }
 
@@ -217,6 +271,9 @@ public class CourseSectionService {
                 "Section " + sectionId + " has no remaining seats or is cancelled"
             );
         }
+        sectionRepository.findTermIdById(sectionId).ifPresent(termId ->
+            eventPublisher.publishEvent(new CatalogSectionChangedEvent(sectionId, termId, true, Instant.now()))
+        );
     }
 
     @Transactional
@@ -234,6 +291,9 @@ public class CourseSectionService {
                 "Section " + sectionId + " already has 0 enrolled students"
             );
         }
+        sectionRepository.findTermIdById(sectionId).ifPresent(termId ->
+            eventPublisher.publishEvent(new CatalogSectionChangedEvent(sectionId, termId, true, Instant.now()))
+        );
     }
 
     private void ensureLecturerHasNoConflict(

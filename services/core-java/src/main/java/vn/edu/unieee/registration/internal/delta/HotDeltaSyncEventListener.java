@@ -65,7 +65,7 @@ public class HotDeltaSyncEventListener {
         if (!hotDeltaPublisher.isEnabled()) {
             return;
         }
-        List<AcademicTermResponse> openTerms = catalogFacade.listTerms().stream()
+        List<AcademicTermResponse> openTerms = catalogFacade.listTermsAuthoritative().stream()
             .filter(term -> REGISTRATION_OPEN_STATUS.equals(term.status()))
             .toList();
         if (openTerms.isEmpty()) {
@@ -95,12 +95,12 @@ public class HotDeltaSyncEventListener {
         if (!hotDeltaPublisher.isEnabled()) {
             return;
         }
-        AcademicTermResponse term = catalogFacade.getTermById(termId);
+        AcademicTermResponse term = catalogFacade.getTermByIdAuthoritative(termId);
         if (!REGISTRATION_OPEN_STATUS.equals(term.status())) {
             return;
         }
 
-        CourseSectionDetailResponse section = catalogFacade.getSectionById(sectionId);
+        CourseSectionDetailResponse section = catalogFacade.getSectionByIdAuthoritative(sectionId);
         Instant effectiveAt = occurredAt == null ? Instant.now() : occurredAt;
         SectionCapacityDeltaPayload payload = SectionCapacityDeltaPayload.of(
             UuidV7Generator.generate(effectiveAt),

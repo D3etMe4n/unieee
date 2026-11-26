@@ -52,6 +52,11 @@ public class CatalogFacadeImpl implements CatalogFacade {
     }
 
     @Override
+    public AcademicTermResponse getTermByIdAuthoritative(UUID termId) {
+        return termService.getTermByIdAuthoritative(termId);
+    }
+
+    @Override
     public AcademicTermResponse getTermByCode(String code) {
         return termService.getTermByCode(code);
     }
@@ -59,6 +64,11 @@ public class CatalogFacadeImpl implements CatalogFacade {
     @Override
     public List<AcademicTermResponse> listTerms() {
         return termService.listTerms();
+    }
+
+    @Override
+    public List<AcademicTermResponse> listTermsAuthoritative() {
+        return termService.listTermsAuthoritative();
     }
 
     @Override
@@ -167,6 +177,11 @@ public class CatalogFacadeImpl implements CatalogFacade {
     }
 
     @Override
+    public CourseSectionDetailResponse getSectionByIdAuthoritative(Long sectionId) {
+        return sectionService.getSectionByIdAuthoritative(sectionId);
+    }
+
+    @Override
     public List<CourseSectionSummaryResponse> getSectionsByIds(Collection<Long> sectionIds) {
         return sectionService.getSectionsByIds(sectionIds);
     }
@@ -179,6 +194,11 @@ public class CatalogFacadeImpl implements CatalogFacade {
     @Override
     public List<CourseSectionSummaryResponse> listSectionsByTerm(UUID termId) {
         return sectionService.listSectionsByTerm(termId);
+    }
+
+    @Override
+    public List<CourseSectionSummaryResponse> listSectionsByTermAuthoritative(UUID termId) {
+        return sectionService.listSectionsByTermAuthoritative(termId);
     }
 
     @Override
