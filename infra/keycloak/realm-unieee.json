@@ -11,8 +11,8 @@
   "resetPasswordAllowed": true,
   "editUsernameAllowed": false,
   "sslRequired": "external",
-  "accessTokenLifespan": 900,
-  "ssoSessionIdleTimeout": 1800,
+  "accessTokenLifespan": 1800,
+  "ssoSessionIdleTimeout": 3600,
   "ssoSessionMaxLifespan": 36000,
   "roles": {
     "realm": [
@@ -164,6 +164,31 @@
           "view-realm"
         ]
       }
+    }
+  ],
+  "authenticationFlows": [
+    {
+      "alias": "unieee-first-broker-login-link-only",
+      "description": "Link-only First Broker Login flow: links external IdP logins only to pre-provisioned Academic Affairs accounts and rejects unknown users (no self-registration).",
+      "providerId": "basic-flow",
+      "topLevel": true,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticator": "idp-detect-existing-broker-user",
+          "authenticatorFlow": false,
+          "requirement": "REQUIRED",
+          "priority": 10,
+          "userSetupAllowed": false
+        },
+        {
+          "authenticator": "idp-auto-link",
+          "authenticatorFlow": false,
+          "requirement": "REQUIRED",
+          "priority": 20,
+          "userSetupAllowed": false
+        }
+      ]
     }
   ]
 }

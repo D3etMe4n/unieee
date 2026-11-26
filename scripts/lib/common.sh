@@ -35,21 +35,26 @@ load_env_file() {
     local env_file="$root_dir/.env"
     local example_file="$root_dir/.env.example"
 
+    if [ ! -f "$env_file" ] && [ ! -f "$example_file" ]; then
+        log_err "Neither .env nor .env.example found in $root_dir"
+        return 1
+    fi
+
+    if [ -f "$example_file" ]; then
+        set -a
+        # shellcheck disable=SC1090
+        . "$example_file"
+        set +a
+        ENV_FILE_ARG="$example_file"
+    fi
+
     if [ -f "$env_file" ]; then
         set -a
         # shellcheck disable=SC1090
         . "$env_file"
         set +a
         ENV_FILE_ARG="$env_file"
-    elif [ -f "$example_file" ]; then
-        log_warn ".env not found; falling back to .env.example (dev defaults)"
-        set -a
-        # shellcheck disable=SC1090
-        . "$example_file"
-        set +a
-        ENV_FILE_ARG="$example_file"
     else
-        log_err "Neither .env nor .env.example found in $root_dir"
-        return 1
+        log_warn ".env not found; falling back to .env.example (dev defaults)"
     fi
 }

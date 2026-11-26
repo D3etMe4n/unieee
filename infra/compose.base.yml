@@ -249,6 +249,7 @@ services:
         condition: service_started
     environment:
       UNIEEE_HTTPS_PORT: ${UNIEEE_HTTPS_PORT:-8443}
+      INTERNAL_OPS_TOKEN: ${INTERNAL_OPS_TOKEN:-}
       NGINX_ENVSUBST_FILTER: "^(NGINX_DNS_RESOLVER|UNIEEE_HTTPS_PORT)$$"
     ports:
       - "${UNIEEE_HTTP_PORT:-8080}:80"
@@ -258,6 +259,7 @@ services:
       - ./reverse-proxy/conf.d/default.conf.template:/etc/nginx/templates/default.conf.template:ro
       - ./reverse-proxy/snippets:/etc/nginx/snippets:ro
       - ./reverse-proxy/10-detect-resolver.envsh:/docker-entrypoint.d/10-detect-resolver.envsh:ro
+      - ./reverse-proxy/20-enrollment-healthcheck.sh:/docker-entrypoint.d/20-enrollment-healthcheck.sh:ro
       - ./reverse-proxy/certs:/etc/nginx/certs:ro
       - certbot_www:/var/www/certbot:ro
     networks:
@@ -298,6 +300,8 @@ services:
       KEYCLOAK_REALM: unieee
       KEYCLOAK_ADMIN_CLIENT_ID: unieee-admin-cli
       KEYCLOAK_ADMIN_CLIENT_SECRET: ${KEYCLOAK_ADMIN_CLIENT_SECRET:-unieee-admin-cli-dev-secret}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      UNIEEE_HOT_DELTA_KAFKA_ENABLED: ${UNIEEE_HOT_DELTA_KAFKA_ENABLED:-true}
       SERVER_PORT: 8080
     networks:
       - app

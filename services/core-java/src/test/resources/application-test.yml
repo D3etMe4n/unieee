@@ -12,6 +12,10 @@ spring:
       repositories:
         enabled: false
 
+  kafka:
+    admin:
+      auto-create: false
+
   ai:
     model:
       chat: none
@@ -39,6 +43,9 @@ unieee:
     cache:
       redis:
         enabled: false
+  hot-delta:
+    kafka:
+      enabled: false
   ai-advisor:
     redis-seat-cache:
       enabled: false

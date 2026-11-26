@@ -18,6 +18,7 @@ import vn.edu.unieee.registration.dto.EvaluatePolicyRequest;
 import vn.edu.unieee.registration.dto.PolicyEvaluationResponse;
 import vn.edu.unieee.registration.dto.PolicySnapshotResponse;
 import vn.edu.unieee.registration.dto.ReconciliationReportResponse;
+import vn.edu.unieee.registration.dto.RegistrationCacheWarmupResponse;
 import vn.edu.unieee.registration.dto.RegistrationWindowResponse;
 import vn.edu.unieee.registration.dto.SectionRosterEntryResponse;
 import vn.edu.unieee.registration.dto.StudentWishSurveyResponse;
@@ -28,6 +29,7 @@ import vn.edu.unieee.registration.dto.WindowEligibilityRequest;
 import vn.edu.unieee.registration.dto.WindowEligibilityResponse;
 import vn.edu.unieee.registration.dto.WishSurveyCampaignResponse;
 import vn.edu.unieee.registration.dto.WishSurveyDemandReportResponse;
+import vn.edu.unieee.registration.internal.cache.RegistrationSeatCacheWarmer;
 import vn.edu.unieee.registration.internal.service.override.AdminEnrollmentOverrideService;
 import vn.edu.unieee.registration.internal.service.policy.EnrollmentPolicyService;
 import vn.edu.unieee.registration.internal.service.policy.PolicySnapshotExporter;
@@ -47,6 +49,7 @@ public class RegistrationFacadeImpl implements RegistrationFacade {
     private final RegistrationWindowService windowService;
     private final EnrollmentPolicyService policyService;
     private final PolicySnapshotExporter policySnapshotExporter;
+    private final RegistrationSeatCacheWarmer seatCacheWarmer;
 
     @Override
     public EnrollmentResponse adminAdd(AdminEnrollmentAddRequest request) {
@@ -81,6 +84,11 @@ public class RegistrationFacadeImpl implements RegistrationFacade {
     @Override
     public ReconciliationReportResponse reconcileTerm(UUID termId) {
         return queryService.reconcileTerm(termId);
+    }
+
+    @Override
+    public RegistrationCacheWarmupResponse warmRegistrationCache(UUID termId) {
+        return seatCacheWarmer.warmTermSeats(termId);
     }
 
     @Override

@@ -2,8 +2,8 @@ use crate::core::coalescer::SeatTentativeCoalescerHandle;
 use crate::core::models::{
     ActiveEnrollment, BootstrapOptions, BootstrapReport, BootstrapSourceKind,
     CoursePrerequisiteEdge, DeltaOutcome, EngineError, EngineReadiness, EngineRuntimeOptions,
-    EnrollmentAccepted, EventStatusRecord, NodeRole, PreloadDataset, ReplayEventRecord,
-    RevertOutcome, SectionMeta, StudentState, SweepReport,
+    EnrollmentAccepted, EventStatusRecord, NodeRole, PreloadDataset, PreloadSummarySnapshot,
+    ReplayEventRecord, RevertOutcome, SectionMeta, StudentState, SweepReport,
 };
 use crate::core::ports::{
     CommandPublisher, EventStatusCacheReader, EventStatusFallbackStore, FallbackEventLogSource,
@@ -14,7 +14,7 @@ use crate::core::rules::{
     evaluate_schedule_conflict, evaluate_tuition_and_standing, evaluate_wave_eligibility,
     RuleViolation,
 };
-use crate::core::snapshot::SnapshotStore;
+use crate::core::snapshot::{sha256_hex, SnapshotStore};
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use parking_lot::RwLock;
@@ -424,6 +424,48 @@ impl EnrollmentEngine {
     #[must_use]
     pub fn student_snapshot(&self, student_id: StudentId) -> Option<StudentState> {
         self.students.get_cloned(&student_id)
+    }
+
+    #[must_use]
+    pub fn preload_summary(&self) -> PreloadSummarySnapshot {
+        let readiness = self.readiness();
+        let catalog = self.catalog.load();
+        let mut snapshots = catalog.seat_table.snapshots();
+        snapshots.sort_by_key(|snap| snap.section_id.as_u64());
+
+        let mut total_max_capacity = 0i64;
+        let mut total_enrolled_seats = 0i64;
+        let mut total_available_seats = 0i64;
+        let mut canonical = String::with_capacity(snapshots.len() * 24);
+
+        for snap in &snapshots {
+            total_max_capacity += i64::from(snap.max_capacity);
+            total_enrolled_seats += i64::from(snap.enrolled_count);
+            total_available_seats += i64::from(snap.available_seats);
+            canonical.push_str(&format!(
+                "{}:{}:{}\n",
+                snap.section_id.as_u64(),
+                snap.max_capacity,
+                snap.enrolled_count
+            ));
+        }
+
+        PreloadSummarySnapshot {
+            ready: readiness == EngineReadiness::Ready,
+            state: readiness.as_str(),
+            role: self.role().as_str(),
+            gate_state: self.gate_state(),
+            term_id: catalog.term_id,
+            term_code: catalog.term_code.clone(),
+            epoch: self.epoch(),
+            checkpoint_seq: self.checkpoint_seq(),
+            section_count: snapshots.len(),
+            student_count: self.students.len(),
+            total_max_capacity,
+            total_enrolled_seats,
+            total_available_seats,
+            seat_checksum_sha256: sha256_hex(canonical.as_bytes()),
+        }
     }
 
     pub fn hydrate_from_dataset(

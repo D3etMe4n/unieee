@@ -354,3 +354,71 @@ fn hot_delta_sync_events_roundtrip_and_validate_schema_version() {
         })
     ));
 }
+
+#[test]
+fn golden_java_and_cli_delta_json_decodes_cleanly() {
+    let java_standing_json = r#"{
+        "deltaType": "STUDENT_STANDING_UPDATED",
+        "schemaVersion": 1,
+        "eventId": "019369f2-7c00-7000-8000-000000000001",
+        "termId": "11111111-2222-3333-4444-555555555555",
+        "studentId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "academicStatus": "ACTIVE",
+        "tuitionDebt": "0.00",
+        "tuitionExempt": false,
+        "enrollmentBlocked": false,
+        "cumulativeGpa": "3.55",
+        "occurredAt": "2026-11-26T12:00:00Z"
+    }"#;
+    let decoded_standing = decode_json::<EnrollmentDeltaEvent>(java_standing_json).unwrap();
+    match decoded_standing {
+        EnrollmentDeltaEvent::StudentStandingUpdated(ev) => {
+            assert!(ev.event_id.is_v7());
+            assert_eq!(ev.academic_status, "ACTIVE");
+            assert_eq!(ev.tuition_debt, Decimal::new(0, 2));
+            assert!(!ev.enrollment_blocked);
+            assert_eq!(ev.cumulative_gpa, Some(Decimal::new(355, 2)));
+        }
+        other => panic!("unexpected delta variant: {other:?}"),
+    }
+
+    let java_section_json = r#"{
+        "deltaType": "SECTION_CAPACITY_UPDATED",
+        "schemaVersion": 1,
+        "eventId": "019369f2-7c01-7000-8000-000000000002",
+        "termId": "11111111-2222-3333-4444-555555555555",
+        "sectionId": 701,
+        "newMaxCapacity": 120,
+        "status": "OPEN",
+        "occurredAt": "2026-11-26T12:05:00Z"
+    }"#;
+    let decoded_section = decode_json::<EnrollmentDeltaEvent>(java_section_json).unwrap();
+    match decoded_section {
+        EnrollmentDeltaEvent::SectionCapacityUpdated(ev) => {
+            assert!(ev.event_id.is_v7());
+            assert_eq!(ev.section_id, SectionId::new(701));
+            assert_eq!(ev.new_max_capacity, 120);
+            assert_eq!(ev.status, Some(SectionStatus::Open));
+        }
+        other => panic!("unexpected delta variant: {other:?}"),
+    }
+
+    let cli_gate_json = r#"{
+        "deltaType": "GATE_CONTROL",
+        "schemaVersion": 1,
+        "termId": "11111111-2222-3333-4444-555555555555",
+        "gateState": "OPEN",
+        "activeWindowId": "99999999-8888-7777-6666-555555555555",
+        "epoch": 2,
+        "issuedAt": "2026-11-26T12:10:00Z"
+    }"#;
+    let decoded_gate = decode_json::<EnrollmentDeltaEvent>(cli_gate_json).unwrap();
+    match decoded_gate {
+        EnrollmentDeltaEvent::GateControl(ev) => {
+            assert_eq!(ev.gate_state, GateState::Open);
+            assert_eq!(ev.epoch, 2);
+            assert!(ev.active_window_id.is_some());
+        }
+        other => panic!("unexpected delta variant: {other:?}"),
+    }
+}

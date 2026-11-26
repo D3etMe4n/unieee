@@ -6,7 +6,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use handlers::{
     drop_handler, fallback_method_not_allowed, fallback_not_found, get_status_handler, healthz,
-    promote_handler, readyz, register_handler, AppState,
+    preload_summary_handler, promote_handler, readyz, register_handler, AppState,
 };
 
 pub fn build_router(state: AppState) -> Router {
@@ -20,6 +20,7 @@ pub fn build_router(state: AppState) -> Router {
             get(get_status_handler),
         )
         .route("/internal/promote", post(promote_handler))
+        .route("/internal/preload-summary", get(preload_summary_handler))
         .fallback(fallback_not_found)
         .method_not_allowed_fallback(fallback_method_not_allowed)
         .with_state(state)

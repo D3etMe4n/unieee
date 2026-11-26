@@ -319,6 +319,24 @@ class CatalogModuleIntegrationTest {
                 .with(jwt().jwt(studentJwt()).authorities(new SimpleGrantedAuthority("ROLE_STUDENT"))))
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.sectionCode").value("SEC1-" + suffix));
+
+        // Unauthenticated /api/v1/sections remains 401 while /api/v1/public/sections exposes only OPEN sections with Cache-Control
+        mockMvc.perform(get("/api/v1/sections").param("termId", term.id().toString()))
+            .andExpect(status().isUnauthorized());
+
+        mockMvc.perform(get("/api/v1/public/sections").param("termId", term.id().toString()))
+            .andExpect(status().isOk())
+            .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.header()
+                .string("Cache-Control", org.hamcrest.Matchers.containsString("public")))
+            .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.header()
+                .string("Cache-Control", org.hamcrest.Matchers.containsString("max-age=5")))
+            .andExpect(jsonPath("$.length()").value(1))
+            .andExpect(jsonPath("$[0].id").value(sec1.id()));
+
+        mockMvc.perform(get("/api/v1/public/courses"))
+            .andExpect(status().isOk())
+            .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.header()
+                .string("Cache-Control", org.hamcrest.Matchers.containsString("public")));
     }
 
     private UUID createCourseViaHttp(String code, String name, int credits, String dept) throws Exception {

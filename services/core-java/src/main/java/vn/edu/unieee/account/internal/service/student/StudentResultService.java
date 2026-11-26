@@ -1,5 +1,6 @@
 package vn.edu.unieee.account.internal.service.student;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -7,10 +8,12 @@ import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import vn.edu.unieee.account.dto.RecordStudentCourseResultRequest;
 import vn.edu.unieee.account.dto.StudentCourseResultResponse;
+import vn.edu.unieee.account.event.StudentAcademicStandingRecalculatedEvent;
 import vn.edu.unieee.account.internal.domain.student.AcademicStanding;
 import vn.edu.unieee.account.internal.domain.student.AcademicStanding.WeightedCourseGrade;
 import vn.edu.unieee.account.internal.domain.student.LetterGrade;
@@ -32,6 +35,7 @@ public class StudentResultService {
     private final StudentCourseResultRepository resultRepository;
     private final CatalogFacade catalogFacade;
     private final AccountMapper mapper;
+    private final ApplicationEventPublisher eventPublisher;
 
     @Transactional
     public StudentCourseResultResponse recordCourseResult(UUID studentId, RecordStudentCourseResultRequest request) {
@@ -97,7 +101,14 @@ public class StudentResultService {
             .toList();
 
         student.applyRecalculatedStanding(AcademicStanding.recalculate(weightedGrades));
-        studentRepository.save(student);
+        Student saved = studentRepository.save(student);
+        eventPublisher.publishEvent(new StudentAcademicStandingRecalculatedEvent(
+            saved.getId(),
+            saved.getStudentCode(),
+            saved.getAcademicStanding().getCumulativeGpa(),
+            saved.getAcademicStanding().getEarnedCredits(),
+            Instant.now()
+        ));
     }
 
     private List<StudentCourseResultResponse> mapResultsWithCatalogCourses(List<StudentCourseResult> results) {

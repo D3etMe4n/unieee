@@ -88,32 +88,54 @@ check_health() {
         failures=$((failures + 1))
     fi
 
-    # 6. Redis Master + 2 Replicas
-    local master_info
-    if container_running "unieee-redis-master" && \
-       master_info=$("$CTR_CLI" exec unieee-redis-master redis-cli -a "$redis_pass" --no-auth-warning info replication 2>/dev/null) && \
-       echo "$master_info" | tr -d '\r' | grep -qx "role:master" && \
-       echo "$master_info" | tr -d '\r' | grep -qx "connected_slaves:2"; then
-        log_ok "redis-master: role=master, connected_slaves=2"
+    # 6. Redis HA (Sentinel-aware Master + Replicas discovery)
+    local redis_master_container=""
+    if container_running "unieee-redis-sentinel-1"; then
+        local sentinel_master_host
+        sentinel_master_host=$("$CTR_CLI" exec unieee-redis-sentinel-1 redis-cli -p 26379 --raw SENTINEL get-master-addr-by-name unieee-master 2>/dev/null | head -n 1 | tr -d '\r' || true)
+        redis_master_container=$(resolve_redis_container_by_host "$sentinel_master_host" || true)
+    fi
+
+    if [ -n "$redis_master_container" ] && container_running "$redis_master_container"; then
+        local master_info connected_slaves
+        master_info=$("$CTR_CLI" exec "$redis_master_container" redis-cli -a "$redis_pass" --no-auth-warning info replication 2>/dev/null || true)
+        connected_slaves=$(printf "%s\n" "$master_info" | tr -d '\r' | awk -F: '/^connected_slaves:/ {print $2; exit}')
+        if printf "%s\n" "$master_info" | tr -d '\r' | grep -qx "role:master" && [ "${connected_slaves:-0}" -ge 1 ]; then
+            log_ok "redis-master ($redis_master_container): role=master, connected_slaves=${connected_slaves}"
+        else
+            log_err "redis-master ($redis_master_container): replication check FAILED (connected_slaves=${connected_slaves:-0})"
+            failures=$((failures + 1))
+        fi
     else
-        log_err "redis-master: replication check FAILED"
+        log_err "redis-master: could not resolve active master via sentinel"
         failures=$((failures + 1))
     fi
 
-    local r
-    for r in 1 2; do
-        local r_name="unieee-redis-replica-${r}"
-        local r_info
-        if container_running "$r_name" && \
-           r_info=$("$CTR_CLI" exec "$r_name" redis-cli -a "$redis_pass" --no-auth-warning info replication 2>/dev/null) && \
-           echo "$r_info" | tr -d '\r' | grep -qx "role:slave" && \
-           echo "$r_info" | tr -d '\r' | grep -qx "master_link_status:up"; then
-            log_ok "redis-replica-${r}: role=slave, master_link_status=up"
+    local redis_node online_replicas=0
+    for redis_node in unieee-redis-master unieee-redis-replica-1 unieee-redis-replica-2; do
+        if [ "$redis_node" = "$redis_master_container" ]; then
+            continue
+        fi
+        if container_running "$redis_node"; then
+            local r_info
+            r_info=$("$CTR_CLI" exec "$redis_node" redis-cli -a "$redis_pass" --no-auth-warning info replication 2>/dev/null || true)
+            if printf "%s\n" "$r_info" | tr -d '\r' | grep -qx "role:slave" && \
+               printf "%s\n" "$r_info" | tr -d '\r' | grep -qx "master_link_status:up"; then
+                online_replicas=$((online_replicas + 1))
+                log_ok "${redis_node#unieee-}: role=slave, master_link_status=up"
+            else
+                log_err "${redis_node#unieee-}: replica replication check FAILED"
+                failures=$((failures + 1))
+            fi
         else
-            log_err "redis-replica-${r}: health check FAILED"
-            failures=$((failures + 1))
+            log_warn "${redis_node#unieee-}: container not running (degraded HA topology)"
         fi
     done
+
+    if [ "$online_replicas" -lt 1 ]; then
+        log_err "redis HA: expected at least 1 online replica, found $online_replicas"
+        failures=$((failures + 1))
+    fi
 
     # 7. Redis Sentinels (quorum = 2)
     local s
@@ -161,12 +183,14 @@ check_health() {
     fi
 
     # 10. Rust Hot Path services (Phases 7-9)
-    local engine_svc
+    local engine_svc engine_ready_body engine_role engine_gate
     for engine_svc in unieee-enrollment-engine-active unieee-enrollment-engine-standby; do
         if container_running "$engine_svc"; then
             if "$CTR_CLI" exec "$engine_svc" curl -fsS http://127.0.0.1:8081/healthz >/dev/null 2>&1 && \
-               "$CTR_CLI" exec "$engine_svc" curl -fsS http://127.0.0.1:8081/readyz >/dev/null 2>&1; then
-                log_ok "$engine_svc: /healthz & /readyz OK"
+               engine_ready_body=$("$CTR_CLI" exec "$engine_svc" curl -fsS http://127.0.0.1:8081/readyz 2>/dev/null); then
+                engine_role=$(printf "%s" "$engine_ready_body" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("role","?"))' 2>/dev/null || echo "?")
+                engine_gate=$(printf "%s" "$engine_ready_body" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("gateState","?"))' 2>/dev/null || echo "?")
+                log_ok "$engine_svc: /healthz & /readyz OK (role=$engine_role, gate=$engine_gate)"
             else
                 log_err "$engine_svc: /healthz or /readyz FAILED"
                 failures=$((failures + 1))
