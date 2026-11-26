@@ -60,10 +60,20 @@ jobs:
           with open("infra/reverse-proxy/nginx.conf", "r", encoding="utf-8") as f:
               nginx_conf = f.read()
           assert "proxy_cache_path" in nginx_conf and "catalog_cache" in nginx_conf
+          assert "seats_cache" in nginx_conf
           with open("infra/reverse-proxy/snippets/unieee-routes.conf", "r", encoding="utf-8") as f:
               routes_conf = f.read()
           assert "proxy_cache_lock on;" in routes_conf
           assert "/tmp/enrollment-primary.conf" in routes_conf
+          assert "$enrollment_read_upstream" in routes_conf
+          assert "/api/v1/enrollments/seats" in routes_conf
+          assert "/api/v1/enrollments/me" in routes_conf
+          with open("infra/reverse-proxy/20-enrollment-healthcheck.sh", "r", encoding="utf-8") as f:
+              hc_script = f.read()
+          assert "enrollment_read_upstream" in hc_script
+          with open("infra/compose.hotpath.yml", "r", encoding="utf-8") as f:
+              hp_compose = f.read()
+          assert "unieee.enrollment.outcomes" in hp_compose
           print("Keycloak realm & Nginx hardening validation OK")
           EOF
 

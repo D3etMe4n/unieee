@@ -336,63 +336,84 @@ ops_clear_hotpath_snapshot_volumes() {
     done
 }
 
+ops_active_engine_kafka_group() {
+    local svc role
+    for svc in unieee-enrollment-engine-active unieee-enrollment-engine-standby; do
+        if container_running "$svc"; then
+            role=$(ops_engine_ready_role "$svc" || true)
+            if [ "$role" = "ACTIVE" ]; then
+                echo "${svc#unieee-}"
+                return 0
+            fi
+        fi
+    done
+    echo "enrollment-engine-active"
+}
+
 ops_wait_kafka_and_outbox_drain() {
     local timeout_secs="${1:-120}"
-    local pg_user="${POSTGRES_USER:-unieee}"
-    local pg_db="${POSTGRES_DB:-unieee}"
-    local pg_pass="${POSTGRES_PASSWORD:-unieee_dev_password}"
     local deadline=$(($(date +%s) + timeout_secs))
+    local active_engine_group
+    active_engine_group="unieee-$(ops_active_engine_kafka_group)"
 
     while [ "$(date +%s)" -le "$deadline" ]; do
         local lag_status="PENDING"
         if container_running "unieee-kafka"; then
-            local desc_out offsets_out
-            desc_out=$("$CTR_CLI" exec unieee-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+            local writer_desc_out cmd_offsets_out engine_desc_out outcome_offsets_out
+            writer_desc_out=$("$CTR_CLI" exec unieee-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
                 --bootstrap-server localhost:9092 \
                 --describe --group unieee-enrollment-writer 2>/dev/null || true)
-            offsets_out=$("$CTR_CLI" exec unieee-kafka /opt/kafka/bin/kafka-get-offsets.sh \
+            cmd_offsets_out=$("$CTR_CLI" exec unieee-kafka /opt/kafka/bin/kafka-get-offsets.sh \
                 --bootstrap-server localhost:9092 \
                 --topic unieee.enrollment.commands 2>/dev/null || true)
+            engine_desc_out=$("$CTR_CLI" exec unieee-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+                --bootstrap-server localhost:9092 \
+                --describe --group "$active_engine_group" 2>/dev/null || true)
+            outcome_offsets_out=$("$CTR_CLI" exec unieee-kafka /opt/kafka/bin/kafka-get-offsets.sh \
+                --bootstrap-server localhost:9092 \
+                --topic unieee.enrollment.outcomes 2>/dev/null || true)
 
             lag_status=$(python3 -c '
 import sys
-desc_lines = [ln.strip() for ln in sys.argv[1].splitlines() if ln.strip()]
-offset_lines = [ln.strip() for ln in sys.argv[2].splitlines() if ln.strip()]
 
-total_end = 0
-for ln in offset_lines:
-    parts = ln.split(":")
-    if len(parts) >= 3 and parts[-1].isdigit():
-        total_end += int(parts[-1])
+def check_topic_lag(desc_text, offsets_text, topic):
+    desc_lines = [ln.strip() for ln in desc_text.splitlines() if ln.strip()]
+    offset_lines = [ln.strip() for ln in offsets_text.splitlines() if ln.strip()]
 
-cmd_rows = [ln.split() for ln in desc_lines if "unieee.enrollment.commands" in ln]
-if not cmd_rows:
-    print("DRAINED" if total_end == 0 else "PENDING")
-    sys.exit(0)
+    total_end = 0
+    for ln in offset_lines:
+        parts = ln.split(":")
+        if len(parts) >= 3 and parts[-1].isdigit():
+            total_end += int(parts[-1])
 
-total_lag = 0
-for cols in cmd_rows:
-    end_col = cols[4] if len(cols) > 4 else "0"
-    lag_col = cols[5] if len(cols) > 5 else "-"
-    if lag_col == "-":
-        if end_col != "0":
-            print("PENDING")
-            sys.exit(0)
-        continue
-    total_lag += int(lag_col)
+    rows = [ln.split() for ln in desc_lines if topic in ln]
+    if not rows:
+        return "DRAINED" if total_end == 0 else "PENDING"
 
-print("DRAINED" if total_lag == 0 else f"LAG:{total_lag}")
-' "$desc_out" "$offsets_out" 2>/dev/null || echo "PENDING")
+    total_lag = 0
+    for cols in rows:
+        end_col = cols[4] if len(cols) > 4 else "0"
+        lag_col = cols[5] if len(cols) > 5 else "-"
+        if lag_col == "-":
+            if end_col != "0":
+                return "PENDING"
+            continue
+        total_lag += int(lag_col)
+    return "DRAINED" if total_lag == 0 else f"LAG:{total_lag}"
+
+cmd_state = check_topic_lag(sys.argv[1], sys.argv[2], "unieee.enrollment.commands")
+out_state = check_topic_lag(sys.argv[3], sys.argv[4], "unieee.enrollment.outcomes")
+if cmd_state == "DRAINED" and out_state == "DRAINED":
+    print("DRAINED")
+else:
+    print(f"PENDING(cmd={cmd_state},out={out_state})")
+' "$writer_desc_out" "$cmd_offsets_out" "$engine_desc_out" "$outcome_offsets_out" 2>/dev/null || echo "PENDING")
         else
             lag_status="DRAINED"
         fi
 
-        local outbox_pending
-        outbox_pending=$("$CTR_CLI" exec -e "PGPASSWORD=$pg_pass" unieee-postgres psql -U "$pg_user" -d "$pg_db" -tAc \
-            "SELECT COUNT(*) FROM registration.writer_revert_outbox WHERE published_at IS NULL;" 2>/dev/null | tr -d '[:space:]' || echo "999")
-
-        if [ "$lag_status" = "DRAINED" ] && [ "$outbox_pending" = "0" ]; then
-            log_ok "Kafka consumer lag = 0 and writer_revert_outbox pending = 0"
+        if [ "$lag_status" = "DRAINED" ]; then
+            log_ok "Kafka consumer lag = 0 on unieee.enrollment.commands (writer) & unieee.enrollment.outcomes ($active_engine_group)"
             return 0
         fi
         sleep 1
@@ -726,11 +747,14 @@ for w in json.load(sys.stdin):
         ops_api_request PATCH "/api/v1/academic/terms/${term_id}/status" "$token" '{"targetStatus":"REGISTRATION_CLOSED"}' >/dev/null || return 1
     fi
 
-    log_info "Waiting for Kafka writer lag=0 and writer_revert_outbox empty (timeout=${drain_timeout}s)..."
+    log_info "Waiting for Kafka commands (writer) and outcomes (active engine) lag=0 (timeout=${drain_timeout}s)..."
     ops_wait_kafka_and_outbox_drain "$drain_timeout" || return 1
 
     log_info "Running 3-way reconciliation for term '$term_code' ($term_id)..."
     ops_reconcile_term_strict "$token" "$term_id" || return 1
+
+    log_info "Warming Redis Read Cache with final reconciled seat counts for term '$term_code'..."
+    ops_api_request POST "/api/v1/admin/enrollments/terms/${term_id}/warm-cache" "$token" >/dev/null || return 1
 
     if [ "$keep_hot_path" = false ]; then
         log_info "Stopping hot-path cluster and cleaning up snapshots..."

@@ -155,9 +155,10 @@ check_health() {
         local topics
         if topics=$("$CTR_CLI" exec unieee-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list 2>/dev/null) && \
            echo "$topics" | grep -qx "unieee.enrollment.commands" && \
+           echo "$topics" | grep -qx "unieee.enrollment.outcomes" && \
            echo "$topics" | grep -qx "unieee.enrollment.deltas" && \
            echo "$topics" | grep -qx "unieee.enrollment.dlq"; then
-            log_ok "kafka: broker ready & topics (commands, deltas, dlq) verified"
+            log_ok "kafka: broker ready & topics (commands, outcomes, deltas, dlq) verified"
         else
             log_err "kafka: broker or required topics check FAILED"
             failures=$((failures + 1))
