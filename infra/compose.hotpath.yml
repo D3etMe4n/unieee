@@ -77,7 +77,9 @@ services:
       BIND_ADDR: 0.0.0.0:8081
       NODE_ROLE: ACTIVE
       REJOIN_AS_STANDBY_ON_RECOVERY: "true"
+      TERM_ID: ${TERM_ID:-}
       TERM_CODE: ${TERM_CODE:-}
+      INTERNAL_OPS_TOKEN: ${INTERNAL_OPS_TOKEN:-}
       DATABASE_URL: postgresql://${POSTGRES_USER:-unieee}:${POSTGRES_PASSWORD:-unieee_dev_password}@pgbouncer:6432/${POSTGRES_DB:-unieee}
       KAFKA_BROKERS: kafka:9092
       KAFKA_GROUP_ID: unieee-enrollment-engine-active
@@ -128,7 +130,9 @@ services:
       BIND_ADDR: 0.0.0.0:8081
       NODE_ROLE: STANDBY
       REJOIN_AS_STANDBY_ON_RECOVERY: "true"
+      TERM_ID: ${TERM_ID:-}
       TERM_CODE: ${TERM_CODE:-}
+      INTERNAL_OPS_TOKEN: ${INTERNAL_OPS_TOKEN:-}
       DATABASE_URL: postgresql://${POSTGRES_USER:-unieee}:${POSTGRES_PASSWORD:-unieee_dev_password}@pgbouncer:6432/${POSTGRES_DB:-unieee}
       KAFKA_BROKERS: kafka:9092
       KAFKA_GROUP_ID: unieee-enrollment-engine-standby
