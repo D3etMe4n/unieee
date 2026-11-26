@@ -1,0 +1,141 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 200,
+      "title": "k6 Load Generator Overview",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 1 },
+      "id": 1,
+      "targets": [
+        { "expr": "k6_vus", "legendFormat": "Active VUs ({{testid}})", "refId": "A" }
+      ],
+      "title": "Virtual Users (VUs)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 1 },
+      "id": 2,
+      "targets": [
+        { "expr": "sum(rate(k6_http_reqs_total[10s]))", "legendFormat": "Total k6 RPS", "refId": "A" },
+        { "expr": "sum(rate(k6_http_reqs_total[10s])) by (scenario)", "legendFormat": "RPS ({{scenario}})", "refId": "B" }
+      ],
+      "title": "k6 HTTP Throughput (RPS)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 1 },
+      "id": 3,
+      "targets": [
+        { "expr": "k6_checks_rate", "legendFormat": "Checks Pass Rate", "refId": "A" },
+        { "expr": "k6_unieee_unexpected_error_rate_rate", "legendFormat": "Unexpected 5xx Error Rate", "refId": "B" },
+        { "expr": "k6_unieee_nginx_cache_hit_rate_rate", "legendFormat": "Nginx Cache HIT Rate", "refId": "C" }
+      ],
+      "title": "Checks Pass Rate, 5xx Rate & Cache Hit Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 1 },
+      "id": 4,
+      "targets": [
+        { "expr": "k6_http_req_duration_seconds_p50", "legendFormat": "k6 p50", "refId": "A" },
+        { "expr": "k6_http_req_duration_seconds_p95", "legendFormat": "k6 p95", "refId": "B" },
+        { "expr": "k6_http_req_duration_seconds_p99", "legendFormat": "k6 p99", "refId": "C" }
+      ],
+      "title": "k6 End-to-End HTTP Latency (p50 / p95 / p99)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 7 },
+      "id": 201,
+      "title": "Per-Scenario Latency Breakdown & Backend Correlation",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 8 },
+      "id": 5,
+      "targets": [
+        { "expr": "k6_unieee_warm_public_sections_ms_p95", "legendFormat": "Warm /public/sections p95", "refId": "A" },
+        { "expr": "k6_unieee_warm_sections_ms_p95", "legendFormat": "Warm /sections p95", "refId": "B" },
+        { "expr": "k6_unieee_warm_timetable_ms_p95", "legendFormat": "Warm /timetable p95", "refId": "C" },
+        { "expr": "k6_unieee_hot_seats_ms_p95", "legendFormat": "Hot /enrollments/seats p95", "refId": "D" },
+        { "expr": "k6_unieee_hot_me_ms_p95", "legendFormat": "Hot /enrollments/me p95", "refId": "E" },
+        { "expr": "k6_unieee_hot_register_ms_p95", "legendFormat": "Hot /enrollments/register p95", "refId": "F" },
+        { "expr": "k6_unieee_hot_drop_ms_p95", "legendFormat": "Hot /enrollments/drop p95", "refId": "G" }
+      ],
+      "title": "Scenario p95 Latencies (ms)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 8 },
+      "id": 6,
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(unieee_engine_http_request_duration_seconds_bucket[10s])) by (le, route))", "legendFormat": "Engine p95 {{route}}", "refId": "A" },
+        { "expr": "histogram_quantile(0.99, sum(rate(unieee_engine_http_request_duration_seconds_bucket[10s])) by (le, route))", "legendFormat": "Engine p99 {{route}}", "refId": "B" },
+        { "expr": "histogram_quantile(0.95, sum(rate(unieee_writer_pg_commit_duration_seconds_bucket[10s])) by (le, path))", "legendFormat": "Writer PG p95 {{path}}", "refId": "C" }
+      ],
+      "title": "Backend Rust Engine & Writer Latency Under Load",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 15 },
+      "id": 7,
+      "targets": [
+        { "expr": "unieee_engine_seats_available{node=\"active\"}", "legendFormat": "RAM Available Seats", "refId": "A" },
+        { "expr": "unieee_engine_seats_enrolled{node=\"active\"}", "legendFormat": "RAM Enrolled Seats", "refId": "B" },
+        { "expr": "sum(kafka_consumergroup_lag{consumergroup=~\"unieee-.*\"}) by (consumergroup)", "legendFormat": "Kafka Lag {{consumergroup}}", "refId": "C" }
+      ],
+      "title": "Flash-Crowd Seat Exhaustion & Kafka Drain",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 15 },
+      "id": 8,
+      "targets": [
+        { "expr": "sum(rate(unieee_read_cache_requests_total{outcome=\"hit\"}[15s])) / clamp_min(sum(rate(unieee_read_cache_requests_total[15s])), 0.0001)", "legendFormat": "Core Java Redis Read-Through Hit Ratio", "refId": "A" },
+        { "expr": "sum(rate(k6_unieee_nginx_cache_hit_rate_rate[15s]))", "legendFormat": "Nginx Cache Hit Rate", "refId": "B" }
+      ],
+      "title": "Read-Through & Edge Micro-Cache Efficiency",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["unieee", "k6", "benchmark"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "unieee — k6 Load Benchmark",
+  "uid": "unieee-k6-benchmark",
+  "version": 1
+}

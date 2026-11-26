@@ -74,13 +74,24 @@ jobs:
           with open("infra/compose.hotpath.yml", "r", encoding="utf-8") as f:
               hp_compose = f.read()
           assert "unieee.enrollment.outcomes" in hp_compose
-          print("Keycloak realm & Nginx hardening validation OK")
+          with open("infra/reverse-proxy/conf.d/default.conf.template", "r", encoding="utf-8") as f:
+              proxy_tpl = f.read()
+          assert "8089" in proxy_tpl and "stub_status" in proxy_tpl
+          import glob
+          dashboards = glob.glob("infra/monitoring/grafana/dashboards/*.json")
+          assert len(dashboards) >= 2, "Expected production & k6 Grafana dashboards"
+          for dash_path in dashboards:
+              with open(dash_path, "r", encoding="utf-8") as df:
+                  json.load(df)
+          print("Keycloak realm, Nginx hardening & monitoring configuration validation OK")
           EOF
 
       - name: Validate Compose configurations
         run: |
           docker compose --env-file .env.example -f infra/compose.base.yml config --quiet
           docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.hotpath.yml config --quiet
+          docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.monitoring.yml config --quiet
+          docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.hotpath.yml -f infra/compose.monitoring.yml --profile hot-path config --quiet
           docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.letsencrypt.yml config --quiet
           docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.cloudflared.yml --profile cf-quick config --quiet
           docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.cloudflared.yml --profile cf-named config --quiet

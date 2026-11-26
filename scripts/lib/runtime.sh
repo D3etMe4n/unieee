@@ -3,6 +3,7 @@
 CTR_RUNTIME=""
 CTR_CLI=""
 COMPOSE_CMD=()
+UNIEEE_MONITORING_ENABLED="${UNIEEE_MONITORING_ENABLED:-false}"
 
 detect_runtime() {
     local requested="${1:-}"
@@ -70,6 +71,15 @@ run_compose_with_tls() {
 
     if [ "$profile" = "hot-path" ] || [ "$profile" = "all" ]; then
         files+=(-f "$ROOT_DIR/infra/compose.hotpath.yml")
+    fi
+
+    if [ "${UNIEEE_MONITORING_ENABLED:-false}" = "true" ] || [ "$profile" = "all" ]; then
+        if [ -f "$ROOT_DIR/infra/compose.monitoring.yml" ]; then
+            files+=(-f "$ROOT_DIR/infra/compose.monitoring.yml")
+            if [ "$profile" = "hot-path" ] || [ "$profile" = "all" ]; then
+                profile_flags+=(--profile hot-path)
+            fi
+        fi
     fi
 
     if [ "$tls_mode" = "letsencrypt" ] || [ "$tls_mode" = "all" ]; then
