@@ -38,9 +38,9 @@ jobs:
       - name: Validate shell script syntax
         run: |
           bash -n scripts/unieee.sh scripts/lib/*.sh
-          sh -n infra/pgbouncer/entrypoint.sh infra/redis/entrypoint-sentinel.sh infra/letsencrypt/entrypoint.sh infra/reverse-proxy/10-detect-resolver.envsh
+          sh -n infra/pgbouncer/entrypoint.sh infra/redis/entrypoint-sentinel.sh infra/letsencrypt/entrypoint.sh infra/reverse-proxy/10-detect-resolver.envsh infra/reverse-proxy/20-enrollment-healthcheck.sh
 
-      - name: Validate Keycloak realm configuration
+      - name: Validate Keycloak realm & Nginx hardening configuration
         run: |
           python3 - <<'EOF'
           import json
@@ -48,9 +48,23 @@ jobs:
               realm = json.load(f)
           assert realm["realm"] == "unieee"
           assert realm["registrationAllowed"] is False, "Self-registration must remain disabled"
+          assert 1800 <= int(realm["accessTokenLifespan"]) <= 3600, "Registration-season accessTokenLifespan must be 1800..3600s"
           role_names = {r["name"] for r in realm["roles"]["realm"]}
           assert {"STUDENT", "LECTURER", "ACADEMIC_ADMIN"}.issubset(role_names)
-          print("Keycloak realm validation OK")
+          flows = {fl["alias"]: fl for fl in realm.get("authenticationFlows", [])}
+          assert "unieee-first-broker-login-link-only" in flows, "Missing link-only First Broker Login flow"
+          auths = [ex["authenticator"] for ex in flows["unieee-first-broker-login-link-only"].get("authenticationExecutions", [])]
+          assert "idp-detect-existing-broker-user" in auths and "idp-auto-link" in auths
+          assert "idp-create-user-if-unique" not in auths, "Self-registration authenticator must NOT exist in link-only flow"
+
+          with open("infra/reverse-proxy/nginx.conf", "r", encoding="utf-8") as f:
+              nginx_conf = f.read()
+          assert "proxy_cache_path" in nginx_conf and "catalog_cache" in nginx_conf
+          with open("infra/reverse-proxy/snippets/unieee-routes.conf", "r", encoding="utf-8") as f:
+              routes_conf = f.read()
+          assert "proxy_cache_lock on;" in routes_conf
+          assert "/tmp/enrollment-primary.conf" in routes_conf
+          print("Keycloak realm & Nginx hardening validation OK")
           EOF
 
       - name: Validate Compose configurations

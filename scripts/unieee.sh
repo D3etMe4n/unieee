@@ -12,6 +12,8 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 . "$SCRIPT_DIR/lib/certs.sh"
 # shellcheck source=scripts/lib/health.sh
 . "$SCRIPT_DIR/lib/health.sh"
+# shellcheck source=scripts/lib/lifecycle.sh
+. "$SCRIPT_DIR/lib/lifecycle.sh"
 
 usage() {
     cat <<'EOF'
@@ -21,6 +23,7 @@ Usage:
 Commands:
   up [options]                          Start core stack (optionally with hot-path & TLS mode)
      --hot-path                         Include Kafka & Hot Path registration cluster
+     --build                            Rebuild service images before starting containers
      --tls-mode <mode>                  Edge/TLS mode: custom (default) | letsencrypt | cloudflared
      --domain <domain>                  Domain name (for letsencrypt or named cloudflared tunnel)
      --email <email>                    Contact email (for Let's Encrypt ACME registration)
@@ -32,9 +35,10 @@ Commands:
   tls-renew                             Renew Let's Encrypt certificate & reload Reverse Proxy
   health                                Check health of all active services & edge TLS mode
   logs [service] [--tail N] [-f]        View service logs (including certbot / cloudflared)
-  prepare-registration --term <CODE>    Start hot-path & preload registration data (Phase 11 hook)
-  open-registration --term <CODE>       Open registration gate (Phase 11 hook)
-  close-registration --term <CODE>      Close gate, drain Kafka, reconcile & stop hot-path (Phase 11 hook)
+  prepare-registration --term <CODE>    Start hot-path, preload RAM, warm cache & verify checksum
+  open-registration --term <CODE> --window <ID>
+                                        Activate window & open registration gate (supports 24/7 multi-window)
+  close-registration --term <CODE>      Close gate, drain Kafka, reconcile 100% & stop hot-path
   help                                  Show this help message
 
 Examples:
@@ -84,6 +88,7 @@ detect_runtime "$RUNTIME_ARG"
 
 cmd_up() {
     local profile="core"
+    local build_flag=false
     local tls_mode="${UNIEEE_TLS_MODE:-custom}"
     local domain="${UNIEEE_DOMAIN:-localhost}"
     local le_email="${UNIEEE_LETSENCRYPT_EMAIL:-}"
@@ -96,6 +101,10 @@ cmd_up() {
         case "$1" in
             --hot-path)
                 profile="hot-path"
+                shift
+                ;;
+            --build)
+                build_flag=true
                 shift
                 ;;
             --tls-mode)
@@ -171,7 +180,11 @@ cmd_up() {
     cleanup_conflicting_edge_containers "$tls_mode" "$cf_submode"
 
     log_info "Starting unieee stack (runtime=$CTR_RUNTIME, profile=$profile, tls_mode=$tls_mode)..."
-    run_compose_with_tls "$profile" "$tls_mode" "$cf_submode" up -d --wait --remove-orphans
+    local -a compose_up_args=(up -d --wait --remove-orphans)
+    if [ "$build_flag" = true ]; then
+        compose_up_args+=(--build)
+    fi
+    run_compose_with_tls "$profile" "$tls_mode" "$cf_submode" "${compose_up_args[@]}"
 
     if [ "$tls_mode" = "letsencrypt" ]; then
         reload_reverse_proxy
@@ -275,21 +288,6 @@ cmd_logs() {
         log_args+=("$service")
     fi
     run_compose_with_tls "all" "all" "all" "${log_args[@]}"
-}
-
-cmd_prepare_registration() {
-    log_info "prepare-registration: starting hot-path infrastructure..."
-    cmd_up --hot-path "$@"
-    log_warn "Preload & Policy Snapshot sync into core-java / Rust Engine will be wired in Phases 7 & 11."
-}
-
-cmd_open_registration() {
-    log_warn "open-registration: gate activation via core-java & Redis Pub/Sub will be wired in Phases 7 & 11 (args: $*)."
-}
-
-cmd_close_registration() {
-    log_warn "close-registration: Kafka drain & PostgreSQL reconciliation will be wired in Phase 11 (args: $*)."
-    cmd_down --hot-path-only
 }
 
 case "$COMMAND" in
