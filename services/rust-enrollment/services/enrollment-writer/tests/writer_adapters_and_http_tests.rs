@@ -4,13 +4,14 @@ use axum::http::{Method, Request, StatusCode};
 use chrono::Utc;
 use enrollment_writer::adapters::kafka::{
     build_commit_tpl, build_dlq_producer_config, build_writer_consumer_config,
-    extract_incoming_record, flush_batch_with_retry, spawn_outbox_sweeper,
+    encode_outcome_payload, extract_incoming_record, flush_batch_with_retry,
     spawn_writer_consumer_loop, OffsetCommitter, RdkafkaDlqPublisher,
 };
 use enrollment_writer::adapters::postgres::{
     build_drop_columns, build_enrollment_insert_columns, build_event_insert_columns,
     build_pg_connect_options, build_rejection_revert_event, build_section_delta_columns,
-    classify_sqlx_error, evaluate_locked_section_for_event, PgWriterRepository,
+    classify_sqlx_error, evaluate_locked_section_for_event, parse_persisted_outcome_row,
+    PgWriterRepository,
 };
 use enrollment_writer::adapters::redis_io::{
     connect_redis_backend, dispatch_gate_control_payload, parse_sentinel_addrs,
@@ -20,16 +21,16 @@ use enrollment_writer::adapters::redis_io::{
 use enrollment_writer::config::{ConfigError, WriterConfig};
 use enrollment_writer::core::{
     classify_pg_sqlstate, compute_commit_offsets, DlqPublisher, FastBatchCommitResult,
-    FastPathBatchError, OutboxRevertRow, PartitionOffset, PgErrorClass, RedisBatchUpdate,
-    RedisWriterSink, SectionSeatSnapshot, SingleEventOutcome, WriterProcessor,
-    WriterProcessorConfig, WriterReadiness, WriterRepository,
+    FastPathBatchError, OutcomePublisher, PartitionOffset, PersistedEventOutcome, PgErrorClass,
+    RedisBatchUpdate, RedisWriterSink, SectionSeatSnapshot, SingleEventOutcome,
+    StaleRejectionOutcome, WriterProcessor, WriterProcessorConfig, WriterReadiness,
+    WriterRepository,
 };
 use enrollment_writer::http::{build_router, WriterAppState};
 use http_body_util::BodyExt as _;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,24 +42,14 @@ use unieee_domain::{
     RuleErrorCode, SectionId, StudentId, TermId, APPLICATION_PROBLEM_JSON,
 };
 use unieee_events::{
-    encode_json, DeadLetterEvent, EnrollmentCommandEvent, GateControlEvent, RevertEvent,
-    SeatConfirmedEvent, REDIS_CHANNEL_GATE_CONTROL,
+    encode_json, DeadLetterEvent, EnrollmentCommandEvent, EnrollmentOutcomeEvent,
+    EnrollmentOutcomeStatus, GateControlEvent, RevertEvent, SeatConfirmedEvent,
+    REDIS_CHANNEL_GATE_CONTROL,
 };
 use uuid::Uuid;
 
-struct StubRepo {
-    outbox_rows: Mutex<Vec<OutboxRevertRow>>,
-    sweep_calls: AtomicUsize,
-}
-
-impl StubRepo {
-    fn new(outbox_rows: Vec<OutboxRevertRow>) -> Self {
-        Self {
-            outbox_rows: Mutex::new(outbox_rows),
-            sweep_calls: AtomicUsize::new(0),
-        }
-    }
-}
+#[derive(Default)]
+struct StubRepo;
 
 #[async_trait]
 impl WriterRepository for StubRepo {
@@ -76,31 +67,37 @@ impl WriterRepository for StubRepo {
 
     async fn commit_or_reject_isolated(
         &self,
-        _event: &EnrollmentCommandEvent,
-        _now: chrono::DateTime<Utc>,
+        event: &EnrollmentCommandEvent,
+        now: chrono::DateTime<Utc>,
     ) -> Result<SingleEventOutcome, String> {
-        Ok(SingleEventOutcome::DuplicateSkipped)
+        Ok(SingleEventOutcome::AlreadyPersisted(
+            PersistedEventOutcome {
+                event_id: event.event_id,
+                status: EnrollmentEventStatus::Confirmed,
+                reason_code: None,
+                reason_detail: None,
+                engine_epoch: event.engine_epoch,
+                created_at: now,
+            },
+        ))
     }
 
     async fn record_stale_epoch_rejection(
         &self,
-        _event: &EnrollmentCommandEvent,
+        event: &EnrollmentCommandEvent,
         _current_epoch: u64,
-        _now: chrono::DateTime<Utc>,
-    ) -> Result<Option<RevertEvent>, String> {
-        Ok(None)
-    }
-
-    async fn fetch_unpublished_revert_outbox(
-        &self,
-        _limit: i64,
-    ) -> Result<Vec<OutboxRevertRow>, String> {
-        self.sweep_calls.fetch_add(1, Ordering::AcqRel);
-        Ok(self.outbox_rows.lock().await.drain(..).collect())
-    }
-
-    async fn mark_revert_outbox_published(&self, event_ids: &[EventId]) -> Result<u64, String> {
-        Ok(event_ids.len() as u64)
+        now: chrono::DateTime<Utc>,
+    ) -> Result<StaleRejectionOutcome, String> {
+        Ok(StaleRejectionOutcome::AlreadyPersisted(
+            PersistedEventOutcome {
+                event_id: event.event_id,
+                status: EnrollmentEventStatus::Rejected,
+                reason_code: Some(RuleErrorCode::StaleEpoch),
+                reason_detail: Some("stale".to_owned()),
+                engine_epoch: event.engine_epoch,
+                created_at: now,
+            },
+        ))
     }
 }
 
@@ -116,10 +113,6 @@ impl RedisWriterSink for StubRedis {
     async fn publish_revert_events(&self, _events: &[RevertEvent]) -> Result<(), String> {
         Ok(())
     }
-
-    async fn publish_raw_revert_payloads(&self, _payloads: &[String]) -> Result<(), String> {
-        Ok(())
-    }
 }
 
 #[derive(Default)]
@@ -128,6 +121,16 @@ struct StubDlq;
 #[async_trait]
 impl DlqPublisher for StubDlq {
     async fn publish_dead_letter(&self, _event: &DeadLetterEvent) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct StubOutcomes;
+
+#[async_trait]
+impl OutcomePublisher for StubOutcomes {
+    async fn publish_outcomes(&self, _events: &[EnrollmentOutcomeEvent]) -> Result<(), String> {
         Ok(())
     }
 }
@@ -144,8 +147,6 @@ fn writer_config_parses_defaults_sentinel_and_rejects_invalid_inputs() {
     assert_eq!(defaults.pg_max_connections, 16);
     assert_eq!(defaults.batch_size, 250);
     assert_eq!(defaults.batch_timeout_ms, 30);
-    assert_eq!(defaults.outbox_sweep_interval_ms, 1000);
-    assert_eq!(defaults.outbox_sweep_batch_size, 100);
     assert_eq!(defaults.max_db_retries, 3);
     assert_eq!(defaults.db_retry_backoff_ms, 50);
     assert_eq!(defaults.cache_ttl_secs, 900);
@@ -173,12 +174,9 @@ fn writer_config_parses_defaults_sentinel_and_rejects_invalid_inputs() {
         ("PG_MAX_CONNECTIONS", "1"),
         ("BATCH_SIZE", "0"),
         ("BATCH_TIMEOUT_MS", "0"),
-        ("OUTBOX_SWEEP_INTERVAL_MS", "10"),
-        ("OUTBOX_SWEEP_BATCH_SIZE", "0"),
         ("CACHE_TTL_SECS", "0"),
         ("MAX_DB_RETRIES", "abc"),
         ("DB_RETRY_BACKOFF_MS", "0"),
-        ("OUTBOX_SWEEP_BATCH_SIZE", "nope"),
     ] {
         let mut bad = env.clone();
         bad.insert(key, val.to_owned());
@@ -203,9 +201,10 @@ fn writer_config_parses_defaults_sentinel_and_rejects_invalid_inputs() {
 #[tokio::test]
 async fn http_healthz_readyz_and_rfc9457_fallbacks() {
     let processor = Arc::new(WriterProcessor::new(
-        Arc::new(StubRepo::new(Vec::new())),
+        Arc::new(StubRepo),
         Arc::new(StubRedis),
         Arc::new(StubDlq),
+        Arc::new(StubOutcomes),
         WriterProcessorConfig::default(),
     ));
     let app = build_router(WriterAppState {
@@ -511,21 +510,23 @@ async fn redis_sentinel_helpers_pipeline_cache_sync_and_gate_listener_work() {
         .publish_revert_events(std::slice::from_ref(&revert))
         .await
         .unwrap();
-    adapter.publish_raw_revert_payloads(&[]).await.unwrap();
-    let raw_revert_json = encode_json(&revert).unwrap();
-    adapter
-        .publish_raw_revert_payloads(&[raw_revert_json])
+    let outcome = EnrollmentOutcomeEvent::from_revert(&revert);
+    let (outcome_key, outcome_payload) = encode_outcome_payload(&outcome).unwrap();
+    assert_eq!(outcome_key, revert.student_id.to_string());
+    assert!(outcome_payload.contains("\"status\":\"REVERTED\""));
+    assert_eq!(outcome.status, EnrollmentOutcomeStatus::Reverted);
+
+    let unreachable_publisher = RdkafkaDlqPublisher::new("127.0.0.1:1").unwrap();
+    assert!(unreachable_publisher
+        .publish_outcomes(&[outcome])
         .await
-        .unwrap();
-    let (delta_key, delta_payload) =
-        enrollment_writer::adapters::kafka::encode_revert_delta_payload(&revert).unwrap();
-    assert_eq!(delta_key, revert.student_id.to_string());
-    assert!(delta_payload.contains("\"deltaType\":\"REVERT\""));
+        .is_err());
 
     let proc = Arc::new(WriterProcessor::new(
-        Arc::new(StubRepo::new(Vec::new())),
+        Arc::new(StubRepo),
         Arc::new(StubRedis),
         Arc::new(StubDlq),
+        Arc::new(StubOutcomes),
         WriterProcessorConfig::default(),
     ));
     dispatch_gate_control_payload(&proc, "bad:channel", "{}");
@@ -554,7 +555,7 @@ async fn redis_sentinel_helpers_pipeline_cache_sync_and_gate_listener_work() {
 }
 
 #[tokio::test]
-async fn kafka_helpers_outbox_sweeper_and_postgres_helpers_work() {
+async fn kafka_helpers_and_postgres_helpers_work() {
     let c_cfg = build_writer_consumer_config("127.0.0.1:9092", "grp");
     assert_eq!(c_cfg.get("enable.auto.commit"), Some("false"));
     assert_eq!(c_cfg.get("enable.auto.offset.store"), Some("false"));
@@ -586,21 +587,15 @@ async fn kafka_helpers_outbox_sweeper_and_postgres_helpers_work() {
     let tpl = build_commit_tpl(&offsets).unwrap();
     assert_eq!(tpl.count(), 2);
 
-    // Sweeper + consumer loop startup & shutdown coverage
-    let outbox_row = OutboxRevertRow {
-        event_id: EventId::new_v7(),
-        payload_json: "{}".to_owned(),
-    };
-    let repo = Arc::new(StubRepo::new(vec![outbox_row]));
+    // Consumer loop startup & shutdown coverage
     let proc = Arc::new(WriterProcessor::new(
-        Arc::clone(&repo) as Arc<dyn WriterRepository>,
+        Arc::new(StubRepo),
         Arc::new(StubRedis),
         Arc::new(StubDlq),
+        Arc::new(StubOutcomes),
         WriterProcessorConfig::default(),
     ));
     let (tx, rx) = tokio::sync::watch::channel(false);
-    let sweeper =
-        spawn_outbox_sweeper(Arc::clone(&proc), Duration::from_millis(15), 50, rx.clone());
     let consumer_loop = spawn_writer_consumer_loop(
         "127.0.0.1:1".to_owned(),
         "test-grp".to_owned(),
@@ -611,9 +606,7 @@ async fn kafka_helpers_outbox_sweeper_and_postgres_helpers_work() {
     );
     tokio::time::sleep(Duration::from_millis(45)).await;
     let _ = tx.send(true);
-    let _ = tokio::time::timeout(Duration::from_millis(300), sweeper).await;
     let _ = tokio::time::timeout(Duration::from_millis(300), consumer_loop).await;
-    assert!(repo.sweep_calls.load(Ordering::Acquire) >= 1);
 
     // Postgres SQLSTATE classifier + pure column builders + lazy-pool error paths
     assert!(matches!(
@@ -852,9 +845,10 @@ async fn kafka_helpers_outbox_sweeper_and_postgres_helpers_work() {
         }
     }
     let fail_proc = WriterProcessor::new(
-        Arc::new(StubRepo::new(Vec::new())),
+        Arc::new(StubRepo),
         Arc::new(StubRedis),
         Arc::new(FailingDlq),
+        Arc::new(StubOutcomes),
         WriterProcessorConfig::default(),
     );
     let (rtx, mut rrx) = tokio::sync::watch::channel(false);
@@ -878,6 +872,33 @@ async fn kafka_helpers_outbox_sweeper_and_postgres_helpers_work() {
     assert_eq!(WriterReadiness::from_u8(2).as_str(), "DEGRADED");
     assert_eq!(WriterReadiness::from_u8(99).as_str(), "STARTING");
 
+    // parse_persisted_outcome_row mapping checks (Confirmed / Rejected / Reverted / Error)
+    let confirmed_row =
+        parse_persisted_outcome_row(cmd_reg.event_id.as_uuid(), "CONFIRMED", None, None, 2, now)
+            .unwrap();
+    assert_eq!(confirmed_row.status, EnrollmentEventStatus::Confirmed);
+    let rejected_row = parse_persisted_outcome_row(
+        cmd_reg.event_id.as_uuid(),
+        "REJECTED",
+        Some("NOT_ENROLLED_IN_SECTION".to_owned()),
+        Some("missing".to_owned()),
+        2,
+        now,
+    )
+    .unwrap();
+    assert_eq!(rejected_row.status, EnrollmentEventStatus::Rejected);
+    assert_eq!(
+        rejected_row.reason_code,
+        Some(RuleErrorCode::NotEnrolledInSection)
+    );
+    let reverted_row =
+        parse_persisted_outcome_row(cmd_reg.event_id.as_uuid(), "REVERTED", None, None, 2, now)
+            .unwrap();
+    assert_eq!(reverted_row.status, EnrollmentEventStatus::Reverted);
+    assert!(
+        parse_persisted_outcome_row(cmd_reg.event_id.as_uuid(), "BAD", None, None, 1, now).is_err()
+    );
+
     // Lazy SQLx pool fast-fail checks
     assert!(build_pg_connect_options("postgresql://u:p@127.0.0.1:1/db").is_ok());
     assert!(build_pg_connect_options("://bad").is_err());
@@ -894,12 +915,6 @@ async fn kafka_helpers_outbox_sweeper_and_postgres_helpers_work() {
         .record_stale_epoch_rejection(&cmd_reg, 3, now)
         .await
         .is_err());
-    assert!(pg.fetch_unpublished_revert_outbox(10).await.is_err());
-    assert!(pg
-        .mark_revert_outbox_published(&[cmd_reg.event_id])
-        .await
-        .is_err());
-    assert_eq!(pg.mark_revert_outbox_published(&[]).await.unwrap(), 0);
 }
 
 /// Optional real PostgreSQL integration test against Flyway V002+V004 schemas when `TEST_DATABASE_URL` is provided.
@@ -1052,17 +1067,6 @@ async fn pg_writer_repository_real_postgres_unnest_check_and_outbox() {
             .unwrap(),
         SingleEventOutcome::Committed(_)
     ));
-
-    // Verify outbox fetch & mark_published on real PG
-    let unpublished = repo.fetch_unpublished_revert_outbox(50).await.unwrap();
-    assert!(unpublished
-        .iter()
-        .any(|r| r.event_id == ev_overflow.event_id));
-    let marked = repo
-        .mark_revert_outbox_published(&[ev_overflow.event_id])
-        .await
-        .unwrap();
-    assert_eq!(marked, 1);
 
     // Verify reconciliation invariant: course_sections.enrolled_count == COUNT(CONFIRMED)
     let row = sqlx::query("SELECT enrolled_count FROM catalog.course_sections WHERE id = $1")

@@ -22,8 +22,6 @@ pub struct WriterConfig {
     pub redis_password: Option<String>,
     pub batch_size: usize,
     pub batch_timeout_ms: u64,
-    pub outbox_sweep_interval_ms: u64,
-    pub outbox_sweep_batch_size: i64,
     pub max_db_retries: u32,
     pub db_retry_backoff_ms: u64,
     pub cache_ttl_secs: u64,
@@ -83,18 +81,6 @@ impl WriterConfig {
         let batch_size = parse_usize_min(non_empty("BATCH_SIZE"), "BATCH_SIZE", 250, 1)?;
         let batch_timeout_ms =
             parse_u64_min(non_empty("BATCH_TIMEOUT_MS"), "BATCH_TIMEOUT_MS", 30, 1)?;
-        let outbox_sweep_interval_ms = parse_u64_min(
-            non_empty("OUTBOX_SWEEP_INTERVAL_MS"),
-            "OUTBOX_SWEEP_INTERVAL_MS",
-            1000,
-            50,
-        )?;
-        let outbox_sweep_batch_size = parse_i64_min(
-            non_empty("OUTBOX_SWEEP_BATCH_SIZE"),
-            "OUTBOX_SWEEP_BATCH_SIZE",
-            100,
-            1,
-        )?;
         let max_db_retries = parse_u32_min(non_empty("MAX_DB_RETRIES"), "MAX_DB_RETRIES", 3, 0)?;
         let db_retry_backoff_ms = parse_u64_min(
             non_empty("DB_RETRY_BACKOFF_MS"),
@@ -122,8 +108,6 @@ impl WriterConfig {
             redis_password,
             batch_size,
             batch_timeout_ms,
-            outbox_sweep_interval_ms,
-            outbox_sweep_batch_size,
             max_db_retries,
             db_retry_backoff_ms,
             cache_ttl_secs,
@@ -185,28 +169,6 @@ fn parse_u64_min(
     let val = match raw {
         None => default,
         Some(v) => v.parse::<u64>().map_err(|e| ConfigError::InvalidValue {
-            key,
-            reason: e.to_string(),
-        })?,
-    };
-    if val < min {
-        return Err(ConfigError::InvalidValue {
-            key,
-            reason: format!("must be >= {min}"),
-        });
-    }
-    Ok(val)
-}
-
-fn parse_i64_min(
-    raw: Option<String>,
-    key: &'static str,
-    default: i64,
-    min: i64,
-) -> Result<i64, ConfigError> {
-    let val = match raw {
-        None => default,
-        Some(v) => v.parse::<i64>().map_err(|e| ConfigError::InvalidValue {
             key,
             reason: e.to_string(),
         })?,

@@ -1,6 +1,6 @@
 use crate::core::{
-    compute_commit_offsets, BatchAccumulator, DeltaRevertPublisher, DlqPublisher,
-    IncomingKafkaRecord, PartitionOffset, WriterProcessor, WriterReadiness,
+    compute_commit_offsets, BatchAccumulator, DlqPublisher, IncomingKafkaRecord, OutcomePublisher,
+    PartitionOffset, WriterProcessor, WriterReadiness,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -15,8 +15,8 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{error, warn};
 use unieee_events::{
-    encode_json, DeadLetterEvent, EnrollmentDeltaEvent, RevertEvent,
-    KAFKA_TOPIC_ENROLLMENT_COMMANDS, KAFKA_TOPIC_ENROLLMENT_DELTAS, KAFKA_TOPIC_ENROLLMENT_DLQ,
+    encode_json, DeadLetterEvent, EnrollmentOutcomeEvent, KAFKA_TOPIC_ENROLLMENT_COMMANDS,
+    KAFKA_TOPIC_ENROLLMENT_DLQ, KAFKA_TOPIC_ENROLLMENT_OUTCOMES,
 };
 
 /// Builds a manual-commit Kafka consumer config (auto-commit and auto-offset-store disabled).
@@ -51,7 +51,7 @@ impl RdkafkaDlqPublisher {
     pub fn new(brokers: &str) -> Result<Self, String> {
         let producer: FutureProducer = build_dlq_producer_config(brokers)
             .create()
-            .map_err(|e| format!("failed to build Kafka DLQ FutureProducer: {e}"))?;
+            .map_err(|e| format!("failed to build Kafka FutureProducer: {e}"))?;
         Ok(Self { producer })
     }
 }
@@ -73,26 +73,25 @@ impl DlqPublisher for RdkafkaDlqPublisher {
     }
 }
 
-pub fn encode_revert_delta_payload(ev: &RevertEvent) -> Result<(String, String), String> {
-    let delta = EnrollmentDeltaEvent::Revert(ev.clone());
-    let key = delta.partition_key();
+pub fn encode_outcome_payload(ev: &EnrollmentOutcomeEvent) -> Result<(String, String), String> {
+    let key = ev.partition_key();
     let payload =
-        encode_json(&delta).map_err(|e| format!("failed encoding Revert delta event: {e}"))?;
+        encode_json(ev).map_err(|e| format!("failed encoding EnrollmentOutcomeEvent: {e}"))?;
     Ok((key, payload))
 }
 
 #[async_trait]
-impl DeltaRevertPublisher for RdkafkaDlqPublisher {
-    async fn publish_revert_deltas(&self, events: &[RevertEvent]) -> Result<(), String> {
+impl OutcomePublisher for RdkafkaDlqPublisher {
+    async fn publish_outcomes(&self, events: &[EnrollmentOutcomeEvent]) -> Result<(), String> {
         for ev in events {
-            let (key, payload) = encode_revert_delta_payload(ev)?;
-            let record = FutureRecord::to(KAFKA_TOPIC_ENROLLMENT_DELTAS)
+            let (key, payload) = encode_outcome_payload(ev)?;
+            let record = FutureRecord::to(KAFKA_TOPIC_ENROLLMENT_OUTCOMES)
                 .payload(&payload)
                 .key(&key);
             self.producer
                 .send(record, Duration::from_secs(3))
                 .await
-                .map_err(|(err, _)| format!("Kafka delta revert send error: {err}"))?;
+                .map_err(|(err, _)| format!("Kafka outcome send error: {err}"))?;
         }
         Ok(())
     }
@@ -155,7 +154,10 @@ pub async fn flush_batch_with_retry(
                 processor.set_readiness(WriterReadiness::Ready);
                 let offsets = compute_commit_offsets(batch);
                 if let Err(err) = committer.commit_offsets(&offsets) {
-                    warn!(error = %err, "Kafka manual offset commit failed after DB commit");
+                    warn!(
+                        error = %err,
+                        "Kafka manual offset commit failed after DB & outcome commit"
+                    );
                 }
                 return true;
             }
@@ -266,33 +268,6 @@ pub fn spawn_writer_consumer_loop(
             if let Ok(_report) = processor.process_kafka_records(&batch, Utc::now()).await {
                 let offsets = compute_commit_offsets(&batch);
                 let _ = consumer.commit_offsets(&offsets);
-            }
-        }
-    })
-}
-
-pub fn spawn_outbox_sweeper(
-    processor: Arc<WriterProcessor>,
-    interval: Duration,
-    batch_limit: i64,
-    mut shutdown: watch::Receiver<bool>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            tokio::select! {
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        break;
-                    }
-                }
-                _ = ticker.tick() => {
-                    if let Err(err) = processor.sweep_outbox_once(batch_limit).await {
-                        warn!(error = %err, "writer_revert_outbox sweep failed; will retry on next tick");
-                    }
-                }
             }
         }
     })

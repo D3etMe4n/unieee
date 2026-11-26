@@ -3,10 +3,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
-use unieee_domain::{CourseId, EventId, RuleErrorCode, SectionId, StudentId, TermId};
+use unieee_domain::{
+    CourseId, EnrollmentEventStatus, EventId, RuleErrorCode, SectionId, StudentId, TermId,
+};
 use unieee_events::{
-    DeadLetterEvent, EnrollmentCommandEvent, EventStatusCachePayload, RevertEvent,
-    SeatConfirmedEvent,
+    DeadLetterEvent, EnrollmentCommandEvent, EnrollmentOutcomeEvent, EventStatusCachePayload,
+    RevertEvent, SeatConfirmedEvent,
 };
 
 /// Authoritative section capacity state returned by PostgreSQL after an atomic update.
@@ -53,11 +55,22 @@ pub struct DecodedBatch {
     pub dead_letters: Vec<DeadLetterEvent>,
 }
 
-/// Unpublished outbox entry from `registration.writer_revert_outbox`.
+/// Persisted outcome row reloaded from `registration.enrollment_events` on duplicate redelivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutboxRevertRow {
+pub struct PersistedEventOutcome {
     pub event_id: EventId,
-    pub payload_json: String,
+    pub status: EnrollmentEventStatus,
+    pub reason_code: Option<RuleErrorCode>,
+    pub reason_detail: Option<String>,
+    pub engine_epoch: u64,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Outcome of recording a stale-epoch rejection in `registration.enrollment_events`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StaleRejectionOutcome {
+    Rejected(RevertEvent),
+    AlreadyPersisted(PersistedEventOutcome),
 }
 
 /// Result of executing a fast-path `UNNEST` batch transaction in PostgreSQL.
@@ -65,6 +78,7 @@ pub struct OutboxRevertRow {
 pub struct FastBatchCommitResult {
     pub committed_events: Vec<EnrollmentCommandEvent>,
     pub duplicate_skipped: usize,
+    pub replayed_duplicate_outcomes: Vec<(EnrollmentCommandEvent, PersistedEventOutcome)>,
     pub updated_sections: HashMap<SectionId, SectionSeatSnapshot>,
 }
 
@@ -81,7 +95,7 @@ pub enum FastPathBatchError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SingleEventOutcome {
     Committed(SectionSeatSnapshot),
-    DuplicateSkipped,
+    AlreadyPersisted(PersistedEventOutcome),
     Rejected(RevertEvent),
 }
 
@@ -99,6 +113,8 @@ pub enum WriterError {
     TransientDb(String),
     #[error("failed publishing malformed record to DLQ: {0}")]
     DlqPublishFailed(String),
+    #[error("failed publishing enrollment outcomes to Kafka: {0}")]
+    OutcomePublishFailed(String),
 }
 
 /// Operational readiness state surfaced on `/readyz`.
@@ -137,8 +153,9 @@ pub struct WriterMetrics {
     pub events_confirmed: AtomicU64,
     pub events_reverted: AtomicU64,
     pub events_duplicate_skipped: AtomicU64,
+    pub events_duplicate_reemitted: AtomicU64,
+    pub events_outcomes_published: AtomicU64,
     pub events_dlq: AtomicU64,
-    pub outbox_swept: AtomicU64,
     pub transient_retries: AtomicU64,
 }
 
@@ -150,8 +167,9 @@ impl WriterMetrics {
             events_confirmed: self.events_confirmed.load(Ordering::Relaxed),
             events_reverted: self.events_reverted.load(Ordering::Relaxed),
             events_duplicate_skipped: self.events_duplicate_skipped.load(Ordering::Relaxed),
+            events_duplicate_reemitted: self.events_duplicate_reemitted.load(Ordering::Relaxed),
+            events_outcomes_published: self.events_outcomes_published.load(Ordering::Relaxed),
             events_dlq: self.events_dlq.load(Ordering::Relaxed),
-            outbox_swept: self.outbox_swept.load(Ordering::Relaxed),
             transient_retries: self.transient_retries.load(Ordering::Relaxed),
         }
     }
@@ -164,8 +182,9 @@ pub struct WriterMetricsSnapshot {
     pub events_confirmed: u64,
     pub events_reverted: u64,
     pub events_duplicate_skipped: u64,
+    pub events_duplicate_reemitted: u64,
+    pub events_outcomes_published: u64,
     pub events_dlq: u64,
-    pub outbox_swept: u64,
     pub transient_retries: u64,
 }
 
@@ -215,9 +234,11 @@ pub struct BatchExecutionReport {
     pub confirmed_count: usize,
     pub rejected_count: usize,
     pub duplicate_skipped_count: usize,
+    pub duplicate_reemitted_count: usize,
+    pub outcomes_published_count: usize,
     pub dlq_count: usize,
     pub used_isolation_fallback: bool,
     pub confirmed_events: Vec<SeatConfirmedEvent>,
     pub reverted_events: Vec<RevertEvent>,
-    pub outbox_marked_published: usize,
+    pub outcomes: Vec<EnrollmentOutcomeEvent>,
 }

@@ -16,10 +16,10 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 use unieee_domain::HotPathEnrollmentState;
 use unieee_events::{
-    decode_json, encode_json, event_status_cache_key, section_seats_cache_key,
-    student_timetable_cache_key, term_sections_cache_key, EventStatusCachePayload,
-    HotPathPubSubMessage, RevertEvent, SeatConfirmedEvent, REDIS_CHANNEL_ENROLLMENT_REVERT,
-    REDIS_CHANNEL_GATE_CONTROL, REDIS_CHANNEL_SEAT_CONFIRMED,
+    encode_json, event_status_cache_key, section_seats_cache_key, student_timetable_cache_key,
+    term_sections_cache_key, EventStatusCachePayload, HotPathPubSubMessage, RevertEvent,
+    SeatConfirmedEvent, REDIS_CHANNEL_ENROLLMENT_REVERT, REDIS_CHANNEL_GATE_CONTROL,
+    REDIS_CHANNEL_SEAT_CONFIRMED,
 };
 
 #[derive(Clone)]
@@ -311,34 +311,6 @@ impl RedisWriterSink for RedisWriterAdapter {
                 .arg("EX")
                 .arg(status_ttl)
                 .ignore();
-            pipe.cmd("PUBLISH")
-                .arg(REDIS_CHANNEL_ENROLLMENT_REVERT)
-                .arg(payload)
-                .ignore();
-        }
-        let mut conn = self.backend.get_multiplexed_async_connection().await?;
-        pipe.query_async::<()>(&mut conn)
-            .await
-            .map_err(|e| format!("Redis revert pipeline PUBLISH failed: {e}"))
-    }
-
-    async fn publish_raw_revert_payloads(&self, payloads: &[String]) -> Result<(), String> {
-        if payloads.is_empty() {
-            return Ok(());
-        }
-        let status_ttl = self.event_status_ttl_secs.max(1);
-        let mut pipe = redis::pipe();
-        for payload in payloads {
-            if let Ok(ev) = decode_json::<RevertEvent>(payload) {
-                if let Ok(status_json) = encode_json(&revert_event_to_status_payload(&ev)) {
-                    pipe.cmd("SET")
-                        .arg(event_status_cache_key(ev.event_id))
-                        .arg(status_json)
-                        .arg("EX")
-                        .arg(status_ttl)
-                        .ignore();
-                }
-            }
             pipe.cmd("PUBLISH")
                 .arg(REDIS_CHANNEL_ENROLLMENT_REVERT)
                 .arg(payload)

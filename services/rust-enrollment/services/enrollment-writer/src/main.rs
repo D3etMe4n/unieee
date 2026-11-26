@@ -4,16 +4,14 @@
 )]
 
 use anyhow::Context;
-use enrollment_writer::adapters::kafka::{
-    spawn_outbox_sweeper, spawn_writer_consumer_loop, RdkafkaDlqPublisher,
-};
+use enrollment_writer::adapters::kafka::{spawn_writer_consumer_loop, RdkafkaDlqPublisher};
 use enrollment_writer::adapters::postgres::PgWriterRepository;
 use enrollment_writer::adapters::redis_io::{
     connect_redis_backend, spawn_gate_control_listener, RedisWriterAdapter,
 };
 use enrollment_writer::config::WriterConfig;
 use enrollment_writer::core::{
-    DeltaRevertPublisher, WriterProcessor, WriterProcessorConfig, WriterReadiness,
+    OutcomePublisher, WriterProcessor, WriterProcessorConfig, WriterReadiness,
 };
 use enrollment_writer::http::{build_router, WriterAppState};
 use std::sync::Arc;
@@ -42,24 +40,22 @@ async fn main() -> anyhow::Result<()> {
         redis_backend.clone(),
         cfg.event_status_ttl_secs,
     ));
-    let dlq_pub =
+    let kafka_pub =
         Arc::new(RdkafkaDlqPublisher::new(&cfg.kafka_brokers).map_err(anyhow::Error::msg)?);
-    let delta_pub = Arc::clone(&dlq_pub) as Arc<dyn DeltaRevertPublisher>;
+    let outcome_pub = Arc::clone(&kafka_pub) as Arc<dyn OutcomePublisher>;
 
-    let processor = Arc::new(
-        WriterProcessor::new(
-            pg_repo,
-            redis_sink,
-            dlq_pub,
-            WriterProcessorConfig {
-                max_db_retries: cfg.max_db_retries,
-                db_retry_backoff: Duration::from_millis(cfg.db_retry_backoff_ms),
-                cache_ttl_secs: cfg.cache_ttl_secs,
-                event_status_ttl_secs: cfg.event_status_ttl_secs,
-            },
-        )
-        .with_delta_publisher(delta_pub),
-    );
+    let processor = Arc::new(WriterProcessor::new(
+        pg_repo,
+        redis_sink,
+        kafka_pub,
+        outcome_pub,
+        WriterProcessorConfig {
+            max_db_retries: cfg.max_db_retries,
+            db_retry_backoff: Duration::from_millis(cfg.db_retry_backoff_ms),
+            cache_ttl_secs: cfg.cache_ttl_secs,
+            event_status_ttl_secs: cfg.event_status_ttl_secs,
+        },
+    ));
 
     if let Err(err) = processor.bootstrap_epochs().await {
         warn!(error = %err, "initial epoch bootstrap failed; continuing with epoch 0 floor");
@@ -67,12 +63,6 @@ async fn main() -> anyhow::Result<()> {
     processor.set_readiness(WriterReadiness::Ready);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let outbox_handle = spawn_outbox_sweeper(
-        Arc::clone(&processor),
-        Duration::from_millis(cfg.outbox_sweep_interval_ms),
-        cfg.outbox_sweep_batch_size,
-        shutdown_rx.clone(),
-    );
     let gate_handle =
         spawn_gate_control_listener(redis_backend, Arc::clone(&processor), shutdown_rx.clone());
     let consumer_handle = spawn_writer_consumer_loop(
@@ -97,7 +87,6 @@ async fn main() -> anyhow::Result<()> {
 
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(5), consumer_handle).await;
-    let _ = tokio::time::timeout(Duration::from_secs(2), outbox_handle).await;
     drop(gate_handle);
     Ok(())
 }
