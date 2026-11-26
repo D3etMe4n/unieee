@@ -17,10 +17,10 @@
 | **Phase 5** | Khảo sát nguyện vọng (không giữ ghế), quản lý đợt đăng ký (`RegistrationWindow`), Policy Engine đa trường (6 rules), SHA-256 Policy Snapshot Exporter + Redis Read Cache (`V005`) | **Hoàn thành** (`dev`) |
 | **Phase 6** | Rust Cargo Workspace (`services/rust-enrollment/`), `unieee-domain` (Bitmask Engine + `proptest`), `unieee-events`, `unieee-cacheline` (`#[repr(align(64))]`) | **Hoàn thành** (`dev`) |
 | **Phase 7** | Rust `enrollment-engine` (Axum + Tokio, xác thực JWKS singleflight cục bộ, preload PostgreSQL + disk snapshots, CAS lock-free, Kafka producer, replay phục hồi theo epoch & Hot Delta Sync) | **Hoàn thành** (`dev`) |
-| **Phase 8** | Rust `enrollment-writer` (Kafka micro-batch consumer, SQL `UNNEST` + `CHECK`, `writer_revert_outbox`, đồng bộ Redis cache & Revert Pub/Sub) | **Hoàn thành** (`dev`) |
-| **Phase 9** | Rust `sse-gateway` (Redis Pub/Sub subscriber, `tokio::sync::broadcast`, gộp 150ms, jitter `retry`/`maxAge` & resync chống lag) | **Hoàn thành** (`dev`) |
+| **Phase 8** | Rust `enrollment-writer` (Kafka micro-batch consumer, SQL `UNNEST` + `CHECK`, producer `unieee.enrollment.outcomes` at-least-once kèm re-emit khi duplicate thay cho runtime outbox, đồng bộ Redis cache & SSE Pub/Sub) | **Hoàn thành** (`dev`) |
+| **Phase 9** | Rust `sse-gateway` (Redis Pub/Sub subscriber với sĩ số tuyệt đối, `tokio::sync::broadcast`, gộp 150ms, jitter `retry`/`maxAge` & resync chống lag) | **Hoàn thành** (`dev`) |
 | **Phase 10** | Module Spring AI 2.0.3 `ai_advisor` (4 `@Tool` chỉ đọc, Guardrails chống IDOR/prompt injection, kiểm chứng bằng `BitmaskConflictChecker` & fallback xác định) | **Hoàn thành** (`dev`) |
-| **Phase 11** | Hoàn thiện CLI vận hành (`prepare-registration`, `open-registration`, `close-registration` drain & đối soát 3 chiều), `/api/v1/public/*` cache lock, `/internal/preload-summary` đối chiếu SHA-256, Active–Standby `/readyz` failover, Keycloak link-only brokering & Hot Delta Sync | **Hoàn thành** (`dev`) |
+| **Phase 11** | Hoàn thiện CLI vận hành (`prepare-registration`, `open-registration`, `close-registration` drain lag=0 cả `commands`+`outcomes`, đối soát 3 chiều & `warm-cache` cuối kỳ), `/api/v1/public/*` cache lock, Nginx tách `$enrollment_read_upstream` + `1s` `seats_cache`, `/internal/preload-summary` đối chiếu SHA-256, Active–Standby `/readyz` failover, `core-java` Redis Read-Through Cache, Keycloak link-only brokering & Hot Delta Sync | **Hoàn thành** (`dev`) |
 | **Phase 12** | Bộ E2E Regression Suite (`tests/e2e/`) & Load Testing giờ vàng (`tests/load/`, chứng minh 0% overbooking & 0% trùng lịch) | *Kế hoạch* |
 
 ---
@@ -44,7 +44,7 @@ Mọi Pull Request vào `dev` hoặc `main` đều phải vượt qua **3 job t�
 1. **Infra, Scripts & Guardrails:**
    - Chặn tuyệt đối nếu phát hiện file secret (`.env`, `*.pem`, `*.key`, `*.crt`, `*.p12`) hoặc tệp chỉ lưu cục bộ lọt vào Git.
    - Kiểm tra syntax toàn bộ script shell (`bash -n` / `sh -n`), bao gồm `20-enrollment-healthcheck.sh`.
-   - Xác thực realm Keycloak (`registrationAllowed == false`, `accessTokenLifespan` trong `1800..3600s`, đủ 3 role, flow `unieee-first-broker-login-link-only` không chứa `idp-create-user-if-unique`) và cấu hình Nginx (`catalog_cache`, `proxy_cache_lock on`, `/tmp/enrollment-primary.conf`).
+   - Xác thực realm Keycloak (`registrationAllowed == false`, `accessTokenLifespan` trong `1800..3600s`, đủ 3 role, flow `unieee-first-broker-login-link-only` không chứa `idp-create-user-if-unique`), cấu hình Nginx (`catalog_cache`, `seats_cache`, `proxy_cache_lock on`, `/tmp/enrollment-primary.conf`, `$enrollment_read_upstream`, `/api/v1/enrollments/seats`, `/api/v1/enrollments/me`) và `compose.hotpath.yml` (`unieee.enrollment.outcomes`).
    - Xác thực toàn bộ 5 tổ hợp Compose (`compose.base.yml`, `compose.hotpath.yml`, `compose.letsencrypt.yml`, `compose.cloudflared.yml` quick & named).
    - Kiểm tra toàn bộ liên kết tương đối trong `README.md` và `README.vi.md`.
 2. **Spring Boot 4.1.3 Core & Modulith:**

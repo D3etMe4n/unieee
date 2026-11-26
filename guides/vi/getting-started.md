@@ -105,7 +105,7 @@ cd services/core-java
 
 Quy trình `./gradlew check` thực hiện tự động:
 1. **Unit & Architecture Tests:** JUnit 5 trên toàn bộ 4 Bounded Contexts (`catalog`, `account`, `registration`, `ai_advisor` guardrails/bitmask) + Spring Modulith `ApplicationModules.of(UnieeeApplication.class).verify()`.
-2. **PostgreSQL Integration Tests:** Testcontainers khởi chạy `postgres:17-alpine`, chạy toàn bộ Flyway migrations `V001`–`V005`, kiểm tra Hibernate schema validation (`ddl-auto: validate`), MockMvc API, Hot Delta Sync và database constraints.
+2. **PostgreSQL & Redis Integration Tests:** Testcontainers khởi chạy `postgres:17-alpine`, chạy toàn bộ Flyway migrations `V001`–`V005`, kiểm tra Hibernate schema validation (`ddl-auto: validate`), MockMvc API, Redis Read-Through Cache fail-open & invalidation, Hot Delta Sync và database constraints.
 3. **JaCoCo Verification:** Fail build nếu line coverage dưới **`90%`** ở các gói nghiệp vụ cốt lõi/bảo mật/guardrails hoặc dưới **`65%`** ở tầng biên/hạ tầng và toàn bundle.
 
 ### Mẹo cho Rootless Podman khi chạy Testcontainers
@@ -139,5 +139,5 @@ python3 ci/check_coverage.py target/llvm-cov.json
 
 Bộ kiểm tra này xác minh:
 1. **Format & Lints nghiêm ngặt:** Không sai lệch `rustfmt`, 0 cảnh báo Clippy (`deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)` trong toàn bộ code runtime).
-2. **Kiểm thử Domain, Concurrency & Tích hợp:** `proptest` đối chiếu Bitmask với interval oracle, kiểm tra `align_of::<SectionSeatSlot>() == 64`, stress test CAS đa luồng, tích hợp Kafka/Redis/PgBouncer, kiểm thử `CHECK` + Revert của `enrollment-writer`, và kiểm thử jitter/coalescing/E2E của `sse-gateway`.
+2. **Kiểm thử Domain, Concurrency & Tích hợp:** `proptest` đối chiếu Bitmask với interval oracle, kiểm tra `align_of::<SectionSeatSlot>() == 64`, stress test CAS đa luồng, tích hợp Kafka (`commands`/`outcomes`/`deltas`)/Redis/PgBouncer, kiểm thử đọc RAM `/seats` & `/me` chống IDOR, `CHECK` + crash-recovery re-emit `EnrollmentOutcomeEvent` của `enrollment-writer`, và jitter/coalescing/E2E của `sse-gateway`.
 3. **Độ phủ Phân tầng (`check_coverage.py`):** Cưỡng chế **`>= 90%`** line coverage cho `unieee-domain`, `unieee-events`, `unieee-cacheline` và các module `*::core`, và **`>= 65%`** cho các module `*::edge` cùng tổng workspace.

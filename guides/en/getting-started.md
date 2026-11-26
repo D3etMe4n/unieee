@@ -105,7 +105,7 @@ cd services/core-java
 
 What `./gradlew check` executes:
 1. **Unit & Architecture Tests:** JUnit 5 tests across all 4 bounded contexts (`catalog`, `account`, `registration`, `ai_advisor` guardrails/bitmask) + Spring Modulith `ApplicationModules.of(UnieeeApplication.class).verify()`.
-2. **PostgreSQL Integration Tests:** Testcontainers launches `postgres:17-alpine`, applies Flyway migrations `V001`–`V005`, validates JPA schemas (`ddl-auto: validate`), and verifies REST controllers, Hot Delta Sync, and DB constraints.
+2. **PostgreSQL & Redis Integration Tests:** Testcontainers launches `postgres:17-alpine`, applies Flyway migrations `V001`–`V005`, validates JPA schemas (`ddl-auto: validate`), and verifies REST controllers, fail-open Redis Read-Through Cache + invalidation, Hot Delta Sync, and DB constraints.
 3. **JaCoCo Verification:** Fails the build if line coverage drops below **`90%`** for critical domain/security/policy/guardrail packages or **`65%`** for edge/integration packages and overall bundle.
 
 ### Rootless Podman Tip for Testcontainers
@@ -139,5 +139,5 @@ python3 ci/check_coverage.py target/llvm-cov.json
 
 What this verifies:
 1. **Formatting & Strict Lints:** Zero `rustfmt` diffs and zero Clippy warnings (`deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)` in non-test crates/services).
-2. **Domain, Concurrency & Service Tests:** `proptest` bitmask vs interval oracle, compile/runtime check `align_of::<SectionSeatSlot>() == 64`, multi-thread barrier atomic CAS seat stress tests, Kafka/Redis/PgBouncer integration tests, `enrollment-writer` `CHECK` + Revert tests, and `sse-gateway` jitter/coalescing/E2E tests.
+2. **Domain, Concurrency & Service Tests:** `proptest` bitmask vs interval oracle, compile/runtime check `align_of::<SectionSeatSlot>() == 64`, multi-thread barrier atomic CAS seat stress tests, Kafka (`commands`/`outcomes`/`deltas`) + Redis + PgBouncer integration tests, RAM `/seats` & `/me` IDOR tests, `enrollment-writer` `CHECK` + crash-recovery `EnrollmentOutcomeEvent` re-emit tests, and `sse-gateway` jitter/coalescing/E2E tests.
 3. **Tiered Coverage (`check_coverage.py`):** Enforces **`>= 90%`** line coverage on `unieee-domain`, `unieee-events`, `unieee-cacheline`, and `*::core` modules, and **`>= 65%`** on `*::edge` modules and workspace total.

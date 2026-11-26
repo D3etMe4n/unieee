@@ -85,7 +85,7 @@ All HTTP endpoints are served behind the **Reverse Proxy** (`https://localhost:8
 | `GET` | `/api/v1/courses/{courseId}` | `STUDENT`, `LECTURER`, `ACADEMIC_ADMIN` | Get course details. |
 | `POST` / `GET` | `/api/v1/courses/{courseId}/prerequisites` | `ACADEMIC_ADMIN` (`POST`), All roles (`GET`) | Add (`PREREQUISITE`, `PRIOR_STUDY`, `COREQUISITE` with DFS cycle detection) or list prerequisites. |
 | `DELETE` | `/api/v1/courses/{courseId}/prerequisites/{prerequisiteId}` | `ACADEMIC_ADMIN` | Remove a prerequisite edge. |
-| `POST` / `GET` | `/api/v1/sections` | `ACADEMIC_ADMIN` (`POST`), All roles (`GET` with `?termId=`) | Create a section with schedule slots (checks lecturer overlap & generates bitmask) or list sections in a term. |
+| `POST` / `GET` | `/api/v1/sections` | `ACADEMIC_ADMIN` (`POST`), All roles (`GET` with `?termId=`) | Create a section with schedule slots (checks lecturer overlap & generates bitmask) or list sections in a term *(fail-open Redis static catalog Read-Through Cache `30m` overlaid with live Redis seat counts)*. |
 | `GET` / `PUT` | `/api/v1/sections/{sectionId}` | All roles (`GET`), `ACADEMIC_ADMIN` (`PUT`) | View or update section capacity, lecturer, and schedule slots (emits Hot Delta when `REGISTRATION_OPEN`). |
 | `POST` | `/api/v1/sections/{sectionId}/publish` | `ACADEMIC_ADMIN` | Open a planned section for registration. |
 | `POST` | `/api/v1/sections/{sectionId}/cancel` | `ACADEMIC_ADMIN` | Cancel a section with reason (emits Hot Delta when `REGISTRATION_OPEN`). |
@@ -116,11 +116,11 @@ All HTTP endpoints are served behind the **Reverse Proxy** (`https://localhost:8
 | `POST` | `/api/v1/admin/enrollments/add` | `ACADEMIC_ADMIN` | Directly enroll student (optional `bypassCapacity` / `bypassScheduleConflict`) + append audit log. |
 | `POST` | `/api/v1/admin/enrollments/drop` | `ACADEMIC_ADMIN` | Drop confirmed enrollment and release seat. |
 | `POST` | `/api/v1/admin/enrollments/transfer` | `ACADEMIC_ADMIN` | Atomically transfer student between sections in the same term. |
-| `GET` | `/api/v1/admin/enrollments/students/{studentId}/events` | `ACADEMIC_ADMIN` | Query append-only enrollment audit trail for a student. |
-| `GET` | `/api/v1/admin/enrollments/terms/{termId}/reconcile` | `ACADEMIC_ADMIN` | Reconcile `catalog.course_sections.enrolled_count` against `CONFIRMED` rows in `registration.enrollments`. |
+| `GET` | `/api/v1/admin/enrollments/students/{studentId}/events` | `ACADEMIC_ADMIN` | Query append-only enrollment audit trail for a student *(always uncached PostgreSQL read)*. |
+| `GET` | `/api/v1/admin/enrollments/terms/{termId}/reconcile` | `ACADEMIC_ADMIN` | Reconcile `catalog.course_sections.enrolled_count` against `CONFIRMED` rows in `registration.enrollments` *(always uncached PostgreSQL read)*. |
 | `POST` | `/api/v1/admin/enrollments/terms/{termId}/warm-cache` | `ACADEMIC_ADMIN` | Pre-warm Redis seat Read Cache (`unieee:cache:section:{sectionId}:seats`, `unieee:cache:term:{termId}:sections`); returns `RegistrationCacheWarmupResponse` (`termId`, `warmedSections`, `redisEnabled`, `warmedAt`). |
-| `GET` | `/api/v1/students/me/timetable?termId={termId}` | `STUDENT` | Get authenticated student's confirmed timetable for a term. |
-| `GET` | `/api/v1/lecturers/me/sections/{sectionId}/roster` | `LECTURER`, `ACADEMIC_ADMIN` | View confirmed roster (enforces ownership check `403 SECTION_ROSTER_FORBIDDEN` for lecturers). |
+| `GET` | `/api/v1/students/me/timetable?termId={termId}` | `STUDENT` | Get authenticated student's confirmed timetable for a term *(fail-open Redis Read-Through Cache: `45s` TTL when `REGISTRATION_OPEN`, `20m` otherwise; invalidated on writer batch commit, Admin override, or section schedule change)*. |
+| `GET` | `/api/v1/lecturers/me/sections/{sectionId}/roster` | `LECTURER`, `ACADEMIC_ADMIN` | View confirmed roster *(always uncached PostgreSQL read; enforces ownership check `403 SECTION_ROSTER_FORBIDDEN` for lecturers)*. |
 
 ### Wish Surveys (`registration` — Non-Seat-Reserving)
 
@@ -149,7 +149,7 @@ All HTTP endpoints are served behind the **Reverse Proxy** (`https://localhost:8
 | `POST` | `/api/v1/admin/policies/{policyId}/activate` | `ACADEMIC_ADMIN` | Activate policy (automatically deactivates any previous active policy for the term). |
 | `POST` | `/api/v1/admin/policies/simulate` | `ACADEMIC_ADMIN` | Simulate all 6 policy rules (`failFast=true|false`) for a student and candidate section. |
 | `POST` / `GET` | `/api/v1/admin/policies/terms/{termId}/export-snapshot`, `.../snapshot` | `ACADEMIC_ADMIN` | Compile & persist SHA-256 snapshot (caches to Redis) or fetch latest snapshot. |
-| `GET` | `/api/v1/policies/terms/{termId}/active` | `STUDENT`, `LECTURER`, `ACADEMIC_ADMIN` | Read the currently active registration policy for a term. |
+| `GET` | `/api/v1/policies/terms/{termId}/active` | `STUDENT`, `LECTURER`, `ACADEMIC_ADMIN` | Read the currently active registration policy for a term *(fail-open Redis Read-Through Cache `1h`, invalidated on policy update or activate)*. |
 
 ### Read-Only AI Schedule Advisor (`ai_advisor`, Phase 10)
 
@@ -214,12 +214,14 @@ All HTTP endpoints are served behind the **Reverse Proxy** (`https://localhost:8
 
 ## 3. Hot Path — Rust Enrollment Engine (`enrollment-engine`, Phases 7 & 11)
 
-Routed via Nginx `/api/v1/enrollments/*` (`enroll_limit` rate limiting + Active–Standby automatic failover):
+Write & status requests route via Nginx `/api/v1/enrollments/*` to `$enrollment_primary` (`enroll_limit` rate limiting + Active–Standby automatic failover), while lock-free RAM reads (`/seats` & `/me`) split via `$enrollment_read_upstream` to `STANDBY` when healthy:
 
 | Method | Path | Allowed Roles | Description |
 | :--- | :--- | :--- | :--- |
 | `POST` | `/api/v1/enrollments/register` | `STUDENT` | Validate all policy rules + 20x112 Bitmask in RAM, decrement seat atomically, emit Kafka command & coalesced `SeatTentativeEvent`. Optional `Idempotency-Key` header (1–128 printable chars). Returns **`202 Accepted`**. |
-| `POST` | `/api/v1/enrollments/drop` | `STUDENT` | Validate active registration & drop rules in RAM, release seat atomically, emit Kafka command. Optional `Idempotency-Key` header. Returns **`202 Accepted`**. |
+| `POST` | `/api/v1/enrollments/drop` | `STUDENT` | Validate active registration & drop rules in RAM, emit Kafka command, release seat on ack. Optional `Idempotency-Key` header. Returns **`202 Accepted`**. |
+| `GET` | `/api/v1/enrollments/seats?termId={termId}` | `STUDENT`, `LECTURER`, `ACADEMIC_ADMIN` | Lock-free read from `SectionSeatSlot` RAM on `$enrollment_read_upstream` returning `[{sectionId, availableSeats, maxCapacity, status}]`. Protected by Nginx `1s` `seats_cache` (`proxy_cache_lock on`, bypassing cache when unauthenticated). |
+| `GET` | `/api/v1/enrollments/me?termId={termId}` | `STUDENT` | Read student's own RAM shard (`{termId, studentId, currentCredits, items}` with `sectionId`, `courseId`, `action`, `status`, `lastEventId`), JWT-bound anti-IDOR, never cached at Nginx. |
 | `GET` | `/api/v1/enrollments/status/{event_id}` | `STUDENT` *(own events only)*, `ACADEMIC_ADMIN` *(any event)* | Query async enrollment status (`RESERVED` -> `CONFIRMED` or `REVERTED`) with RAM -> Redis -> PostgreSQL fallback lookup. |
 
 **`POST /api/v1/enrollments/register` Request & `202 Accepted` Response:**

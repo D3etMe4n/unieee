@@ -78,11 +78,12 @@ While the term is `REGISTRATION_OPEN`:
 What `cmd_close_registration` executes in strict sequence:
 1. Publishes `GateControlEvent(DRAINING)` followed by `GateControlEvent(CLOSED)` and waits for both engines to report `gateState == CLOSED`.
 2. Closes all `ACTIVE` and `PAUSED` registration windows for the term and transitions the term status to `REGISTRATION_CLOSED`.
-3. Waits up to `--drain-timeout` seconds until Kafka consumer group `unieee-enrollment-writer` reaches **`lag = 0`** across all partitions of `unieee.enrollment.commands` (including empty partitions) AND `registration.writer_revert_outbox` has `0` unpublished rows.
+3. Waits up to `--drain-timeout` seconds until Kafka `lag = 0` is reached across both consumer groups: `unieee-enrollment-writer` on `unieee.enrollment.commands` and the active engine consumer group on `unieee.enrollment.outcomes`.
 4. Runs **3-way strict reconciliation** (`0|0|0`):
    - `GET /api/v1/admin/enrollments/terms/{termId}/reconcile` reports `mismatchCount == 0`.
    - Direct PostgreSQL verification checks `0` out-of-bounds seat counts, `0` duplicate active `(student_id, course_id)` enrollments, and `0` discrepancies between `catalog.course_sections.enrolled_count` and net `CONFIRMED` events in `registration.enrollment_events`.
-5. Stops and removes the `hot-path` containers cleanly while keeping `core` running (pass `--keep-hot-path` to inspect containers post-drain).
+5. Calls `POST /api/v1/admin/enrollments/terms/{termId}/warm-cache` to lock the final reconciled seat counts into Redis Read Cache.
+6. Stops and removes the `hot-path` containers cleanly while keeping `core` running (pass `--keep-hot-path` to inspect containers post-drain).
 
 ---
 
@@ -147,11 +148,18 @@ echo "$ACCEPT_JSON" | jq .
 
 EVENT_ID=$(echo "$ACCEPT_JSON" | jq -r '.eventId')
 
-# 2. Poll durable status (RESERVED -> CONFIRMED or REVERTED)
+# 2. Inspect live seat availability & personal RAM state (served via $enrollment_read_upstream)
+curl -sk -H "Authorization: Bearer ${STUDENT_TOKEN}" \
+  "https://localhost:8443/api/v1/enrollments/seats?termId=${TERM_ID}" | jq .
+
+curl -sk -H "Authorization: Bearer ${STUDENT_TOKEN}" \
+  "https://localhost:8443/api/v1/enrollments/me?termId=${TERM_ID}" | jq .
+
+# 3. Poll durable status (RESERVED -> CONFIRMED or REVERTED)
 curl -sk -H "Authorization: Bearer ${STUDENT_TOKEN}" \
   "https://localhost:8443/api/v1/enrollments/status/${EVENT_ID}" | jq .
 
-# 3. Drop the section if needed (202 Accepted)
+# 4. Drop the section if needed (202 Accepted)
 curl -sk -X POST "https://localhost:8443/api/v1/enrollments/drop" \
   -H "Authorization: Bearer ${STUDENT_TOKEN}" \
   -H "Content-Type: application/json" \
@@ -184,13 +192,14 @@ The `ai_advisor` module (`POST /api/v1/ai/advisor/chat`) operates in two modes c
 
 ## 4. High Availability, Active–Standby Failover & Recovery
 
-- **Reverse Proxy Active–Standby Failover ([20-enrollment-healthcheck.sh](../../infra/reverse-proxy/20-enrollment-healthcheck.sh)):**
-  - Polls `http://<primary>:8081/readyz` and `http://<secondary>:8081/readyz` every `1s`.
-  - After **2 consecutive failures** on the active primary, promotes the healthy standby via `POST /internal/promote` (incrementing the fencing `epoch`), rewrites `/tmp/enrollment-primary.conf`, and executes `nginx -s reload`.
-  - **No Auto-Failback:** Once the standby has been promoted to `ACTIVE` and stays healthy, Nginx holds traffic on it even after the failed node restarts.
+- **Reverse Proxy Read/Write Split & Active–Standby Failover ([20-enrollment-healthcheck.sh](../../infra/reverse-proxy/20-enrollment-healthcheck.sh)):**
+  - Polls `http://<primary>:8081/readyz` and `http://<secondary>:8081/readyz` every `1s` and writes both `$enrollment_primary` and `$enrollment_read_upstream` in `/tmp/enrollment-primary.conf` before executing `nginx -s reload`.
+  - **Healthy Steady State:** Writes (`POST/DELETE`) go to `$enrollment_primary` (`ACTIVE`), while RAM reads (`GET /api/v1/enrollments/seats`, `GET /api/v1/enrollments/me`, `GET /api/v1/enrollments/status/{eventId}`) are offloaded to `$enrollment_read_upstream` (`STANDBY`). Both nodes stay synchronized via Kafka `unieee.enrollment.outcomes` and `unieee.enrollment.deltas`.
+  - **Degraded / Failover State:** After **2 consecutive failures** on the active primary, Nginx promotes the healthy standby via `POST /internal/promote` (incrementing the fencing `epoch`) and routes both `$enrollment_primary` and `$enrollment_read_upstream` to the surviving `ACTIVE` node (also avoiding `SYNCING` nodes returning `/readyz = 503`). `GET /api/v1/enrollments/seats` uses Nginx `seats_cache` (`1s` TTL, `proxy_cache_lock on`) to shield the surviving node.
+  - **No Auto-Failback:** Once promoted, Nginx keeps write ownership on the surviving `ACTIVE` node even after the failed node recovers; as soon as the recovered node passes `/readyz` as `STANDBY`, Nginx restores `$enrollment_read_upstream` to it.
 - **Zero-PG Snapshot Recovery & Standby Rejoin:**
   - Engines write atomic local disk snapshots (`SNAPSHOT_DIR=/var/lib/unieee/snapshots` with SHA-256 checksum and `checkpoint_seq`) after preload.
-  - On restart during peak hours, an engine boots with `REJOIN_AS_STANDBY_ON_RECOVERY=true`, keeps `/readyz` at `503` (`SYNCING`) until it loads the disk snapshot and replays `unieee.enrollment.commands` + `unieee.enrollment.deltas` from Kafka (**zero PostgreSQL queries**), and rejoins strictly as `STANDBY`.
+  - On restart during peak hours, an engine boots with `REJOIN_AS_STANDBY_ON_RECOVERY=true`, keeps `/readyz` at `503` (`SYNCING`) until it loads the disk snapshot and replays `unieee.enrollment.commands`, `unieee.enrollment.deltas`, and `unieee.enrollment.outcomes` from Kafka (**zero PostgreSQL queries**), and rejoins strictly as `STANDBY`.
   - Only if no valid local snapshot exists does it fall back to keyset-paginated PostgreSQL replay (`REPLAY_BATCH_SIZE=5000`, `REPLAY_THROTTLE_MS=30` ms) to avoid holding long transactions.
 - **Redis Sentinel-Aware Health Checks:**
   - `./scripts/unieee.sh health` queries `redis-sentinel-1` (`SENTINEL get-master-addr-by-name unieee-master`) to discover whichever Redis container currently holds `role:master`, validates replica links (`master_link_status:up`), and checks quorum (`ckquorum`) across all 3 Sentinels.

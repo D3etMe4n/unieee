@@ -85,7 +85,7 @@ Toàn bộ HTTP API đi qua **Reverse Proxy** (`https://localhost:8443` ở ch�
 | `GET` | `/api/v1/courses/{courseId}` | `STUDENT`, `LECTURER`, `ACADEMIC_ADMIN` | Xem chi tiết môn học. |
 | `POST` / `GET` | `/api/v1/courses/{courseId}/prerequisites` | `ACADEMIC_ADMIN` (`POST`), Mọi role (`GET`) | Thêm điều kiện (`PREREQUISITE`, `PRIOR_STUDY`, `COREQUISITE` kèm DFS chống vòng lặp) hoặc xem danh sách tiên quyết. |
 | `DELETE` | `/api/v1/courses/{courseId}/prerequisites/{prerequisiteId}` | `ACADEMIC_ADMIN` | Gỡ bỏ điều kiện môn học. |
-| `POST` / `GET` | `/api/v1/sections` | `ACADEMIC_ADMIN` (`POST`), Mọi role (`GET` với `?termId=`) | Mở lớp học phần kèm lịch học chi tiết (kiểm tra trùng lịch giảng viên & sinh Bitmask) hoặc liệt kê lớp theo kỳ. |
+| `POST` / `GET` | `/api/v1/sections` | `ACADEMIC_ADMIN` (`POST`), Mọi role (`GET` với `?termId=`) | Mở lớp học phần kèm lịch học chi tiết (kiểm tra trùng lịch giảng viên & sinh Bitmask) hoặc liệt kê lớp theo kỳ *(Redis Read-Through Cache fail-open `30m` cho metadata tĩnh + trộn lớp phủ sĩ số live từ Redis)*. |
 | `GET` / `PUT` | `/api/v1/sections/{sectionId}` | Mọi role (`GET`), `ACADEMIC_ADMIN` (`PUT`) | Xem hoặc cập nhật sĩ số, giảng viên và khung giờ học (tự phát Hot Delta khi `REGISTRATION_OPEN`). |
 | `POST` | `/api/v1/sections/{sectionId}/publish` | `ACADEMIC_ADMIN` | Chuyển lớp học phần sang trạng thái sẵn sàng mở đăng ký. |
 | `POST` | `/api/v1/sections/{sectionId}/cancel` | `ACADEMIC_ADMIN` | Hủy lớp học phần kèm lý do (tự phát Hot Delta khi `REGISTRATION_OPEN`). |
@@ -116,11 +116,11 @@ Toàn bộ HTTP API đi qua **Reverse Proxy** (`https://localhost:8443` ở ch�
 | `POST` | `/api/v1/admin/enrollments/add` | `ACADEMIC_ADMIN` | Thêm sinh viên vào lớp (tùy chọn `bypassCapacity` / `bypassScheduleConflict`) + ghi audit log. |
 | `POST` | `/api/v1/admin/enrollments/drop` | `ACADEMIC_ADMIN` | Hủy đăng ký đang xác nhận của sinh viên và hoàn ghế. |
 | `POST` | `/api/v1/admin/enrollments/transfer` | `ACADEMIC_ADMIN` | Chuyển lớp nguyên tử trong cùng học kỳ. |
-| `GET` | `/api/v1/admin/enrollments/students/{studentId}/events` | `ACADEMIC_ADMIN` | Tra cứu nhật ký sự kiện đăng ký append-only của sinh viên. |
-| `GET` | `/api/v1/admin/enrollments/terms/{termId}/reconcile` | `ACADEMIC_ADMIN` | Đối soát `catalog.course_sections.enrolled_count` với số bản ghi `CONFIRMED` trong `registration.enrollments`. |
+| `GET` | `/api/v1/admin/enrollments/students/{studentId}/events` | `ACADEMIC_ADMIN` | Tra cứu nhật ký sự kiện đăng ký append-only của sinh viên *(luôn đọc trực tiếp PostgreSQL, không cache)*. |
+| `GET` | `/api/v1/admin/enrollments/terms/{termId}/reconcile` | `ACADEMIC_ADMIN` | Đối soát `catalog.course_sections.enrolled_count` với số bản ghi `CONFIRMED` trong `registration.enrollments` *(luôn đọc trực tiếp PostgreSQL, không cache)*. |
 | `POST` | `/api/v1/admin/enrollments/terms/{termId}/warm-cache` | `ACADEMIC_ADMIN` | Làm ấm Redis Read Cache (`unieee:cache:section:{sectionId}:seats`, `unieee:cache:term:{termId}:sections`); trả về `RegistrationCacheWarmupResponse` (`termId`, `warmedSections`, `redisEnabled`, `warmedAt`). |
-| `GET` | `/api/v1/students/me/timetable?termId={termId}` | `STUDENT` | Xem thời khóa biểu các lớp đã xác nhận của sinh viên. |
-| `GET` | `/api/v1/lecturers/me/sections/{sectionId}/roster` | `LECTURER`, `ACADEMIC_ADMIN` | Xem danh sách sinh viên của lớp (chặn IDOR `403 SECTION_ROSTER_FORBIDDEN` nếu không phải giảng viên phụ trách). |
+| `GET` | `/api/v1/students/me/timetable?termId={termId}` | `STUDENT` | Xem thời khóa biểu các lớp đã xác nhận của sinh viên *(Redis Read-Through Cache fail-open: TTL `45s` khi `REGISTRATION_OPEN`, `20m` ngoài giờ; tự xóa cache khi writer commit, Admin can thiệp hoặc sửa lịch lớp)*. |
+| `GET` | `/api/v1/lecturers/me/sections/{sectionId}/roster` | `LECTURER`, `ACADEMIC_ADMIN` | Xem danh sách sinh viên của lớp *(luôn đọc trực tiếp PostgreSQL, không cache; chặn IDOR `403 SECTION_ROSTER_FORBIDDEN` nếu không phải giảng viên phụ trách)*. |
 
 ### Khảo sát Nguyện vọng (`registration` — Không Giữ ghế)
 
@@ -149,7 +149,7 @@ Toàn bộ HTTP API đi qua **Reverse Proxy** (`https://localhost:8443` ở ch�
 | `POST` | `/api/v1/admin/policies/{policyId}/activate` | `ACADEMIC_ADMIN` | Kích hoạt quy chế cho học kỳ (tự động tắt quy chế active trước đó). |
 | `POST` | `/api/v1/admin/policies/simulate` | `ACADEMIC_ADMIN` | Chạy mô phỏng toàn bộ 6 quy tắc (`failFast=true|false`) cho sinh viên và lớp dự kiến. |
 | `POST` / `GET` | `/api/v1/admin/policies/terms/{termId}/export-snapshot`, `.../snapshot` | `ACADEMIC_ADMIN` | Biên dịch & lưu snapshot SHA-256 (đồng bộ lên Redis) hoặc đọc snapshot mới nhất. |
-| `GET` | `/api/v1/policies/terms/{termId}/active` | `STUDENT`, `LECTURER`, `ACADEMIC_ADMIN` | Xem bộ quy chế đang kích hoạt của học kỳ. |
+| `GET` | `/api/v1/policies/terms/{termId}/active` | `STUDENT`, `LECTURER`, `ACADEMIC_ADMIN` | Xem bộ quy chế đang kích hoạt của học kỳ *(Redis Read-Through Cache fail-open `1h`, tự xóa cache khi update hoặc activate policy)*. |
 
 ### Trợ lý AI Xếp lịch Read-Only (`ai_advisor`, Phase 10)
 
@@ -214,12 +214,14 @@ Toàn bộ HTTP API đi qua **Reverse Proxy** (`https://localhost:8443` ở ch�
 
 ## 3. Hot Path — Rust Enrollment Engine (`enrollment-engine`, Phases 7 & 11)
 
-Đi qua Nginx `/api/v1/enrollments/*` (rate limit `enroll_limit` + Active–Standby failover tự động):
+Các lệnh ghi & tra cứu status đi qua Nginx `/api/v1/enrollments/*` tới `$enrollment_primary` (rate limit `enroll_limit` + Active–Standby failover), còn 2 endpoint đọc nhanh từ RAM (`/seats` & `/me`) được Nginx tách sang `$enrollment_read_upstream` (`STANDBY` khi khỏe mạnh):
 
 | Phương thức | Đường dẫn | Quyền truy cập | Mô tả |
 | :--- | :--- | :--- | :--- |
 | `POST` | `/api/v1/enrollments/register` | `STUDENT` | Kiểm tra toàn bộ quy chế & Bitmask 20x112 ngay trong RAM, trừ ghế nguyên tử, đẩy sự kiện vào Kafka & phát `SeatTentativeEvent` gộp nhóm. Hỗ trợ header tùy chọn `Idempotency-Key` (1–128 ký tự in được). Trả về **`202 Accepted`**. |
-| `POST` | `/api/v1/enrollments/drop` | `STUDENT` | Kiểm tra điều kiện hủy trong RAM, hoàn ghế nguyên tử và đẩy sự kiện vào Kafka. Hỗ trợ `Idempotency-Key`. Trả về **`202 Accepted`**. |
+| `POST` | `/api/v1/enrollments/drop` | `STUDENT` | Kiểm tra điều kiện hủy trong RAM, đẩy lệnh vào Kafka & hoàn ghế khi ack. Hỗ trợ `Idempotency-Key`. Trả về **`202 Accepted`**. |
+| `GET` | `/api/v1/enrollments/seats?termId={termId}` | `STUDENT`, `LECTURER`, `ACADEMIC_ADMIN` | Đọc lock-free từ `SectionSeatSlot` trong RAM trên `$enrollment_read_upstream`, trả về danh sách gọn `[{sectionId, availableSeats, maxCapacity, status}]`. Bọc bởi Nginx `1s` `seats_cache` (`proxy_cache_lock on`, bypass khi thiếu JWT). |
+| `GET` | `/api/v1/enrollments/me?termId={termId}` | `STUDENT` | Đọc trực tiếp từ shard `ShardedMap` của đúng `studentId` trong JWT (chống IDOR), trả `{termId, studentId, currentCredits, items}` (`sectionId`, `courseId`, `action`, `status`, `lastEventId`); không cache tại Nginx. |
 | `GET` | `/api/v1/enrollments/status/{event_id}` | `STUDENT` *(chỉ event của chính mình)*, `ACADEMIC_ADMIN` *(mọi event)* | Tra cứu trạng thái bất đồng bộ (`RESERVED` -> `CONFIRMED` hoặc `REVERTED`) theo chuỗi fallback RAM -> Redis -> PostgreSQL. |
 
 **Request & Response `POST /api/v1/enrollments/register`:**

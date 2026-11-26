@@ -78,11 +78,12 @@ Trong thời gian học kỳ ở trạng thái `REGISTRATION_OPEN`:
 Quy trình `cmd_close_registration` chạy theo thứ tự chặt chẽ:
 1. Phát `GateControlEvent(DRAINING)` rồi `GateControlEvent(CLOSED)` và chờ các engine chuyển `gateState == CLOSED`.
 2. Đóng toàn bộ đợt đang `ACTIVE` hoặc `PAUSED` của học kỳ và chuyển học kỳ sang `REGISTRATION_CLOSED`.
-3. Chờ tối đa `--drain-timeout` giây cho tới khi consumer group `unieee-enrollment-writer` đạt **`lag = 0`** trên mọi partition của `unieee.enrollment.commands` (kể cả partition rỗng) VÀ `registration.writer_revert_outbox` không còn bản ghi chờ phát (`published_at IS NULL`).
+3. Chờ tối đa `--drain-timeout` giây cho tới khi đạt **`lag = 0`** trên cả hai consumer group: `unieee-enrollment-writer` (`unieee.enrollment.commands`) và consumer group của engine đang `ACTIVE` (`unieee.enrollment.outcomes`).
 4. Thực thi **đối soát 3 chiều nghiêm ngặt (`0|0|0`)**:
    - `GET /api/v1/admin/enrollments/terms/{termId}/reconcile` trả về `mismatchCount == 0`.
    - Truy vấn PostgreSQL xác nhận `0` lớp lệch biên `[0, max_capacity]`, `0` sinh viên có nhiều hơn 1 bản ghi `CONFIRMED` cùng môn, và `0` sai lệch giữa `catalog.course_sections.enrolled_count` với tổng đại số sự kiện `CONFIRMED` trong `registration.enrollment_events`.
-5. Dừng và gỡ các container `hot-path` gọn gàng trong khi giữ stack `core` hoạt động 24/7 (dùng `--keep-hot-path` nếu muốn giữ lại container để kiểm tra).
+5. Gọi `POST /api/v1/admin/enrollments/terms/{termId}/warm-cache` để chốt lại số liệu sĩ số cuối cùng lên Redis Read Cache.
+6. Dừng và gỡ các container `hot-path` gọn gàng trong khi giữ stack `core` hoạt động 24/7 (dùng `--keep-hot-path` nếu muốn giữ lại container để kiểm tra).
 
 ---
 
@@ -147,11 +148,18 @@ echo "$ACCEPT_JSON" | jq .
 
 EVENT_ID=$(echo "$ACCEPT_JSON" | jq -r '.eventId')
 
-# 2. Tra cứu kết quả ghi PostgreSQL (RESERVED -> CONFIRMED hoặc REVERTED)
+# 2. Đọc sĩ số & trạng thái cá nhân từ RAM (định tuyến qua $enrollment_read_upstream)
+curl -sk -H "Authorization: Bearer ${STUDENT_TOKEN}" \
+  "https://localhost:8443/api/v1/enrollments/seats?termId=${TERM_ID}" | jq .
+
+curl -sk -H "Authorization: Bearer ${STUDENT_TOKEN}" \
+  "https://localhost:8443/api/v1/enrollments/me?termId=${TERM_ID}" | jq .
+
+# 3. Tra cứu kết quả ghi PostgreSQL (RESERVED -> CONFIRMED hoặc REVERTED)
 curl -sk -H "Authorization: Bearer ${STUDENT_TOKEN}" \
   "https://localhost:8443/api/v1/enrollments/status/${EVENT_ID}" | jq .
 
-# 3. Hủy lớp học phần (202 Accepted)
+# 4. Hủy lớp học phần (202 Accepted)
 curl -sk -X POST "https://localhost:8443/api/v1/enrollments/drop" \
   -H "Authorization: Bearer ${STUDENT_TOKEN}" \
   -H "Content-Type: application/json" \
@@ -184,13 +192,14 @@ Module `ai_advisor` (`POST /api/v1/ai/advisor/chat`) hỗ trợ hai chế độ 
 
 ## 4. High Availability, Active–Standby Failover & Phục hồi
 
-- **Reverse Proxy Active–Standby Failover ([20-enrollment-healthcheck.sh](../../infra/reverse-proxy/20-enrollment-healthcheck.sh)):**
-  - Thăm dò `http://<primary>:8081/readyz` và `http://<secondary>:8081/readyz` mỗi `1s`.
-  - Sau **2 lần lỗi liên tiếp** trên node chính, script tự động gọi `POST /internal/promote` lên Standby đang khỏe mạnh (tăng fencing `epoch`), cập nhật `/tmp/enrollment-primary.conf` và chạy `nginx -s reload`.
-  - **Chặn Auto-Failback:** Khi Standby đã lên `ACTIVE` và còn khỏe, Nginx giữ nguyên luồng trên node đó, không tự chuyển ngược lại khi node cũ vừa khởi động xong.
+- **Reverse Proxy Tách Đọc/Ghi & Active–Standby Failover ([20-enrollment-healthcheck.sh](../../infra/reverse-proxy/20-enrollment-healthcheck.sh)):**
+  - Thăm dò `http://<primary>:8081/readyz` và `http://<secondary>:8081/readyz` mỗi `1s`, cập nhật cả `$enrollment_primary` và `$enrollment_read_upstream` trong `/tmp/enrollment-primary.conf` trước khi chạy `nginx -s reload`.
+  - **Trạng thái Khỏe mạnh:** Luồng ghi (`POST/DELETE`) đi vào `$enrollment_primary` (`ACTIVE`), còn các endpoint đọc từ RAM (`GET /api/v1/enrollments/seats`, `GET /api/v1/enrollments/me`, `GET /api/v1/enrollments/status/{eventId}`) được tách sang `$enrollment_read_upstream` (`STANDBY`). Hai node luôn đồng bộ qua Kafka `unieee.enrollment.outcomes` và `unieee.enrollment.deltas`.
+  - **Trạng thái Degraded / Failover:** Sau **2 lần lỗi liên tiếp** trên node chính, Nginx gọi `POST /internal/promote` lên Standby khỏe mạnh (tăng fencing `epoch`) và trỏ cả `$enrollment_primary` lẫn `$enrollment_read_upstream` về node `ACTIVE` còn sống (tránh timeout node chết và tránh đọc node đang `SYNCING` với `/readyz = 503`). Route `GET /api/v1/enrollments/seats` được bọc Nginx `seats_cache` (`1s`, `proxy_cache_lock on`) để bảo vệ node sống duy nhất.
+  - **Chặn Auto-Failback:** Nginx giữ nguyên quyền ghi trên node `ACTIVE` đã được thăng cấp kể cả sau khi node cũ sống lại; ngay khi node cũ replay xong và `/readyz = 200` ở vai trò `STANDBY`, Nginx tự động tách lại `$enrollment_read_upstream` sang `STANDBY`.
 - **Phục hồi Từ Disk Snapshot Không Truy vấn PostgreSQL:**
   - Sau preload, engine ghi snapshot ra local volume (`SNAPSHOT_DIR=/var/lib/unieee/snapshots` kèm SHA-256 và `checkpoint_seq`).
-  - Khi node khởi động lại giữa cao điểm, nó chạy với `REJOIN_AS_STANDBY_ON_RECOVERY=true`, giữ `/readyz = 503` (`SYNCING`) cho đến khi nạp xong disk snapshot và replay phần còn thiếu từ Kafka (`unieee.enrollment.commands` + `unieee.enrollment.deltas`) với **0 câu query vào PostgreSQL**, rồi gia nhập lại ở vai trò `STANDBY`.
+  - Khi node khởi động lại giữa cao điểm, nó chạy với `REJOIN_AS_STANDBY_ON_RECOVERY=true`, giữ `/readyz = 503` (`SYNCING`) cho đến khi nạp xong disk snapshot và replay phần còn thiếu từ Kafka (`unieee.enrollment.commands`, `unieee.enrollment.deltas` và `unieee.enrollment.outcomes`) với **0 câu query vào PostgreSQL**, rồi gia nhập lại ở vai trò `STANDBY`.
   - Chỉ khi mất disk snapshot mới fallback sang keyset-paginated replay từ PostgreSQL (`REPLAY_BATCH_SIZE=5000`, `REPLAY_THROTTLE_MS=30` ms) để tránh giữ transaction dài.
 - **Kiểm tra Health Redis HA theo Sentinel:**
   - `./scripts/unieee.sh health` truy vấn `redis-sentinel-1` (`SENTINEL get-master-addr-by-name unieee-master`) để tìm đúng container đang giữ `role:master`, kiểm tra replication và quorum trên cả 3 Sentinel.
