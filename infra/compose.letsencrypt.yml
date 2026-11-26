@@ -1,0 +1,32 @@
+name: unieee
+
+volumes:
+  certbot_conf:
+
+services:
+  certbot:
+    image: docker.io/certbot/certbot:v3.2.0
+    container_name: unieee-certbot
+    restart: unless-stopped
+    depends_on:
+      reverse-proxy:
+        condition: service_healthy
+    environment:
+      UNIEEE_DOMAIN: ${UNIEEE_DOMAIN:-localhost}
+      UNIEEE_LETSENCRYPT_EMAIL: ${UNIEEE_LETSENCRYPT_EMAIL:-}
+      UNIEEE_LETSENCRYPT_STAGING: ${UNIEEE_LETSENCRYPT_STAGING:-true}
+    volumes:
+      - certbot_www:/var/www/certbot:rw
+      - certbot_conf:/etc/letsencrypt:rw
+      - ./reverse-proxy/certs:/etc/nginx/certs:rw
+      - ./letsencrypt/entrypoint.sh:/usr/local/bin/unieee-certbot-entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/unieee-certbot-entrypoint.sh"]
+    networks:
+      - edge
+      - app
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/certbot.ready && test -d /var/www/certbot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s

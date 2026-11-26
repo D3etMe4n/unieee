@@ -1,0 +1,169 @@
+{
+  "realm": "unieee",
+  "displayName": "unieee University Credit Registration",
+  "enabled": true,
+  "registrationAllowed": false,
+  "registrationEmailAsUsername": false,
+  "rememberMe": true,
+  "verifyEmail": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": true,
+  "editUsernameAllowed": false,
+  "sslRequired": "external",
+  "accessTokenLifespan": 900,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "roles": {
+    "realm": [
+      {
+        "name": "STUDENT",
+        "description": "Sinh vien tham gia khao sat, dang ky tin chi va su dung AI advisor"
+      },
+      {
+        "name": "LECTURER",
+        "description": "Giang vien xem lop phan cong, lich day va danh sach sinh vien"
+      },
+      {
+        "name": "ACADEMIC_ADMIN",
+        "description": "Phong Dao tao quan tri du lieu, tai khoan, quy che va cong dang ky"
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "unieee-web",
+      "name": "unieee Web Application",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "protocol": "openid-connect",
+      "redirectUris": [
+        "https://localhost:8443/*",
+        "http://localhost:8080/*",
+        "http://localhost:5173/*"
+      ],
+      "webOrigins": [
+        "+"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "+"
+      },
+      "protocolMappers": [
+        {
+          "name": "student_id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "userinfo.token.claim": "true",
+            "user.attribute": "student_id",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "student_id",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "lecturer_id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "userinfo.token.claim": "true",
+            "user.attribute": "lecturer_id",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "lecturer_id",
+            "jsonType.label": "String"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "unieee-admin-cli",
+      "name": "unieee Core Java Account Sync Client",
+      "enabled": true,
+      "publicClient": false,
+      "secret": "unieee-admin-cli-dev-secret",
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "protocol": "openid-connect"
+    }
+  ],
+  "users": [
+    {
+      "username": "admin01",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Phong",
+      "lastName": "Dao Tao",
+      "email": "admin01@unieee.edu.vn",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "Admin@123",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "ACADEMIC_ADMIN"
+      ]
+    },
+    {
+      "username": "lecturer01",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Giang",
+      "lastName": "Vien 01",
+      "email": "lecturer01@unieee.edu.vn",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "Lecturer@123",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "LECTURER"
+      ]
+    },
+    {
+      "username": "student01",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Sinh",
+      "lastName": "Vien 01",
+      "email": "student01@unieee.edu.vn",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "Student@123",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "STUDENT"
+      ]
+    },
+    {
+      "username": "service-account-unieee-admin-cli",
+      "enabled": true,
+      "serviceAccountClientId": "unieee-admin-cli",
+      "clientRoles": {
+        "realm-management": [
+          "manage-users",
+          "view-users",
+          "query-users",
+          "view-realm"
+        ]
+      }
+    }
+  ]
+}

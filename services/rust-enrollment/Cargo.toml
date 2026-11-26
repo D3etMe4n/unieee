@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/unieee-domain",
+  "crates/unieee-events",
+  "crates/unieee-cacheline",
+  "services/enrollment-engine",
+  "services/enrollment-writer",
+  "services/sse-gateway",
+]
+
+[workspace.package]
+version = "0.4.1"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+arc-swap = "1"
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+futures-util = "0.3"
+hex = "0.4"
+http-body-util = "0.1"
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+parking_lot = "0.12"
+proptest = "1"
+rdkafka = { version = "0.37", default-features = false, features = ["cmake-build", "tokio"] }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "sentinel"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rust_decimal = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "rust_decimal", "json"] }
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+
+unieee-domain = { path = "crates/unieee-domain" }
+unieee-events = { path = "crates/unieee-events" }
+unieee-cacheline = { path = "crates/unieee-cacheline" }

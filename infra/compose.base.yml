@@ -1,0 +1,310 @@
+name: unieee
+
+networks:
+  edge:
+    driver: bridge
+  app:
+    driver: bridge
+    internal: true
+  data:
+    driver: bridge
+    internal: true
+
+volumes:
+  postgres_data:
+  redis_master_data:
+  redis_replica_1_data:
+  redis_replica_2_data:
+  certbot_www:
+
+services:
+  postgres:
+    image: docker.io/library/postgres:17-alpine
+    container_name: unieee-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-unieee}
+      POSTGRES_USER: ${POSTGRES_USER:-unieee}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-unieee_dev_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init-databases.sql:/docker-entrypoint-initdb.d/01-init-databases.sql:ro
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-unieee} -d ${POSTGRES_DB:-unieee}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  pgbouncer:
+    image: docker.io/edoburu/pgbouncer:v1.23.1-p0
+    container_name: unieee-pgbouncer
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-unieee}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-unieee_dev_password}
+    volumes:
+      - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./pgbouncer/entrypoint.sh:/etc/pgbouncer/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/etc/pgbouncer/entrypoint.sh"]
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 6432"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  redis-master:
+    image: docker.io/library/redis:7.4-alpine
+    container_name: unieee-redis-master
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-unieee_redis_dev_password}
+    command:
+      - /bin/sh
+      - -c
+      - exec redis-server /etc/redis/redis-master.conf --requirepass "$REDIS_PASSWORD" --masterauth "$REDIS_PASSWORD"
+    volumes:
+      - ./redis/redis-master.conf:/etc/redis/redis-master.conf:ro
+      - redis_master_data:/data
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-replica-1:
+    image: docker.io/library/redis:7.4-alpine
+    container_name: unieee-redis-replica-1
+    restart: unless-stopped
+    depends_on:
+      redis-master:
+        condition: service_healthy
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-unieee_redis_dev_password}
+    command:
+      - /bin/sh
+      - -c
+      - exec redis-server /etc/redis/redis-replica.conf --replicaof redis-master 6379 --requirepass "$REDIS_PASSWORD" --masterauth "$REDIS_PASSWORD"
+    volumes:
+      - ./redis/redis-replica.conf:/etc/redis/redis-replica.conf:ro
+      - redis_replica_1_data:/data
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-replica-2:
+    image: docker.io/library/redis:7.4-alpine
+    container_name: unieee-redis-replica-2
+    restart: unless-stopped
+    depends_on:
+      redis-master:
+        condition: service_healthy
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-unieee_redis_dev_password}
+    command:
+      - /bin/sh
+      - -c
+      - exec redis-server /etc/redis/redis-replica.conf --replicaof redis-master 6379 --requirepass "$REDIS_PASSWORD" --masterauth "$REDIS_PASSWORD"
+    volumes:
+      - ./redis/redis-replica.conf:/etc/redis/redis-replica.conf:ro
+      - redis_replica_2_data:/data
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-sentinel-1:
+    image: docker.io/library/redis:7.4-alpine
+    container_name: unieee-redis-sentinel-1
+    restart: unless-stopped
+    depends_on:
+      redis-master:
+        condition: service_healthy
+      redis-replica-1:
+        condition: service_healthy
+      redis-replica-2:
+        condition: service_healthy
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-unieee_redis_dev_password}
+      SENTINEL_ANNOUNCE_IP: redis-sentinel-1
+    volumes:
+      - ./redis/sentinel.conf.tmpl:/etc/redis/sentinel.conf.tmpl:ro
+      - ./redis/entrypoint-sentinel.sh:/etc/redis/entrypoint-sentinel.sh:ro
+    entrypoint: ["/bin/sh", "/etc/redis/entrypoint-sentinel.sh"]
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 26379 ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-sentinel-2:
+    image: docker.io/library/redis:7.4-alpine
+    container_name: unieee-redis-sentinel-2
+    restart: unless-stopped
+    depends_on:
+      redis-master:
+        condition: service_healthy
+      redis-replica-1:
+        condition: service_healthy
+      redis-replica-2:
+        condition: service_healthy
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-unieee_redis_dev_password}
+      SENTINEL_ANNOUNCE_IP: redis-sentinel-2
+    volumes:
+      - ./redis/sentinel.conf.tmpl:/etc/redis/sentinel.conf.tmpl:ro
+      - ./redis/entrypoint-sentinel.sh:/etc/redis/entrypoint-sentinel.sh:ro
+    entrypoint: ["/bin/sh", "/etc/redis/entrypoint-sentinel.sh"]
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 26379 ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-sentinel-3:
+    image: docker.io/library/redis:7.4-alpine
+    container_name: unieee-redis-sentinel-3
+    restart: unless-stopped
+    depends_on:
+      redis-master:
+        condition: service_healthy
+      redis-replica-1:
+        condition: service_healthy
+      redis-replica-2:
+        condition: service_healthy
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-unieee_redis_dev_password}
+      SENTINEL_ANNOUNCE_IP: redis-sentinel-3
+    volumes:
+      - ./redis/sentinel.conf.tmpl:/etc/redis/sentinel.conf.tmpl:ro
+      - ./redis/entrypoint-sentinel.sh:/etc/redis/entrypoint-sentinel.sh:ro
+    entrypoint: ["/bin/sh", "/etc/redis/entrypoint-sentinel.sh"]
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 26379 ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.1
+    container_name: unieee-keycloak
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_KEYCLOAK_DB:-keycloak}
+      KC_DB_USERNAME: ${POSTGRES_USER:-unieee}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:-unieee_dev_password}
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin_dev_password}
+      KC_HTTP_ENABLED: "true"
+      KC_HTTP_RELATIVE_PATH: /auth
+      KC_PROXY_HEADERS: xforwarded
+      KC_HOSTNAME_STRICT: "false"
+      KC_HEALTH_ENABLED: "true"
+    command: ["start-dev", "--import-realm"]
+    volumes:
+      - ./keycloak/realm-unieee.json:/opt/keycloak/data/import/realm-unieee.json:ro
+    networks:
+      - app
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /auth/health/ready HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q '200' <&3"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
+  reverse-proxy:
+    image: docker.io/library/nginx:1.27-alpine
+    container_name: unieee-reverse-proxy
+    restart: unless-stopped
+    depends_on:
+      keycloak:
+        condition: service_started
+    environment:
+      UNIEEE_HTTPS_PORT: ${UNIEEE_HTTPS_PORT:-8443}
+      NGINX_ENVSUBST_FILTER: "^(NGINX_DNS_RESOLVER|UNIEEE_HTTPS_PORT)$$"
+    ports:
+      - "${UNIEEE_HTTP_PORT:-8080}:80"
+      - "${UNIEEE_HTTPS_PORT:-8443}:443"
+    volumes:
+      - ./reverse-proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./reverse-proxy/conf.d/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./reverse-proxy/snippets:/etc/nginx/snippets:ro
+      - ./reverse-proxy/10-detect-resolver.envsh:/docker-entrypoint.d/10-detect-resolver.envsh:ro
+      - ./reverse-proxy/certs:/etc/nginx/certs:ro
+      - certbot_www:/var/www/certbot:ro
+    networks:
+      - edge
+      - app
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/proxy-health >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  core-java:
+    build:
+      context: ../services/core-java
+      dockerfile: Dockerfile
+    container_name: unieee-core-java
+    restart: unless-stopped
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis-master:
+        condition: service_healthy
+      redis-sentinel-1:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    environment:
+      DB_HOST: pgbouncer
+      DB_PORT: 6432
+      DB_NAME: ${POSTGRES_DB:-unieee}
+      DB_USER: ${POSTGRES_USER:-unieee}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-unieee_dev_password}
+      SPRING_DATA_REDIS_SENTINEL_MASTER: unieee-master
+      SPRING_DATA_REDIS_SENTINEL_NODES: redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:-unieee_redis_dev_password}
+      KEYCLOAK_JWK_SET_URI: http://keycloak:8080/auth/realms/unieee/protocol/openid-connect/certs
+      KEYCLOAK_ADMIN_BASE_URL: http://keycloak:8080/auth
+      KEYCLOAK_REALM: unieee
+      KEYCLOAK_ADMIN_CLIENT_ID: unieee-admin-cli
+      KEYCLOAK_ADMIN_CLIENT_SECRET: ${KEYCLOAK_ADMIN_CLIENT_SECRET:-unieee-admin-cli-dev-secret}
+      SERVER_PORT: 8080
+    networks:
+      - app
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/actuator/health/readiness | grep -q '\"status\":\"UP\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s

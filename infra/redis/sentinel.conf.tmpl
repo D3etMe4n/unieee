@@ -1,0 +1,12 @@
+port 26379
+dir /tmp
+
+sentinel resolve-hostnames yes
+sentinel announce-hostnames yes
+sentinel announce-ip ${SENTINEL_ANNOUNCE_IP}
+
+sentinel monitor unieee-master redis-master 6379 2
+sentinel auth-pass unieee-master ${REDIS_PASSWORD}
+sentinel down-after-milliseconds unieee-master 3000
+sentinel failover-timeout unieee-master 10000
+sentinel parallel-syncs unieee-master 1

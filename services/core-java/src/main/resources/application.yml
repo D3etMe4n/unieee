@@ -1,0 +1,116 @@
+spring:
+  application:
+    name: unieee-core-java
+  threads:
+    virtual:
+      enabled: true
+  task:
+    execution:
+      thread-name-prefix: unieee-vt-
+      shutdown:
+        await-termination: true
+        await-termination-period: 30s
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:6432}/${DB_NAME:unieee}?prepareThreshold=0
+    username: ${DB_USER:unieee}
+    password: ${DB_PASSWORD:unieee_dev_password}
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 5000
+      idle-timeout: 300000
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+  modulith:
+    events:
+      completion-mode: update
+      jdbc:
+        schema-initialization:
+          enabled: false
+
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: ${KEYCLOAK_JWK_SET_URI:http://keycloak:8080/auth/realms/unieee/protocol/openid-connect/certs}
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:unieee_redis_dev_password}
+
+  ai:
+    model:
+      chat: ${SPRING_AI_CHAT_PROVIDER:none}
+      embedding: none
+      image: none
+      moderation: none
+      audio:
+        transcription: none
+        speech: none
+    openai:
+      api-key: ${OPENAI_API_KEY:disabled}
+      base-url: ${OPENAI_BASE_URL:https://api.openai.com}
+      chat:
+        options:
+          model: ${OPENAI_CHAT_MODEL:gpt-4o-mini}
+          temperature: ${OPENAI_CHAT_TEMPERATURE:0.2}
+
+server:
+  port: ${SERVER_PORT:8080}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: when_authorized
+
+unieee:
+  outbox:
+    cleanup:
+      enabled: true
+      cron: ${OUTBOX_CLEANUP_CRON:0 0 */4 * * *}
+      retention: ${OUTBOX_CLEANUP_RETENTION:24h}
+  keycloak:
+    admin:
+      enabled: ${KEYCLOAK_ADMIN_ENABLED:true}
+      base-url: ${KEYCLOAK_ADMIN_BASE_URL:http://keycloak:8080/auth}
+      realm: ${KEYCLOAK_REALM:unieee}
+      client-id: ${KEYCLOAK_ADMIN_CLIENT_ID:unieee-admin-cli}
+      client-secret: ${KEYCLOAK_ADMIN_CLIENT_SECRET:unieee-admin-cli-dev-secret}
+      connect-timeout: 5s
+      read-timeout: 10s
+  policy:
+    cache:
+      redis:
+        enabled: ${POLICY_CACHE_REDIS_ENABLED:true}
+        ttl: ${POLICY_CACHE_REDIS_TTL:1h}
+  ai-advisor:
+    enabled: ${AI_ADVISOR_ENABLED:true}
+    timeout: ${AI_ADVISOR_TIMEOUT:15s}
+    rate-limit-per-minute: ${AI_ADVISOR_RATE_LIMIT_PER_MINUTE:10}
+    circuit-breaker-failure-threshold: ${AI_ADVISOR_CB_FAILURE_THRESHOLD:3}
+    circuit-breaker-open-duration: ${AI_ADVISOR_CB_OPEN_DURATION:30s}
+    max-message-length: ${AI_ADVISOR_MAX_MESSAGE_LENGTH:2000}
+    max-options: ${AI_ADVISOR_MAX_OPTIONS:3}
+    redis-seat-cache:
+      enabled: ${AI_ADVISOR_REDIS_SEAT_CACHE_ENABLED:true}
