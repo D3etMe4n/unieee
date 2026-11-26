@@ -1335,3 +1335,49 @@ async fn writer_publishes_kafka_outcomes_and_caches_event_statuses_on_confirm_an
     assert_eq!(rep2.outcomes_published_count, 1);
     assert_eq!(outcome_pub.events.lock().await.len(), 3);
 }
+
+#[tokio::test]
+async fn conflict_free_chunking_preserves_causal_order_and_uses_fast_batch_across_mixed_churn() {
+    let repo = Arc::new(FakePgWriterRepository::default());
+    let redis = Arc::new(MockRedisWriterSink::default());
+    let dlq = Arc::new(MockDlqPublisher::default());
+    let proc = make_processor(Arc::clone(&repo), Arc::clone(&redis), Arc::clone(&dlq));
+
+    let term = TermId::new_v4();
+    let c1 = CourseId::new_v4();
+    let c2 = CourseId::new_v4();
+    let s1 = StudentId::new_v4();
+    let s2 = StudentId::new_v4();
+    let s3 = StudentId::new_v4();
+    let s4 = StudentId::new_v4();
+
+    repo.insert_section(SectionId::new(701), term, c1, "C701", 10, 0, "OPEN")
+        .await;
+    repo.insert_section(SectionId::new(702), term, c2, "C702", 10, 0, "OPEN")
+        .await;
+
+    let cmds = vec![
+        make_cmd(term, s1, 701, c1, EnrollmentAction::Register, 1),
+        make_cmd(term, s2, 702, c2, EnrollmentAction::Register, 1),
+        // Same (s1, c1) forces chunk split after the first two fast-batch commands.
+        make_cmd(term, s1, 701, c1, EnrollmentAction::Drop, 1),
+        make_cmd(term, s3, 701, c1, EnrollmentAction::Register, 1),
+        make_cmd(term, s4, 702, c2, EnrollmentAction::Register, 1),
+    ];
+
+    assert!(enrollment_writer::core::split_into_conflict_free_chunks(&[]).is_empty());
+    let chunks = enrollment_writer::core::split_into_conflict_free_chunks(&cmds);
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].len(), 2);
+    assert_eq!(chunks[1].len(), 3);
+
+    let report = proc.process_commands(&cmds, Utc::now()).await.unwrap();
+    assert!(!report.used_isolation_fallback);
+    assert_eq!(report.confirmed_count, 5);
+    assert_eq!(report.rejected_count, 0);
+
+    let guard = repo.state.lock().await;
+    // s1 registered (+1), dropped (-1), s3 registered (+1) -> section 701 net = 1
+    assert_eq!(guard.sections[&SectionId::new(701)].enrolled_count, 1);
+    assert_eq!(guard.sections[&SectionId::new(702)].enrolled_count, 2);
+}

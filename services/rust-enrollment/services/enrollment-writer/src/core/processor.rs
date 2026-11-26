@@ -1,4 +1,4 @@
-use crate::core::batch::{deduplicate_commands_in_batch, has_intra_batch_student_course_conflict};
+use crate::core::batch::{deduplicate_commands_in_batch, split_into_conflict_free_chunks};
 use crate::core::models::{
     BatchExecutionReport, FastPathBatchError, IncomingKafkaRecord, PersistedEventOutcome,
     RedisBatchUpdate, SectionSeatSnapshot, SingleEventOutcome, StaleRejectionOutcome, WriterError,
@@ -254,100 +254,104 @@ impl WriterProcessor {
         }
 
         if !eligible.is_empty() {
-            let needs_sequential_order = has_intra_batch_student_course_conflict(&eligible);
-            if needs_sequential_order {
-                report.used_isolation_fallback = true;
-                let pg_started = Instant::now();
-                self.run_isolated_sequence(
-                    &eligible,
-                    now,
-                    &mut report,
-                    &mut latest_sections,
-                    &mut timetable_set,
-                    &mut confirmed_statuses,
-                    &mut sse_reverts,
-                    &mut outcomes,
-                )
-                .await?;
-                metrics::histogram!(
-                    "unieee_writer_pg_commit_duration_seconds",
-                    "path" => "isolated"
-                )
-                .record(pg_started.elapsed().as_secs_f64());
-            } else {
-                let fast_started = Instant::now();
-                match self.try_fast_batch_with_retry(&eligible, now).await? {
-                    Ok(fast) => {
-                        metrics::histogram!(
-                            "unieee_writer_pg_commit_duration_seconds",
-                            "path" => "fast_batch"
-                        )
-                        .record(fast_started.elapsed().as_secs_f64());
-                        report.duplicate_skipped_count += fast.duplicate_skipped;
-                        for (dup_cmd, persisted) in &fast.replayed_duplicate_outcomes {
-                            report.duplicate_reemitted_count += 1;
-                            let (outcome_ev, maybe_rev) =
-                                persisted_outcome_to_event(dup_cmd, persisted);
-                            outcomes.push(outcome_ev);
-                            if let Some(rev) = maybe_rev {
-                                sse_reverts.push(rev);
+            let chunks = split_into_conflict_free_chunks(&eligible);
+            let had_split = chunks.len() > 1;
+            for chunk in chunks {
+                if had_split && chunk.len() == 1 {
+                    report.used_isolation_fallback = true;
+                    let pg_started = Instant::now();
+                    self.run_isolated_sequence(
+                        &chunk,
+                        now,
+                        &mut report,
+                        &mut latest_sections,
+                        &mut timetable_set,
+                        &mut confirmed_statuses,
+                        &mut sse_reverts,
+                        &mut outcomes,
+                    )
+                    .await?;
+                    metrics::histogram!(
+                        "unieee_writer_pg_commit_duration_seconds",
+                        "path" => "isolated"
+                    )
+                    .record(pg_started.elapsed().as_secs_f64());
+                } else {
+                    let fast_started = Instant::now();
+                    match self.try_fast_batch_with_retry(&chunk, now).await? {
+                        Ok(fast) => {
+                            metrics::histogram!(
+                                "unieee_writer_pg_commit_duration_seconds",
+                                "path" => "fast_batch"
+                            )
+                            .record(fast_started.elapsed().as_secs_f64());
+                            report.duplicate_skipped_count += fast.duplicate_skipped;
+                            for (dup_cmd, persisted) in &fast.replayed_duplicate_outcomes {
+                                report.duplicate_reemitted_count += 1;
+                                let (outcome_ev, maybe_rev) =
+                                    persisted_outcome_to_event(dup_cmd, persisted);
+                                outcomes.push(outcome_ev);
+                                if let Some(rev) = maybe_rev {
+                                    sse_reverts.push(rev);
+                                }
                             }
-                        }
-                        for (sec_id, snap) in fast.updated_sections {
-                            latest_sections.insert(sec_id, snap);
-                        }
-                        for ev in &fast.committed_events {
-                            self.epochs.observe(ev.term_id, ev.engine_epoch);
-                            timetable_set.insert((ev.student_id, ev.term_id));
-                            confirmed_statuses.push(confirmed_command_to_status_payload(ev, now));
-                            outcomes.push(EnrollmentOutcomeEvent::confirmed(
-                                ev.event_id,
-                                ev.term_id,
-                                ev.student_id,
-                                ev.section_id,
-                                ev.course_id,
-                                ev.action,
-                                ev.engine_epoch,
-                                now,
-                            ));
-                            if let Some(snap) = latest_sections.get(&ev.section_id) {
-                                report.confirmed_events.push(SeatConfirmedEvent::new(
+                            for (sec_id, snap) in fast.updated_sections {
+                                latest_sections.insert(sec_id, snap);
+                            }
+                            for ev in &fast.committed_events {
+                                self.epochs.observe(ev.term_id, ev.engine_epoch);
+                                timetable_set.insert((ev.student_id, ev.term_id));
+                                confirmed_statuses
+                                    .push(confirmed_command_to_status_payload(ev, now));
+                                outcomes.push(EnrollmentOutcomeEvent::confirmed(
                                     ev.event_id,
                                     ev.term_id,
-                                    ev.section_id,
                                     ev.student_id,
-                                    snap.available_seats(),
-                                    snap.max_capacity,
-                                    EnrollmentEventStatus::Confirmed,
+                                    ev.section_id,
+                                    ev.course_id,
+                                    ev.action,
+                                    ev.engine_epoch,
                                     now,
                                 ));
+                                if let Some(snap) = latest_sections.get(&ev.section_id) {
+                                    report.confirmed_events.push(SeatConfirmedEvent::new(
+                                        ev.event_id,
+                                        ev.term_id,
+                                        ev.section_id,
+                                        ev.student_id,
+                                        snap.available_seats(),
+                                        snap.max_capacity,
+                                        EnrollmentEventStatus::Confirmed,
+                                        now,
+                                    ));
+                                }
                             }
                         }
-                    }
-                    Err(reason) => {
-                        debug!(
-                            reason = %reason,
-                            batch_len = eligible.len(),
-                            "fast-path batch fell back to per-event isolation"
-                        );
-                        report.used_isolation_fallback = true;
-                        let iso_started = Instant::now();
-                        self.run_isolated_sequence(
-                            &eligible,
-                            now,
-                            &mut report,
-                            &mut latest_sections,
-                            &mut timetable_set,
-                            &mut confirmed_statuses,
-                            &mut sse_reverts,
-                            &mut outcomes,
-                        )
-                        .await?;
-                        metrics::histogram!(
-                            "unieee_writer_pg_commit_duration_seconds",
-                            "path" => "isolated"
-                        )
-                        .record(iso_started.elapsed().as_secs_f64());
+                        Err(reason) => {
+                            debug!(
+                                reason = %reason,
+                                chunk_len = chunk.len(),
+                                "fast-path batch chunk fell back to per-event isolation"
+                            );
+                            report.used_isolation_fallback = true;
+                            let iso_started = Instant::now();
+                            self.run_isolated_sequence(
+                                &chunk,
+                                now,
+                                &mut report,
+                                &mut latest_sections,
+                                &mut timetable_set,
+                                &mut confirmed_statuses,
+                                &mut sse_reverts,
+                                &mut outcomes,
+                            )
+                            .await?;
+                            metrics::histogram!(
+                                "unieee_writer_pg_commit_duration_seconds",
+                                "path" => "isolated"
+                            )
+                            .record(iso_started.elapsed().as_secs_f64());
+                        }
                     }
                 }
             }
