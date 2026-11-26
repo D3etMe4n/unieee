@@ -520,7 +520,7 @@ def main() -> int:
         c_base = create_course("BAS", 3)
         c_adv = create_course("ADV", 3)
         c_con_a = create_course("CNA", 4)
-        c_con_b = create_course("CNB", 4)
+        c_con_b = create_course("CNB", 2)
         c_extra = create_course("EXT", 4)
         c_cap = create_course("CAP", 1)
         c_rev = create_course("REV", 1)
@@ -716,7 +716,7 @@ def main() -> int:
             json_body={"targetStatus": "SURVEY_CLOSED"},
         )
 
-        # Configure & activate policy (maxCredits=8 so ADV(3)+CON_A(4)+EXT(4) hits CREDIT_LIMIT_EXCEEDED)
+        # Configure & activate policy (maxCredits=10: ADV(3)+CON_A(4)+CON_B(2)=9<=10 hits SCHEDULE_CONFLICT; +EXT(4)=11>10 hits CREDIT_LIMIT_EXCEEDED)
         _, policy, _ = client.expect_ok(
             "POST",
             "/api/v1/admin/policies",
@@ -726,7 +726,7 @@ def main() -> int:
                 "policyCode": f"POL{suffix}",
                 "name": f"Strict Policy {suffix}",
                 "minCredits": 0,
-                "maxCredits": 8,
+                "maxCredits": 10,
                 "gpaBonusThreshold": None,
                 "maxCreditsWithBonus": None,
                 "enforceCreditLimit": True,
