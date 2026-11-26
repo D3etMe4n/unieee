@@ -36,6 +36,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = EngineConfig::from_env().context("failed to load EngineConfig")?;
+    let _ = enrollment_engine::metrics::init_prometheus_recorder();
     let redis_backend = connect_redis_backend(&cfg).map_err(anyhow::Error::msg)?;
     let pg_adapter = PgPreloadAndReplayAdapter::connect(&cfg.database_url, 16)
         .await

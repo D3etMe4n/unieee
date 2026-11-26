@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 use unieee_domain::{
     EnrollmentAction, EnrollmentEventStatus, HotPathEnrollmentState, RuleErrorCode, SectionId,
@@ -157,6 +157,7 @@ impl WriterProcessor {
             self.metrics
                 .events_dlq
                 .fetch_add(dlq_count as u64, Ordering::Relaxed);
+            metrics::counter!("unieee_writer_events_dlq_total").increment(dlq_count as u64);
         }
 
         let mut report = self.process_commands_inner(&decoded.commands, now).await?;
@@ -165,6 +166,7 @@ impl WriterProcessor {
         self.metrics
             .batches_committed
             .fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("unieee_writer_batches_committed_total").increment(1);
         Ok(report)
     }
 
@@ -178,6 +180,7 @@ impl WriterProcessor {
         self.metrics
             .batches_committed
             .fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("unieee_writer_batches_committed_total").increment(1);
         Ok(report)
     }
 
@@ -195,6 +198,7 @@ impl WriterProcessor {
         if commands.is_empty() {
             return Ok(report);
         }
+        metrics::histogram!("unieee_writer_batch_size").record(commands.len() as f64);
 
         let (unique_commands, in_batch_dups) = deduplicate_commands_in_batch(commands);
         report.duplicate_skipped_count += in_batch_dups;
@@ -253,6 +257,7 @@ impl WriterProcessor {
             let needs_sequential_order = has_intra_batch_student_course_conflict(&eligible);
             if needs_sequential_order {
                 report.used_isolation_fallback = true;
+                let pg_started = Instant::now();
                 self.run_isolated_sequence(
                     &eligible,
                     now,
@@ -264,9 +269,20 @@ impl WriterProcessor {
                     &mut outcomes,
                 )
                 .await?;
+                metrics::histogram!(
+                    "unieee_writer_pg_commit_duration_seconds",
+                    "path" => "isolated"
+                )
+                .record(pg_started.elapsed().as_secs_f64());
             } else {
+                let fast_started = Instant::now();
                 match self.try_fast_batch_with_retry(&eligible, now).await? {
                     Ok(fast) => {
+                        metrics::histogram!(
+                            "unieee_writer_pg_commit_duration_seconds",
+                            "path" => "fast_batch"
+                        )
+                        .record(fast_started.elapsed().as_secs_f64());
                         report.duplicate_skipped_count += fast.duplicate_skipped;
                         for (dup_cmd, persisted) in &fast.replayed_duplicate_outcomes {
                             report.duplicate_reemitted_count += 1;
@@ -315,6 +331,7 @@ impl WriterProcessor {
                             "fast-path batch fell back to per-event isolation"
                         );
                         report.used_isolation_fallback = true;
+                        let iso_started = Instant::now();
                         self.run_isolated_sequence(
                             &eligible,
                             now,
@@ -326,6 +343,11 @@ impl WriterProcessor {
                             &mut outcomes,
                         )
                         .await?;
+                        metrics::histogram!(
+                            "unieee_writer_pg_commit_duration_seconds",
+                            "path" => "isolated"
+                        )
+                        .record(iso_started.elapsed().as_secs_f64());
                     }
                 }
             }
@@ -334,10 +356,28 @@ impl WriterProcessor {
         // At-least-once invariant: Kafka consumer offsets on `unieee.enrollment.commands` MUST NOT
         // advance until all fresh and re-emitted duplicate outcomes succeed on `unieee.enrollment.outcomes`.
         if !outcomes.is_empty() {
-            self.outcome_publisher
-                .publish_outcomes(&outcomes)
-                .await
-                .map_err(WriterError::OutcomePublishFailed)?;
+            let out_started = Instant::now();
+            match self.outcome_publisher.publish_outcomes(&outcomes).await {
+                Ok(()) => {
+                    metrics::counter!(
+                        "unieee_writer_outcomes_published_total",
+                        "outcome" => "ok"
+                    )
+                    .increment(outcomes.len() as u64);
+                    metrics::histogram!("unieee_writer_outcomes_publish_duration_seconds")
+                        .record(out_started.elapsed().as_secs_f64());
+                }
+                Err(err) => {
+                    metrics::counter!(
+                        "unieee_writer_outcomes_published_total",
+                        "outcome" => "error"
+                    )
+                    .increment(1);
+                    metrics::histogram!("unieee_writer_outcomes_publish_duration_seconds")
+                        .record(out_started.elapsed().as_secs_f64());
+                    return Err(WriterError::OutcomePublishFailed(err));
+                }
+            }
         }
 
         report.confirmed_count = report.confirmed_events.len();
@@ -360,6 +400,12 @@ impl WriterProcessor {
         self.metrics
             .events_outcomes_published
             .fetch_add(report.outcomes_published_count as u64, Ordering::Relaxed);
+        metrics::counter!("unieee_writer_events_confirmed_total")
+            .increment(report.confirmed_count as u64);
+        metrics::counter!("unieee_writer_events_reverted_total")
+            .increment(report.rejected_count as u64);
+        metrics::counter!("unieee_writer_events_duplicate_skipped_total")
+            .increment(report.duplicate_skipped_count as u64);
 
         // Best-effort post-commit Redis Read Cache & SSE Pub/Sub fan-out.
         if !sse_reverts.is_empty() {
@@ -412,6 +458,7 @@ impl WriterProcessor {
                     self.metrics
                         .transient_retries
                         .fetch_add(1, Ordering::Relaxed);
+                    metrics::counter!("unieee_writer_transient_retries_total").increment(1);
                     tokio::time::sleep(self.backoff_for(attempt)).await;
                 }
             }
@@ -497,6 +544,7 @@ impl WriterProcessor {
                     self.metrics
                         .transient_retries
                         .fetch_add(1, Ordering::Relaxed);
+                    metrics::counter!("unieee_writer_transient_retries_total").increment(1);
                     tokio::time::sleep(self.backoff_for(attempt)).await;
                 }
             }

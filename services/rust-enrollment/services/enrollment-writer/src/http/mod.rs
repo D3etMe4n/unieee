@@ -1,4 +1,5 @@
 use crate::core::{WriterMetricsSnapshot, WriterProcessor, WriterReadiness};
+use crate::metrics::metrics_handler;
 use axum::extract::State;
 use axum::http::{header, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -29,9 +30,11 @@ pub struct WriterReadinessResponse {
 }
 
 pub fn build_router(state: WriterAppState) -> Router {
+    let _ = crate::metrics::init_prometheus_recorder();
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics_handler))
         .fallback(fallback_not_found)
         .method_not_allowed_fallback(fallback_method_not_allowed)
         .with_state(state)

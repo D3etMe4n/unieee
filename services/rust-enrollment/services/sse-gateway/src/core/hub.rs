@@ -173,6 +173,7 @@ impl SseHub {
         self.metrics
             .total_connections
             .fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("unieee_sse_connections_total", "stream" => "sections").increment(1);
         Ok(TermSubscription {
             rx,
             control_rx,
@@ -201,6 +202,7 @@ impl SseHub {
         self.metrics
             .total_connections
             .fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("unieee_sse_connections_total", "stream" => "personal").increment(1);
         Ok(PersonalSubscription {
             rx,
             control_rx,
@@ -249,6 +251,7 @@ impl SseHub {
 
     pub fn handle_pubsub_message(&self, msg: HotPathPubSubMessage) {
         self.metrics.events_received.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("unieee_sse_pubsub_events_received_total").increment(1);
         match msg {
             HotPathPubSubMessage::SeatTentative(ev) => {
                 self.enqueue_or_broadcast_seat_update(SectionSeatUpdate {
@@ -318,6 +321,7 @@ impl SseHub {
                     self.metrics
                         .gate_events_broadcast
                         .fetch_add(1, Ordering::Relaxed);
+                    metrics::counter!("unieee_sse_gate_events_broadcast_total").increment(1);
                 }
             }
         }
@@ -327,6 +331,7 @@ impl SseHub {
         self.metrics
             .upstream_reconnects
             .fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("unieee_sse_upstream_reconnects_total").increment(1);
         let payload = Arc::new(ResyncRequiredPayload {
             reason: ResyncReason::UpstreamReconnected,
             skipped_events: None,
@@ -365,6 +370,7 @@ impl SseHub {
                 self.metrics
                     .seat_updates_broadcast
                     .fetch_add(1, Ordering::Relaxed);
+                metrics::counter!("unieee_sse_seat_updates_broadcast_total").increment(1);
             }
         }
     }
@@ -377,6 +383,7 @@ impl SseHub {
             self.metrics
                 .personal_events_broadcast
                 .fetch_add(1, Ordering::Relaxed);
+            metrics::counter!("unieee_sse_personal_events_broadcast_total").increment(1);
         }
     }
 }

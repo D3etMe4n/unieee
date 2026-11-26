@@ -1,6 +1,7 @@
 pub mod error;
 pub mod handlers;
 
+use crate::metrics::metrics_handler;
 use axum::routing::get;
 use axum::Router;
 use handlers::{
@@ -9,9 +10,11 @@ use handlers::{
 };
 
 pub fn build_router(state: SseAppState) -> Router {
+    let _ = crate::metrics::init_prometheus_recorder();
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics_handler))
         .route("/api/v1/sse/sections", get(sections_sse_handler))
         .route(
             "/api/v1/sse/sections/{term_id}",

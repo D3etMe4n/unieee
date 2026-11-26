@@ -30,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = WriterConfig::from_env().context("failed to load WriterConfig")?;
+    let _ = enrollment_writer::metrics::init_prometheus_recorder();
     let pg_repo = Arc::new(
         PgWriterRepository::connect(&cfg.database_url, cfg.pg_max_connections)
             .await
