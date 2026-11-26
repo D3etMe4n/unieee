@@ -69,6 +69,17 @@ class SecurityJwtIntegrationTest {
     }
 
     @Test
+    void prometheusActuatorPathIsNotBlockedBySecurityFilter() throws Exception {
+        // Under @WebMvcTest without full Actuator PrometheusEndpoint auto-config, SecurityConfig permits /actuator/prometheus
+        // instead of returning 401 UNAUTHORIZED (Spring MVC returns 404 when endpoint bean is not loaded in slice).
+        int status = mockMvc.perform(get("/actuator/prometheus"))
+            .andReturn()
+            .getResponse()
+            .getStatus();
+        assertThat(status).isNotIn(401, 403);
+    }
+
+    @Test
     void keycloakJwtConverterMapsRealmRolesAndPreferredUsername() {
         Jwt jwt = createKeycloakJwt("student01", List.of("STUDENT"));
         var token = converter.convert(jwt);

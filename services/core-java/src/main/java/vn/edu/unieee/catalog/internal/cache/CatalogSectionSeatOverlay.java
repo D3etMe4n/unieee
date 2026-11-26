@@ -9,6 +9,7 @@ import java.util.Objects;
 import java.util.UUID;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.JsonNode;
@@ -17,6 +18,7 @@ import vn.edu.unieee.catalog.dto.CourseSectionDetailResponse;
 import vn.edu.unieee.catalog.dto.CourseSectionSummaryResponse;
 import vn.edu.unieee.common.cache.ReadCacheProperties;
 import vn.edu.unieee.common.cache.RedisCacheKeys;
+import vn.edu.unieee.common.metrics.UnieeeMetrics;
 
 /**
  * Merges live seat counts stored in Redis by Hot Path / warm-cache
@@ -31,13 +33,24 @@ public class CatalogSectionSeatOverlay {
 
     private final ObjectProvider<StringRedisTemplate> redisTemplateProvider;
     private final ReadCacheProperties properties;
+    private final UnieeeMetrics metrics;
 
     public CatalogSectionSeatOverlay(
         ObjectProvider<StringRedisTemplate> redisTemplateProvider,
         ReadCacheProperties properties
     ) {
+        this(redisTemplateProvider, properties, UnieeeMetrics.noop());
+    }
+
+    @Autowired
+    public CatalogSectionSeatOverlay(
+        ObjectProvider<StringRedisTemplate> redisTemplateProvider,
+        ReadCacheProperties properties,
+        UnieeeMetrics metrics
+    ) {
         this.redisTemplateProvider = redisTemplateProvider;
         this.properties = properties;
+        this.metrics = metrics == null ? UnieeeMetrics.noop() : metrics;
     }
 
     public List<CourseSectionSummaryResponse> overlaySummaries(
@@ -121,6 +134,7 @@ public class CatalogSectionSeatOverlay {
         try {
             Map<Object, Object> entries = redis.opsForHash().entries(RedisCacheKeys.termSectionsLiveHash(termId));
             if (entries.isEmpty()) {
+                metrics.recordSeatOverlay("term_hash", "miss");
                 return Map.of();
             }
             Map<Long, LiveSeatSnapshot> result = new HashMap<>();
@@ -134,8 +148,10 @@ public class CatalogSectionSeatOverlay {
                     }
                 }
             }
+            metrics.recordSeatOverlay("term_hash", result.isEmpty() ? "miss" : "hit");
             return result;
         } catch (RuntimeException ex) {
+            metrics.recordSeatOverlay("term_hash", "error");
             log.warn("Failed reading Redis term seat hash for termId={} (falling back to cached/PG counts)", termId, ex);
             return Map.of();
         }
@@ -152,6 +168,7 @@ public class CatalogSectionSeatOverlay {
         try {
             List<String> rawValues = redis.opsForValue().multiGet(keys);
             if (rawValues == null || rawValues.isEmpty()) {
+                metrics.recordSeatOverlay("section_keys", "miss");
                 return Map.of();
             }
             Map<Long, LiveSeatSnapshot> result = new HashMap<>();
@@ -166,8 +183,10 @@ public class CatalogSectionSeatOverlay {
                     result.put(ordered.get(i), parsed);
                 }
             }
+            metrics.recordSeatOverlay("section_keys", result.isEmpty() ? "miss" : "hit");
             return result;
         } catch (RuntimeException ex) {
+            metrics.recordSeatOverlay("section_keys", "error");
             log.warn("Failed reading Redis section seat keys (falling back to cached/PG counts)", ex);
             return Map.of();
         }

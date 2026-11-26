@@ -1,10 +1,11 @@
 package vn.edu.unieee.registration.internal.delta;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.modulith.events.ApplicationModuleListener;
 import org.springframework.stereotype.Component;
 import vn.edu.unieee.account.AccountFacade;
@@ -17,6 +18,7 @@ import vn.edu.unieee.catalog.dto.AcademicTermResponse;
 import vn.edu.unieee.catalog.dto.CourseSectionDetailResponse;
 import vn.edu.unieee.catalog.event.CourseSectionCapacityUpdatedEvent;
 import vn.edu.unieee.catalog.event.CourseSectionStatusChangedEvent;
+import vn.edu.unieee.common.metrics.UnieeeMetrics;
 import vn.edu.unieee.registration.internal.delta.HotDeltaPayloads.SectionCapacityDeltaPayload;
 import vn.edu.unieee.registration.internal.delta.HotDeltaPayloads.StudentStandingDeltaPayload;
 
@@ -27,7 +29,6 @@ import vn.edu.unieee.registration.internal.delta.HotDeltaPayloads.StudentStandin
  */
 @Slf4j
 @Component
-@RequiredArgsConstructor
 public class HotDeltaSyncEventListener {
 
     private static final String REGISTRATION_OPEN_STATUS = "REGISTRATION_OPEN";
@@ -35,6 +36,28 @@ public class HotDeltaSyncEventListener {
     private final HotDeltaPublisher hotDeltaPublisher;
     private final CatalogFacade catalogFacade;
     private final AccountFacade accountFacade;
+    private final UnieeeMetrics metrics;
+
+    public HotDeltaSyncEventListener(
+        HotDeltaPublisher hotDeltaPublisher,
+        CatalogFacade catalogFacade,
+        AccountFacade accountFacade
+    ) {
+        this(hotDeltaPublisher, catalogFacade, accountFacade, UnieeeMetrics.noop());
+    }
+
+    @Autowired
+    public HotDeltaSyncEventListener(
+        HotDeltaPublisher hotDeltaPublisher,
+        CatalogFacade catalogFacade,
+        AccountFacade accountFacade,
+        UnieeeMetrics metrics
+    ) {
+        this.hotDeltaPublisher = hotDeltaPublisher;
+        this.catalogFacade = catalogFacade;
+        this.accountFacade = accountFacade;
+        this.metrics = metrics == null ? UnieeeMetrics.noop() : metrics;
+    }
 
     @ApplicationModuleListener
     public void onStudentFinancialStatusChanged(StudentFinancialStatusChangedEvent event) {
@@ -63,12 +86,14 @@ public class HotDeltaSyncEventListener {
 
     public void emitStudentStandingDelta(UUID studentId, Instant occurredAt) {
         if (!hotDeltaPublisher.isEnabled()) {
+            metrics.recordHotDeltaPublish("student_standing", "skipped", Duration.ZERO);
             return;
         }
         List<AcademicTermResponse> openTerms = catalogFacade.listTermsAuthoritative().stream()
             .filter(term -> REGISTRATION_OPEN_STATUS.equals(term.status()))
             .toList();
         if (openTerms.isEmpty()) {
+            metrics.recordHotDeltaPublish("student_standing", "skipped", Duration.ZERO);
             return;
         }
 
@@ -93,10 +118,12 @@ public class HotDeltaSyncEventListener {
 
     public void emitSectionCapacityDelta(UUID termId, Long sectionId, Instant occurredAt) {
         if (!hotDeltaPublisher.isEnabled()) {
+            metrics.recordHotDeltaPublish("section_capacity", "skipped", Duration.ZERO);
             return;
         }
         AcademicTermResponse term = catalogFacade.getTermByIdAuthoritative(termId);
         if (!REGISTRATION_OPEN_STATUS.equals(term.status())) {
+            metrics.recordHotDeltaPublish("section_capacity", "skipped", Duration.ZERO);
             return;
         }
 
