@@ -2,7 +2,7 @@
 
 **Ngôn ngữ:** [English](../en/architecture.md) | **Tiếng Việt** | [Trung tâm Tài liệu](../README.vi.md)
 
-**unieee** kết hợp một **Spring Boot 4.1.3 Modular Monolith** (Warm/Cold Path chạy 24/7, `0.3.0-SNAPSHOT`) với cụm **Rust Hot Path** (`0.5.0`, bật theo chu kỳ mở cổng đăng ký), xoay quanh **PostgreSQL 17** làm Source of Truth duy nhất và **Redis 7.4 HA** chỉ đóng vai trò Read Cache & Pub/Sub.
+**unieee** kết hợp một **Spring Boot 4.1.3 Modular Monolith** (Warm/Cold Path chạy 24/7, `0.4.0-SNAPSHOT`) với cụm **Rust Hot Path** (`0.6.0`, bật theo chu kỳ mở cổng đăng ký), xoay quanh **PostgreSQL 17** làm Source of Truth duy nhất và **Redis 7.4 HA** chỉ đóng vai trò Read Cache & Pub/Sub.
 
 ---
 
@@ -11,11 +11,11 @@
 | Tiêu chí | Warm / Cold Path (`services/core-java/`) | Hot Path (`services/rust-enrollment/`) |
 | :--- | :--- | :--- |
 | **Nền tảng** | Java 25 (Virtual Threads), Spring Boot 4.1.3, Spring Modulith 2.1.2, Spring AI 2.0.3 | Rust, Axum 0.8, Tokio, SQLx 0.8, `rdkafka` (`enrollment-engine`, `enrollment-writer`, `sse-gateway`) |
-| **Phạm vi** | Chương trình khung, môn học, tiên quyết, học kỳ, lớp học phần, danh mục công khai (`/api/v1/public/*`), cấp phát Keycloak, khảo sát nguyện vọng, Policy Engine & export snapshot, đợt đăng ký, can thiệp Admin, làm ấm Redis cache, Hot Delta Sync (`unieee.enrollment.deltas`), đối soát, Trợ lý AI Read-Only (`ai_advisor`) | Giữ ghế tốc độ cao trong RAM, trừ ghế CAS lock-free, kiểm tra trùng lịch Bitmask `O(1)`, Kafka batch ingestion, SQL `UNNEST` batch commit + Revert, fan-out SSE thời gian thực |
+| **Phạm vi** | Chương trình khung, môn học, tiên quyết, học kỳ, lớp học phần, danh mục công khai (`/api/v1/public/*`), cấp phát Keycloak, khảo sát nguyện vọng, Policy Engine & export snapshot, đợt đăng ký, can thiệp Admin, Redis Read-Through Cache & làm ấm cache, Hot Delta Sync (`unieee.enrollment.deltas`), đối soát, Trợ lý AI Read-Only (`ai_advisor`) | Giữ ghế & đọc trạng thái RAM lock-free (`/seats`, `/me`), trừ ghế CAS, kiểm tra trùng lịch Bitmask `O(1)`, Kafka batch ingestion, SQL `UNNEST` batch commit + đồng bộ `unieee.enrollment.outcomes`, fan-out SSE giá trị tuyệt đối |
 | **Vòng đời** | Chạy **24/7** (`core` Compose profile) | Bật trước giờ vàng (`prepare-registration` / `open-registration`) và drain sạch trước khi tắt (`close-registration`) |
 
 ### Vì sao không dùng Redis làm State Machine giữ ghế?
-Dùng Redis Lua script hoặc `DECR` theo từng request phát sinh chi phí network round-trip TCP/RESP và khó phối hợp nhiều ràng buộc lồng nhau (đợt đăng ký, nợ học phí, tiên quyết, quy tắc học lại/cải thiện, trần tín chỉ và trùng lịch). Trong **unieee**, `enrollment-engine` tự kiểm tra toàn bộ quy chế và trừ ghế ngay trong RAM (`#[repr(align(64))]` + sharding theo sinh viên), còn Redis chỉ dùng cho Read Cache và Pub/Sub.
+Dùng Redis Lua script hoặc `DECR` theo từng request phát sinh chi phí network round-trip TCP/RESP và khó phối hợp nhiều ràng buộc lồng nhau (đợt đăng ký, nợ học phí, tiên quyết, quy tắc học lại/cải thiện, trần tín chỉ và trùng lịch). Trong **unieee**, `enrollment-engine` tự kiểm tra toàn bộ quy chế và trừ ghế ngay trong RAM (`#[repr(align(64))]` + sharding theo sinh viên), đồng bộ kết quả ghi đĩa bền vững từ `enrollment-writer` qua topic Kafka `unieee.enrollment.outcomes`, còn Redis chỉ dùng cho Read Cache và Pub/Sub phục vụ `sse-gateway`.
 
 ---
 
@@ -25,10 +25,10 @@ Core Java được tổ chức thành **4 Bounded Contexts theo Business Capabil
 
 ```mermaid
 flowchart TB
-    common["common (OPEN: Virtual Threads, JWT Security, RFC 9457 ProblemDetail, Keycloak Client, Outbox Cleanup)"]
-    catalog["catalog (Học kỳ, Khoa/Ngành/CTK, Môn học, Tiên quyết DFS, Lớp HP & Bitmask, Danh mục công khai)"]
+    common["common (OPEN: Virtual Threads, JWT Security, RFC 9457 ProblemDetail, Fail-Open Redis Cache, Keycloak Client, Outbox Cleanup)"]
+    catalog["catalog (Học kỳ, Khoa/Ngành/CTK, Môn học, Tiên quyết DFS, Lớp HP & Bitmask, Danh mục công khai, Cache & Seat Overlay)"]
     account["account (Giảng viên, Sinh viên với Embeddable Standing, GPA trọng số tín chỉ, Keycloak Provisioning)"]
-    registration["registration (Admin Override + Gate Guard, Đối soát, Khảo sát NV, Đợt ĐK, Policy Engine, Hot Delta Sync, Seat Cache Warmer)"]
+    registration["registration (Admin Override + Gate Guard, Đối soát, Khảo sát NV, Đợt ĐK, Policy Engine, Hot Delta Sync, Cache TKB & Policy)"]
     ai["ai_advisor (Trợ lý Spring AI 2.0.3 Read-Only, 4 Tools chỉ đọc, Guardrails & Kiểm chứng Bitmask)"]
 
     ai -->|"Catalog/Account/Registration Facades"| registration
@@ -45,6 +45,7 @@ flowchart TB
 ### Nguyên tắc Thiết kế Module & DDD
 - **Public API vs `internal/`:** Giao tiếp liên module chỉ đi qua interface `*Facade`, DTO `*Request`/`*Response` (`@NamedInterface("dto")`) và Domain Event `*Event` (`@NamedInterface("event")`). Mọi import vào `*.internal.*` của module khác đều bị test kiến trúc chặn đứng.
 - **Rich Domain Entity & `@Embeddable` Value Objects:** Bất biến nghiệp vụ nằm trực tiếp trong Entity và Value Object (`CourseSection`, `ScheduleBitmask`, `FinancialStanding`, `AcademicStanding`, `WishSurveyCampaign`, `RegistrationWindow`, `EnrollmentPolicy`).
+- **Redis Read-Through Cache Fail-Open (`common.cache`):** Trước và sau khi đóng cổng (`REGISTRATION_CLOSED`), `core-java` cache thời khóa biểu cá nhân (`45s` khi `REGISTRATION_OPEN`, `20m` khi ngoài giờ), active policy (`1h`) và metadata catalog ít đổi (`30m–45m`, trộn lớp phủ sĩ số live từ Redis cho `/api/v1/sections` & `ai_advisor`), tự fallback an toàn về PostgreSQL khi Redis tắt/lỗi và loại trừ hoàn toàn `reconcile`, `roster`, `events` khỏi cache.
 - **Outbox Cleanup Job:** Spring Modulith ghi sự kiện vào `public.event_publication` trong cùng transaction với dữ liệu; `EventPublicationCleanupJob` định kỳ dọn các bản ghi đã hoàn tất (`completion_date IS NOT NULL`) quá ngưỡng retention.
 
 ---
@@ -58,7 +59,7 @@ Mỗi Bounded Context sở hữu schema PostgreSQL riêng, **tuyệt đối khô
 | `public` | `V001` | `event_publication` | Spring Modulith Transactional Outbox kèm partial index theo `completion_date`. |
 | `catalog` | `V002` | `academic_terms`, `faculties`, `majors`, `curricula`, `courses`, `curriculum_courses`, `course_prerequisites`, `course_sections`, `section_schedules` | `curriculum_courses` tham chiếu `course_id`; phát hiện vòng lặp tiên quyết bằng DFS; `course_sections` lưu `schedule_bitmask_hex` (640 ký tự hex = 20 tuần x 112 bit) và `CHECK (max_capacity >= 0 AND enrolled_count >= 0 AND enrolled_count <= max_capacity)`. |
 | `account` | `V003` | `lecturers`, `students`, `student_course_results` | `students` giữ bảng phẳng trên PG để Rust preload 1 query không JOIN, map sang `@Embeddable` `FinancialStanding` & `AcademicStanding` trong Java; `student_course_results` khóa trùng bằng `UNIQUE (student_id, course_id, attempt_number)`. |
-| `registration` | `V004` | `enrollments`, `enrollment_events`, `writer_revert_outbox` | Partial unique index `uq_enrollments_active_student_course ON (term_id, student_id, course_id) WHERE status = 'CONFIRMED'`; bảng append-only `enrollment_events` có `BIGSERIAL seq` phục vụ audit và replay. |
+| `registration` | `V004` | `enrollments`, `enrollment_events`, `writer_revert_outbox` | Partial unique index `uq_enrollments_active_student_course ON (term_id, student_id, course_id) WHERE status = 'CONFIRMED'`; bảng append-only `enrollment_events` có `BIGSERIAL seq` phục vụ audit và replay. *(Bảng `writer_revert_outbox` được giữ nguyên trong lịch sử Flyway `V004` nhưng không còn ghi/quét ở runtime vì `enrollment-writer` phát kết quả bền vững qua topic Kafka `unieee.enrollment.outcomes`.)* |
 | `registration` | `V005` | `wish_survey_campaigns`, `wish_survey_entries`, `enrollment_policies`, `enrollment_policy_snapshots`, `registration_windows` | `uq_survey_student_course` chống trùng nguyện vọng; partial unique index `uq_enrollment_policies_active_term` đảm bảo tối đa 1 policy `active = TRUE` mỗi học kỳ; snapshot JSONB bất biến kèm SHA-256 checksum. |
 
 ---
@@ -89,29 +90,34 @@ Trước giờ mở cổng, `PolicySnapshotExporter` biên dịch policy đang k
 
 ### Các Shared Workspace Crates (`crates/`)
 - **`unieee-domain`:** Các kiểu ID định danh mạnh (`TermId`, `StudentId`, `CourseId`, `SectionId`, `EventId`, `WindowId`), `RuleErrorCode`, chuẩn lỗi `ProblemDetail` RFC 9457, và `ScheduleBitmask` (`[u128; 20]` — 20 tuần x 112 bit) hỗ trợ kiểm tra trùng lịch & khoảng đệm `O(1)` được kiểm chứng bằng `proptest`.
-- **`unieee-events`:** Bộ codec JSON có phiên bản (`EVENT_SCHEMA_VERSION_V1`) cho thông điệp Kafka (`EnrollmentCommandEvent`, `EnrollmentDeltaEvent`, `DeadLetterEvent`) và Redis Pub/Sub (`SeatTentativeEvent`, `SeatConfirmedEvent`, `RevertEvent`, `GateControlEvent`), cùng hàm chuẩn hóa tên topic/key.
+- **`unieee-events`:** Bộ codec JSON có phiên bản (`EVENT_SCHEMA_VERSION_V1`) cho thông điệp Kafka (`EnrollmentCommandEvent`, `EnrollmentOutcomeEvent`, `EnrollmentDeltaEvent`, `DeadLetterEvent`) và Redis Pub/Sub (`SeatTentativeEvent`, `SeatConfirmedEvent`, `RevertEvent`, `GateControlEvent`), cùng hàm chuẩn hóa tên topic/key.
 - **`unieee-cacheline`:** Cấu trúc `SectionSeatSlot` căn lề `#[repr(align(64))]` (khẳng định `align_of::<SectionSeatSlot>() == 64` để chống *false sharing*) và `ShardedMap` phân mảnh trạng thái sinh viên lock-free.
 
-### Luồng dữ liệu Hot Path, Vòng Revert & Hot Delta Sync
+### Luồng dữ liệu Hot Path, Đồng bộ Outcome qua Kafka & Phân tách Đọc/Ghi
 
 ```mermaid
 flowchart LR
     Client["Trình duyệt / CLI"] -->|"HTTPS /api/v1/*"| Nginx["Reverse Proxy (Nginx)"]
-    Nginx -->|"/api/v1/enrollments/*"| Engine["enrollment-engine (Active / Standby)"]
-    Engine -->|"Kafka unieee.enrollment.commands"| Writer["enrollment-writer (Batch Consumer)"]
+    Nginx -->|"Ghi: POST/DELETE -> $enrollment_primary (ACTIVE)"| EngineActive["enrollment-engine (ACTIVE)"]
+    Nginx -->|"Đọc: GET /seats, /me -> $enrollment_read_upstream (STANDBY)"| EngineStandby["enrollment-engine (STANDBY)"]
+    EngineActive -->|"Kafka unieee.enrollment.commands"| Writer["enrollment-writer (Batch Consumer)"]
     Writer -->|"UNNEST + CHECK qua PgBouncer"| PG["PostgreSQL 17"]
-    Writer -->|"SeatConfirmed / Cache"| Redis["Redis 7.4 HA (Sentinel)"]
-    Writer -->|"RevertEvent (khi DB từ chối)"| Redis
-    Redis -->|"unieee:enrollment:revert"| Engine
+    Writer -->|"Kafka unieee.enrollment.outcomes (acks=all)"| EngineActive
+    Writer -->|"Kafka unieee.enrollment.outcomes (acks=all)"| EngineStandby
+    EngineActive -->|"SeatTentative (số ghế tuyệt đối)"| Redis["Redis 7.4 HA (Sentinel)"]
+    Writer -->|"SeatConfirmed / Cache DEL"| Redis
     Redis -->|"Pub/Sub"| SSE["sse-gateway"]
     SSE -->|"SSE /api/v1/sse/*"| Client
-    Core["core-java (Cập nhật Trạng thái / Sĩ số)"] -->|"Kafka unieee.enrollment.deltas"| Engine
+    Core["core-java (Học vụ / Standing / Sĩ số)"] -->|"Kafka unieee.enrollment.deltas"| EngineActive
+    Core -->|"Kafka unieee.enrollment.deltas"| EngineStandby
 ```
 
-### Các Điểm nhấn về Độ bền & Bảo vệ Biên
-- **Xác thực JWT không nghẽn & Gộp Pub/Sub:** `enrollment-engine` và `sse-gateway` xác thực JWT cục bộ qua một luồng background JWKS singleflight (`JWKS_REFRESH_INTERVAL_SECS=300`) kết hợp cache SHA-256 ngắn hạn (`JWT_CACHE_TTL_SECS=30`). Biến động ghế tạm thời được gộp (`COALESCE_WINDOW_MS=50`) và đẩy qua Redis pipeline (flush tức thì khi `availableSeats == 0`).
-- **Idempotency Hoàn tác (RAM-First Revert):** Khi nhận `RevertEvent`, `enrollment-engine` khôi phục ghế và bitmask nguyên tử trong shard sinh viên ở RAM trước (`reverted_event_ids`), rồi mới ghi best-effort khóa `unieee:revert:dedup:{eventId}` lên Redis.
-- **Phục hồi Không chạm PostgreSQL & Chặn Auto-Failback:** Sau preload, engine ghi disk snapshot nguyên tử (`SNAPSHOT_DIR`, SHA-256 + `checkpoint_seq`). Khi khởi động lại, engine giữ `/readyz = 503`, nạp lại từ disk snapshot + replay Kafka (`commands` + `deltas`) với **0 câu query vào PostgreSQL** và gia nhập ở vai trò `STANDBY` (`REJOIN_AS_STANDBY_ON_RECOVERY=true`). Nginx thăng cấp Standby sau 2 lần `/readyz` lỗi (`POST /internal/promote` kèm fencing `epoch`) và giữ nguyên luồng trên node đã thăng cấp.
+### Các Điểm nhấn về Độ bền, Đọc RAM & Bảo vệ Biên
+- **Đồng bộ Bền vững qua Kafka (`unieee.enrollment.outcomes`) & Chống mất Revert:** `enrollment-writer` không còn ghi hay quét `writer_revert_outbox` ở runtime (vẫn giữ migration `V004` trong lịch sử Flyway). Writer chỉ commit consumer offset của `unieee.enrollment.commands` sau khi **cả** PostgreSQL batch commit lẫn `kafka.produce(EnrollmentOutcomeEvent, acks=all)` sang `unieee.enrollment.outcomes` thành công. Nếu crash giữa hai bước rồi gặp `duplicate event_id` trong `registration.enrollment_events`, writer đọc lại trạng thái đã lưu (`CONFIRMED` / `REJECTED` + `reason_code`) và **re-emit** `EnrollmentOutcomeEvent` trước khi commit offset.
+- **State Machine Độc lập với Redis Pub/Sub & 2 Endpoint Đọc RAM:** Cả `ACTIVE` và `STANDBY` của `enrollment-engine` đều tiêu thụ `unieee.enrollment.outcomes` (ngừng subscribe `unieee:seat:confirmed` và `unieee:enrollment:revert` trên Redis Pub/Sub) để chuyển trạng thái idempotent trong RAM (`Reserved -> Confirmed`, `DropPending -> Dropped`, hoặc `Reverted` + hoàn ghế & tính lại bitmask). Ngoài ghi, engine mở `GET /api/v1/enrollments/seats?termId=...` (đọc lock-free từ `SectionSeatSlot`) và `GET /api/v1/enrollments/me?termId=...` (đọc shard của đúng `student_id` trong JWT).
+- **Xác thực JWT không nghẽn & Gộp Pub/Sub Giá trị Tuyệt đối:** `enrollment-engine` và `sse-gateway` xác thực JWT cục bộ qua một luồng background JWKS singleflight (`JWKS_REFRESH_INTERVAL_SECS=300`) kết hợp cache SHA-256 ngắn hạn (`JWT_CACHE_TTL_SECS=30`). `SeatTentativeEvent` (`enrollment-engine`) và `SeatConfirmedEvent` (`enrollment-writer`) luôn phát **số ghế trống tuyệt đối (`availableSeats`, `maxCapacity`)** thay vì delta `+1`/`-1`, nên dù Redis Pub/Sub rơi gói tin vẫn tự đồng bộ ở sự kiện kế tiếp. Biến động tạm thời được gộp (`COALESCE_WINDOW_MS=50`, flush tức thì khi `availableSeats == 0`) qua Redis pipeline.
+- **Phân tách Đọc/Ghi Nginx (`$enrollment_read_upstream`) & Micro-cache `1s`:** Khi cả hai node engine đều `READY`, Nginx tách `$enrollment_primary = ACTIVE` (ghi) và `$enrollment_read_upstream = STANDBY` (đọc). Khi `ACTIVE` chết và `STANDBY` được promote (chỉ còn 1 node sống) hoặc node cũ đang `SYNCING` (`/readyz = 503`), cả hai biến trỏ về node `ACTIVE` còn sống kết hợp `seats_cache` (`1s`, `proxy_cache_lock on`) cho `GET /api/v1/enrollments/seats`. Khi node cũ replay xong và quay lại ở vai trò `STANDBY`, Nginx giữ nguyên quyền ghi (không auto-failback) và tự động tách lại luồng đọc sang `STANDBY`.
+- **Phục hồi Không chạm PostgreSQL:** Sau preload, engine ghi disk snapshot nguyên tử (`SNAPSHOT_DIR`, SHA-256 + `checkpoint_seq`). Khi khởi động lại, engine giữ `/readyz = 503`, nạp lại từ disk snapshot + replay Kafka (`commands` + `deltas` + `outcomes`) với **0 câu query vào PostgreSQL** và gia nhập ở vai trò `STANDBY` (`REJOIN_AS_STANDBY_ON_RECOVERY=true`).
 - **Nginx Public Catalog Cache Lock:** `/api/v1/public/sections` và `/api/v1/public/courses` dùng `proxy_cache catalog_cache` kết hợp `proxy_cache_lock on` và `proxy_cache_use_stale ... updating` để hấp thụ đột biến lượt đọc.
 
 ---
@@ -121,10 +127,11 @@ flowchart LR
 | Kênh / Kho lưu | Tên định danh | Producer -> Consumer | Mục đích |
 | :--- | :--- | :--- | :--- |
 | **Kafka Topic** | `unieee.enrollment.commands` *(12 partitions)* | `enrollment-engine` -> `enrollment-writer`, replay phục hồi | Luồng lệnh đăng ký/hủy bền vững phân vùng theo `student_id`. |
+| **Kafka Topic** | `unieee.enrollment.outcomes` *(12 partitions)* | `enrollment-writer` -> `enrollment-engine` (Active & Standby), replay phục hồi | Kết quả bền vững `CONFIRMED` / `REVERTED` (`acks=all`, partition key = `student_id`), thay thế `writer_revert_outbox` ở runtime. |
 | **Kafka Topic** | `unieee.enrollment.deltas` *(6 partitions)* | `core-java` (`KafkaHotDeltaPublisher`) -> `enrollment-engine` (Active & Standby) | Đồng bộ nóng `StudentStandingUpdatedEvent` & `SectionCapacityUpdatedEvent` khi cổng đang `REGISTRATION_OPEN`. |
 | **Kafka Topic** | `unieee.enrollment.dlq` *(3 partitions)* | `enrollment-writer` -> Ops kiểm tra | Hàng đợi thư chết cho payload Kafka lỗi không thể xử lý. |
-| **Redis Pub/Sub** | `unieee:seat:tentative` | `enrollment-engine` -> `sse-gateway` | Biến động sĩ số tạm thời đã gộp nhóm từ RAM (`TENTATIVE`). |
-| **Redis Pub/Sub** | `unieee:seat:confirmed` | `enrollment-writer` -> `sse-gateway` | Xác nhận ghi đĩa PostgreSQL thành công (`CONFIRMED`). |
-| **Redis Pub/Sub** | `unieee:enrollment:revert` | `enrollment-writer` -> `enrollment-engine`, `sse-gateway` | Sự kiện hoàn tác khi PostgreSQL từ chối bản ghi (`REVERTED`). |
+| **Redis Pub/Sub** | `unieee:seat:tentative` | `enrollment-engine` -> `sse-gateway` | Biến động sĩ số tạm thời đã gộp nhóm từ RAM (`TENTATIVE`, mang `availableSeats` & `maxCapacity` tuyệt đối). |
+| **Redis Pub/Sub** | `unieee:seat:confirmed` | `enrollment-writer` -> `sse-gateway` | Xác nhận ghi đĩa PostgreSQL thành công cho UI SSE (`CONFIRMED`, mang `availableSeats` & `maxCapacity` tuyệt đối). |
+| **Redis Pub/Sub** | `unieee:enrollment:revert` | `enrollment-writer` -> `sse-gateway` | Sự kiện hoàn tác cho luồng SSE cá nhân (`REVERTED`; `enrollment-engine` đã chuyển sang tiêu thụ Kafka `unieee.enrollment.outcomes`). |
 | **Redis Pub/Sub** | `unieee:gate:control` | `scripts/unieee.sh` -> `enrollment-engine`, `sse-gateway` | Chuyển trạng thái cổng (`OPEN`, `DRAINING`, `CLOSED`) và đổi đợt không cần restart kèm fencing `epoch`. |
-| **Redis Keys** | `unieee:cache:term:{termId}:sections`<br>`unieee:cache:section:{sectionId}:seats`<br>`unieee:cache:student:{studentId}:term:{termId}:timetable`<br>`unieee:cache:policy:{termId}:snapshot`<br>`unieee:event:status:{eventId}`<br>`unieee:revert:dedup:{eventId}` | `core-java` & `enrollment-writer` -> `ai_advisor`, `enrollment-engine` | Dữ liệu Read Cache (`warm-cache` & đồng bộ sau commit), cache policy snapshot, tra cứu trạng thái event và khóa chống trùng revert 24h. |
+| **Redis Keys** | `unieee:cache:term:{termId}:sections`<br>`unieee:cache:section:{sectionId}:seats`<br>`unieee:cache:student:{studentId}:term:{termId}:timetable`<br>`unieee:cache:policy:{termId}:active`<br>`unieee:cache:policy:{termId}:snapshot`<br>`unieee:cache:catalog:{terms\|term:*\|courses\|course:*\|course:*:prerequisites\|sections:term:*\|section:*:detail}`<br>`unieee:event:status:{eventId}`<br>`unieee:revert:dedup:{eventId}` | `core-java` & `enrollment-writer` -> `core-java`, `ai_advisor`, `enrollment-engine`, client | Lớp Read-Through Cache fail-open (`core-java`: catalog, active policy, thời khóa biểu thích ứng), cache sĩ số `warm-cache` & đồng bộ sau commit cho `/api/v1/sections` & `ai_advisor`, cache policy snapshot, tra cứu trạng thái event và khóa chống trùng revert 24h dự phòng. |

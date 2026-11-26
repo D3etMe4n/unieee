@@ -178,6 +178,10 @@ impl From<EngineError> for ApiError {
                 "NODE_STANDBY",
                 err.to_string(),
             ),
+            EngineError::TermNotFound(term_id) => Self::not_found(
+                "TERM_NOT_FOUND",
+                format!("Term {term_id} is not loaded in enrollment engine"),
+            ),
             EngineError::RuleViolation { code, detail } => {
                 let status = StatusCode::from_u16(code.http_status_code())
                     .unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);

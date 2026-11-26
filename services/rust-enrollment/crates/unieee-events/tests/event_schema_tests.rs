@@ -8,10 +8,11 @@ use unieee_events::{
     decode_json, decode_json_slice, encode_json, encode_json_bytes, event_status_cache_key,
     policy_snapshot_cache_key, revert_dedup_key, section_seats_cache_key,
     student_timetable_cache_key, term_sections_cache_key, DeadLetterEvent, EnrollmentCommandEvent,
-    EnrollmentDeltaEvent, EventCodecError, EventStatusCachePayload, GateControlEvent,
-    HotPathPubSubMessage, RevertEvent, SeatConfirmedEvent, SeatTentativeEvent,
-    SectionCapacityUpdatedEvent, StudentStandingUpdatedEvent, EVENT_SCHEMA_VERSION_V1,
-    KAFKA_TOPIC_ENROLLMENT_COMMANDS, KAFKA_TOPIC_ENROLLMENT_DELTAS, KAFKA_TOPIC_ENROLLMENT_DLQ,
+    EnrollmentDeltaEvent, EnrollmentOutcomeEvent, EnrollmentOutcomeStatus, EventCodecError,
+    EventStatusCachePayload, GateControlEvent, HotPathPubSubMessage, RevertEvent,
+    SeatConfirmedEvent, SeatTentativeEvent, SectionCapacityUpdatedEvent,
+    StudentStandingUpdatedEvent, EVENT_SCHEMA_VERSION_V1, KAFKA_TOPIC_ENROLLMENT_COMMANDS,
+    KAFKA_TOPIC_ENROLLMENT_DELTAS, KAFKA_TOPIC_ENROLLMENT_DLQ, KAFKA_TOPIC_ENROLLMENT_OUTCOMES,
     REDIS_CHANNEL_ENROLLMENT_REVERT, REDIS_CHANNEL_GATE_CONTROL, REDIS_CHANNEL_SEAT_CONFIRMED,
     REDIS_CHANNEL_SEAT_TENTATIVE,
 };
@@ -21,6 +22,10 @@ fn topic_and_redis_key_builders_match_database_and_cache_spec() {
     assert_eq!(
         KAFKA_TOPIC_ENROLLMENT_COMMANDS,
         "unieee.enrollment.commands"
+    );
+    assert_eq!(
+        KAFKA_TOPIC_ENROLLMENT_OUTCOMES,
+        "unieee.enrollment.outcomes"
     );
     assert_eq!(KAFKA_TOPIC_ENROLLMENT_DLQ, "unieee.enrollment.dlq");
     assert_eq!(REDIS_CHANNEL_SEAT_TENTATIVE, "unieee:seat:tentative");
@@ -421,4 +426,107 @@ fn golden_java_and_cli_delta_json_decodes_cleanly() {
         }
         other => panic!("unexpected delta variant: {other:?}"),
     }
+}
+
+#[test]
+fn kafka_outcome_events_and_absolute_sse_seat_counts_roundtrip() {
+    let now = Utc::now();
+    let event_id = EventId::new_v7();
+    let term_id = TermId::new_v4();
+    let student_id = StudentId::new_v4();
+    let section_id = SectionId::new(909);
+    let course_id = CourseId::new_v4();
+
+    assert_eq!(EnrollmentOutcomeStatus::Confirmed.as_str(), "CONFIRMED");
+    assert_eq!(EnrollmentOutcomeStatus::Reverted.as_str(), "REVERTED");
+
+    let confirmed = EnrollmentOutcomeEvent::confirmed(
+        event_id,
+        term_id,
+        student_id,
+        section_id,
+        course_id,
+        EnrollmentAction::Register,
+        7,
+        now,
+    );
+    assert_eq!(confirmed.partition_key(), student_id.to_string());
+    assert!(confirmed.to_revert_event().is_none());
+    let confirmed_json = encode_json(&confirmed).unwrap();
+    assert!(confirmed_json.contains("\"status\":\"CONFIRMED\""));
+    assert!(confirmed_json.contains("\"engineEpoch\":7"));
+    assert_eq!(
+        decode_json::<EnrollmentOutcomeEvent>(&confirmed_json).unwrap(),
+        confirmed
+    );
+
+    let revert = RevertEvent::new(
+        event_id,
+        term_id,
+        student_id,
+        section_id,
+        course_id,
+        EnrollmentAction::Drop,
+        RuleErrorCode::NotEnrolledInSection,
+        "No active CONFIRMED enrollment",
+        7,
+        now,
+    );
+    let reverted_from = EnrollmentOutcomeEvent::from_revert(&revert);
+    assert_eq!(reverted_from.partition_key(), student_id.to_string());
+    assert_eq!(reverted_from.status, EnrollmentOutcomeStatus::Reverted);
+    assert_eq!(reverted_from.to_revert_event(), Some(revert.clone()));
+
+    let reverted = EnrollmentOutcomeEvent::reverted(
+        event_id,
+        term_id,
+        student_id,
+        section_id,
+        course_id,
+        EnrollmentAction::Drop,
+        RuleErrorCode::NotEnrolledInSection,
+        "No active CONFIRMED enrollment",
+        7,
+        now,
+    );
+    assert_eq!(reverted, reverted_from);
+    let reverted_bytes = encode_json_bytes(&reverted).unwrap();
+    assert_eq!(
+        decode_json_slice::<EnrollmentOutcomeEvent>(&reverted_bytes).unwrap(),
+        reverted
+    );
+
+    let mut bad_outcome = confirmed;
+    bad_outcome.schema_version = EVENT_SCHEMA_VERSION_V1 + 1;
+    assert!(matches!(
+        encode_json(&bad_outcome),
+        Err(EventCodecError::UnsupportedSchemaVersion {
+            expected: 1,
+            actual: 2
+        })
+    ));
+
+    // Confirm Redis SSE seat events carry absolute availableSeats & maxCapacity (never deltas).
+    let tentative_json = encode_json(&SeatTentativeEvent::new(
+        term_id, section_id, 14, 50, 7, now,
+    ))
+    .unwrap();
+    assert!(tentative_json.contains("\"availableSeats\":14"));
+    assert!(tentative_json.contains("\"maxCapacity\":50"));
+    assert!(!tentative_json.contains("delta"));
+
+    let seat_conf_json = encode_json(&SeatConfirmedEvent::new(
+        event_id,
+        term_id,
+        section_id,
+        student_id,
+        14,
+        50,
+        EnrollmentEventStatus::Confirmed,
+        now,
+    ))
+    .unwrap();
+    assert!(seat_conf_json.contains("\"availableSeats\":14"));
+    assert!(seat_conf_json.contains("\"maxCapacity\":50"));
+    assert!(!seat_conf_json.contains("delta"));
 }

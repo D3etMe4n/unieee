@@ -105,7 +105,10 @@ class EnrollmentPolicyServiceAndExporterTest {
             catalogFacade,
             accountFacade,
             evaluator,
-            mapper
+            mapper,
+            new vn.edu.unieee.common.cache.NoOpReadThroughCache(),
+            new vn.edu.unieee.common.cache.ReadCacheProperties(),
+            eventPublisher
         );
         snapshotExporter = new PolicySnapshotExporter(
             policyRepository,
@@ -198,6 +201,11 @@ class EnrollmentPolicyServiceAndExporterTest {
         assertThat(prevActive.isActive()).isFalse();
         verify(policyRepository).saveAndFlush(prevActive);
         verify(policyRepository).saveAndFlush(policy);
+        verify(eventPublisher, org.mockito.Mockito.times(2))
+            .publishEvent(any(vn.edu.unieee.registration.event.EnrollmentPolicyChangedEvent.class));
+
+        when(policyRepository.findByTermIdAndActiveTrue(termId)).thenReturn(Optional.of(policy));
+        assertThat(policyService.getActivePolicyForTerm(termId).policyCode()).isEqualTo("UNI-A");
 
         // Idempotent when already active
         EnrollmentPolicyResponse idempotent = policyService.activatePolicy(policyId);

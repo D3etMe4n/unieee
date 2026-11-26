@@ -7,7 +7,7 @@
 Chào mừng bạn đến với bộ tài liệu dành cho người đọc, kỹ sư vận hành và cộng tác viên của **unieee** — hệ thống quản lý đào tạo và đăng ký tín chỉ đại học áp dụng kiến trúc lai **Hybrid CQRS + Event Sourcing & Modular Monolith**.
 
 > [!NOTE]
-> Thư mục `guides/` chứa bộ tài liệu công khai hướng dẫn cài đặt, vận hành, kiến trúc, API và kiểm thử cho người xem repository. Nội dung phản ánh đầy đủ các tính năng đã hoàn thành tới **Phase 11** trên nhánh `dev` (`core-java` `0.3.0-SNAPSHOT`, `rust-enrollment` `0.5.0`), chỉ còn **Phase 12** (E2E & Load Testing) ở bước tiếp theo.
+> Thư mục `guides/` chứa bộ tài liệu công khai hướng dẫn cài đặt, vận hành, kiến trúc, API và kiểm thử cho người xem repository. Nội dung phản ánh đầy đủ các tính năng tới **Phase 11** cùng kiến trúc đồng bộ Kafka `outcomes`, tách luồng đọc/ghi Hot Path và Redis Read-Through Cache (`core-java` `0.4.0-SNAPSHOT`, `rust-enrollment` `0.6.0`), chỉ còn **Phase 12** (E2E & Load Testing) ở bước tiếp theo.
 
 ---
 

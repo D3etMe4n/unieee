@@ -29,9 +29,13 @@ public interface CatalogFacade {
 
     AcademicTermResponse getTermById(UUID termId);
 
+    AcademicTermResponse getTermByIdAuthoritative(UUID termId);
+
     AcademicTermResponse getTermByCode(String code);
 
     List<AcademicTermResponse> listTerms();
+
+    List<AcademicTermResponse> listTermsAuthoritative();
 
     AcademicTermResponse transitionTermStatus(UUID termId, TransitionAcademicTermStatusRequest request);
 
@@ -75,11 +79,15 @@ public interface CatalogFacade {
 
     CourseSectionDetailResponse getSectionById(Long sectionId);
 
+    CourseSectionDetailResponse getSectionByIdAuthoritative(Long sectionId);
+
     List<CourseSectionSummaryResponse> getSectionsByIds(Collection<Long> sectionIds);
 
     List<CourseSectionDetailResponse> getSectionDetailsByIds(Collection<Long> sectionIds);
 
     List<CourseSectionSummaryResponse> listSectionsByTerm(UUID termId);
+
+    List<CourseSectionSummaryResponse> listSectionsByTermAuthoritative(UUID termId);
 
     List<CourseSectionDetailResponse> listTeachingSections(UUID termId, UUID lecturerId);
 

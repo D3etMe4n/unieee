@@ -4,7 +4,7 @@ use crate::core::{
 };
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
-use rdkafka::consumer::{BaseConsumer, Consumer, StreamConsumer};
+use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer, StreamConsumer};
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::Message;
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -17,7 +17,8 @@ use tracing::warn;
 use unieee_domain::TermId;
 use unieee_events::{
     decode_json_slice, encode_json, EnrollmentCommandEvent, EnrollmentDeltaEvent,
-    KAFKA_TOPIC_ENROLLMENT_COMMANDS, KAFKA_TOPIC_ENROLLMENT_DELTAS,
+    EnrollmentOutcomeEvent, KAFKA_TOPIC_ENROLLMENT_COMMANDS, KAFKA_TOPIC_ENROLLMENT_DELTAS,
+    KAFKA_TOPIC_ENROLLMENT_OUTCOMES,
 };
 
 #[must_use]
@@ -175,6 +176,7 @@ fn replay_topics_blocking(
     for topic in [
         KAFKA_TOPIC_ENROLLMENT_COMMANDS,
         KAFKA_TOPIC_ENROLLMENT_DELTAS,
+        KAFKA_TOPIC_ENROLLMENT_OUTCOMES,
     ] {
         let metadata = consumer
             .fetch_metadata(Some(topic), Duration::from_secs(3))
@@ -310,6 +312,12 @@ pub fn collect_replay_payload(
                 batch.deltas.push(delta);
             }
         }
+    } else if topic == KAFKA_TOPIC_ENROLLMENT_OUTCOMES {
+        if let Ok(outcome) = decode_json_slice::<EnrollmentOutcomeEvent>(payload) {
+            if outcome.term_id == term_id {
+                batch.outcomes.push(outcome);
+            }
+        }
     }
 }
 
@@ -331,6 +339,12 @@ pub fn decode_and_apply_kafka_message(
                     decode_json_slice(payload).map_err(|e| format!("bad command payload: {e}"))?;
                 engine.apply_replayed_command(&cmd);
             }
+            Ok(())
+        }
+        KAFKA_TOPIC_ENROLLMENT_OUTCOMES => {
+            let outcome: EnrollmentOutcomeEvent =
+                decode_json_slice(payload).map_err(|e| format!("bad outcome payload: {e}"))?;
+            let _ = engine.apply_outcome_in_ram(&outcome);
             Ok(())
         }
         other => Err(format!("unexpected Kafka topic: {other}")),
@@ -357,17 +371,16 @@ pub async fn decode_and_apply_kafka_message_async(
         KAFKA_TOPIC_ENROLLMENT_DELTAS => {
             let delta: EnrollmentDeltaEvent =
                 decode_json_slice(payload).map_err(|e| format!("bad delta payload: {e}"))?;
-            match &delta {
-                EnrollmentDeltaEvent::Revert(rev) => {
-                    let _ = engine.apply_revert_event(rev).await;
-                }
-                _ => {
-                    let _ = engine.apply_delta_event(&delta);
-                }
-            }
+            let _ = engine.apply_delta_event(&delta);
             Ok(())
         }
         KAFKA_TOPIC_ENROLLMENT_COMMANDS => decode_and_apply_kafka_message(engine, topic, payload),
+        KAFKA_TOPIC_ENROLLMENT_OUTCOMES => {
+            let outcome: EnrollmentOutcomeEvent =
+                decode_json_slice(payload).map_err(|e| format!("bad outcome payload: {e}"))?;
+            let _ = engine.apply_outcome_event(&outcome).await;
+            Ok(())
+        }
         other => Err(format!("unexpected Kafka topic: {other}")),
     }
 }
@@ -381,14 +394,12 @@ pub fn spawn_delta_and_standby_consumer(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut cfg = build_consumer_config(&brokers, &group_id, "latest");
-        if !resume_offsets.is_empty() {
-            // Manual partition assignment resumes from exact high-watermark without group rebalance.
-            cfg.set("enable.auto.commit", "false");
-        }
+        cfg.set("enable.auto.commit", "false")
+            .set("enable.auto.offset.store", "false");
         let consumer: StreamConsumer = match cfg.create() {
             Ok(c) => c,
             Err(err) => {
-                warn!(error = %err, "failed creating live Kafka delta/standby consumer");
+                warn!(error = %err, "failed creating live Kafka delta/standby/outcomes consumer");
                 return;
             }
         };
@@ -400,6 +411,9 @@ pub fn spawn_delta_and_standby_consumer(
                         warn!(error = %err, "failed assigning live Kafka resume offsets");
                         return;
                     }
+                    if let Err(err) = consumer.commit(&tpl, CommitMode::Async) {
+                        warn!(error = %err, "failed recording initial Kafka resume offsets");
+                    }
                 }
                 Err(err) => {
                     warn!(error = %err, "invalid Kafka resume offsets");
@@ -409,6 +423,7 @@ pub fn spawn_delta_and_standby_consumer(
         } else if let Err(err) = consumer.subscribe(&[
             KAFKA_TOPIC_ENROLLMENT_DELTAS,
             KAFKA_TOPIC_ENROLLMENT_COMMANDS,
+            KAFKA_TOPIC_ENROLLMENT_OUTCOMES,
         ]) {
             warn!(error = %err, "failed subscribing to Kafka topics");
             return;
@@ -424,9 +439,20 @@ pub fn spawn_delta_and_standby_consumer(
                 recv = consumer.recv() => {
                     match recv {
                         Ok(msg) => {
-                            if let Some(payload) = msg.payload() {
-                                if let Err(err) = decode_and_apply_kafka_message_async(&engine, msg.topic(), payload).await {
-                                    warn!(topic = msg.topic(), error = %err, "failed applying Kafka message");
+                            let applied_ok = if let Some(payload) = msg.payload() {
+                                match decode_and_apply_kafka_message_async(&engine, msg.topic(), payload).await {
+                                    Ok(()) => true,
+                                    Err(err) => {
+                                        warn!(topic = msg.topic(), error = %err, "failed applying Kafka message");
+                                        false
+                                    }
+                                }
+                            } else {
+                                true
+                            };
+                            if applied_ok {
+                                if let Err(err) = consumer.commit_message(&msg, CommitMode::Async) {
+                                    warn!(topic = msg.topic(), error = %err, "failed committing Kafka outcome/delta offset");
                                 }
                             }
                         }

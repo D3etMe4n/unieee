@@ -17,10 +17,10 @@
 | **Phase 5** | Wish Surveys (non-seat-reserving), Registration Windows lifecycle, Multi-University Policy Engine (6 rules), SHA-256 Policy Snapshot Exporter + Redis Read Cache (`V005`) | **Completed** (`dev`) |
 | **Phase 6** | Rust Cargo Workspace (`services/rust-enrollment/`), `unieee-domain` (Bitmask Engine + `proptest`), `unieee-events`, `unieee-cacheline` (`#[repr(align(64))]`) | **Completed** (`dev`) |
 | **Phase 7** | Rust `enrollment-engine` (Axum + Tokio, local JWKS singleflight verify, PostgreSQL preload + disk snapshots, lock-free CAS, Kafka producer, epoch recovery replay & Hot Delta Sync) | **Completed** (`dev`) |
-| **Phase 8** | Rust `enrollment-writer` (Kafka micro-batch consumer, SQL `UNNEST` + `CHECK`, `writer_revert_outbox`, Redis cache sync & Revert Pub/Sub) | **Completed** (`dev`) |
-| **Phase 9** | Rust `sse-gateway` (Redis Pub/Sub subscriber, `tokio::sync::broadcast`, 150ms coalescing, jittered `retry`/`maxAge` & lag resync) | **Completed** (`dev`) |
+| **Phase 8** | Rust `enrollment-writer` (Kafka micro-batch consumer, SQL `UNNEST` + `CHECK`, crash-safe at-least-once `unieee.enrollment.outcomes` Kafka producer + duplicate re-emit replacing runtime outbox, Redis cache sync & SSE Pub/Sub) | **Completed** (`dev`) |
+| **Phase 9** | Rust `sse-gateway` (Redis Pub/Sub subscriber with absolute seat counts, `tokio::sync::broadcast`, 150ms coalescing, jittered `retry`/`maxAge` & lag resync) | **Completed** (`dev`) |
 | **Phase 10** | Spring AI 2.0.3 `ai_advisor` module (4 Read-Only `@Tool` functions, anti-IDOR/prompt-injection guardrails, deterministic `BitmaskConflictChecker` & fallback) | **Completed** (`dev`) |
-| **Phase 11** | Operational Lifecycle CLI (`prepare-registration`, `open-registration`, `close-registration` drain & 3-way reconciliation), `/api/v1/public/*` cache lock, `/internal/preload-summary` SHA-256 verification, Active–Standby `/readyz` failover, Keycloak brokering & Hot Delta Sync | **Completed** (`dev`) |
+| **Phase 11** | Operational Lifecycle CLI (`prepare-registration`, `open-registration`, `close-registration` Kafka `commands`+`outcomes` lag=0 drain, 3-way reconciliation & final `warm-cache`), `/api/v1/public/*` cache lock, Nginx `$enrollment_read_upstream` read/write split + `1s` `seats_cache`, `/internal/preload-summary` SHA-256 verification, Active–Standby `/readyz` failover, `core-java` Redis Read-Through Cache, Keycloak link-only brokering & Hot Delta Sync | **Completed** (`dev`) |
 | **Phase 12** | Full E2E Regression Suite (`tests/e2e/`) & Flash-Crowd Load Testing (`tests/load/`, 0% overbooking & 0% schedule conflict verification) | *Planned* |
 
 ---
@@ -44,7 +44,7 @@ Every Pull Request into `dev` or `main` must pass **3 GitHub Actions jobs**:
 1. **Infra, Scripts & Guardrails:**
    - Rejects any tracked secret files (`.env`, `*.pem`, `*.key`, `*.crt`, `*.p12`) or local-only workspace files.
    - Validates shell script syntax (`bash -n` / `sh -n`), including `20-enrollment-healthcheck.sh`.
-   - Validates Keycloak realm integrity (`registrationAllowed == false`, `accessTokenLifespan` in `1800..3600s`, all 3 roles, `unieee-first-broker-login-link-only` flow without `idp-create-user-if-unique`) and Nginx cache lock / failover config (`catalog_cache`, `proxy_cache_lock on`, `/tmp/enrollment-primary.conf`).
+   - Validates Keycloak realm integrity (`registrationAllowed == false`, `accessTokenLifespan` in `1800..3600s`, all 3 roles, `unieee-first-broker-login-link-only` flow without `idp-create-user-if-unique`), Nginx cache lock / read-write split / failover config (`catalog_cache`, `seats_cache`, `proxy_cache_lock on`, `/tmp/enrollment-primary.conf`, `$enrollment_read_upstream`, `/api/v1/enrollments/seats`, `/api/v1/enrollments/me`), and `compose.hotpath.yml` (`unieee.enrollment.outcomes`).
    - Validates all 5 Compose configuration overlays (`compose.base.yml`, `compose.hotpath.yml`, `compose.letsencrypt.yml`, `compose.cloudflared.yml` quick & named).
    - Verifies that all relative links in `README.md` and `README.vi.md` resolve cleanly.
 2. **Spring Boot 4.1.3 Core & Modulith:**

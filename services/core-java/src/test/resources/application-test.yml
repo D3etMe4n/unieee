@@ -43,6 +43,8 @@ unieee:
     cache:
       redis:
         enabled: false
+  read-cache:
+    enabled: false
   hot-delta:
     kafka:
       enabled: false

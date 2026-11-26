@@ -12,7 +12,8 @@ pub use models::{
     ActiveEnrollment, BootstrapOptions, BootstrapReport, BootstrapSourceKind,
     CoursePrerequisiteEdge, DeltaOutcome, EngineError, EngineReadiness, EngineRuntimeOptions,
     EnrollmentAccepted, EventStatusRecord, NodeRole, PreloadDataset, PreloadSummarySnapshot,
-    ReplayEventRecord, RevertOutcome, SectionMeta, StudentCourseAttempt, StudentState, SweepReport,
+    ReplayEventRecord, RevertOutcome, SectionMeta, SectionSeatView, StudentCourseAttempt,
+    StudentEnrollmentItemView, StudentEnrollmentsView, StudentState, SweepReport,
 };
 pub use ports::{
     CommandPublisher, EventStatusCacheReader, EventStatusFallbackStore, FallbackEventLogSource,

@@ -4,19 +4,20 @@ use crate::core::{
 };
 use crate::http::dto::{
     DropRequest, EnrollmentAcceptedResponse, EnrollmentStatusResponse, HealthResponse,
-    PromoteResponse, ReadinessResponse, RegisterRequest,
+    MyEnrollmentItemResponse, MyEnrollmentsResponse, PromoteResponse, ReadinessResponse,
+    RegisterRequest, SectionSeatResponse,
 };
 use crate::http::error::{ApiError, ProblemJson};
-use axum::extract::{FromRequestParts, Path, State};
+use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono::Utc;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
-use unieee_domain::{EventId, SectionId};
+use unieee_domain::{EventId, SectionId, TermId};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -227,6 +228,93 @@ pub async fn get_status_handler(
         engine_epoch: record.engine_epoch,
         updated_at: record.updated_at,
     }))
+}
+
+pub async fn get_seats_handler(
+    State(state): State<AppState>,
+    uri: Uri,
+    AuthenticatedUser(claims): AuthenticatedUser,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Vec<SectionSeatResponse>>, ApiError> {
+    let instance = uri.path();
+    if !claims.has_role("STUDENT")
+        && !claims.has_role("LECTURER")
+        && !claims.has_role("ACADEMIC_ADMIN")
+    {
+        return Err(ApiError::from(AuthError::Forbidden).with_instance(instance));
+    }
+    let term_id = parse_required_term_id(&params, instance)?;
+    let seats = state
+        .engine
+        .list_term_seats(term_id)
+        .map_err(|err| ApiError::from(err).with_instance(instance))?;
+    Ok(Json(
+        seats
+            .into_iter()
+            .map(|s| SectionSeatResponse {
+                section_id: s.section_id,
+                available_seats: s.available_seats,
+                max_capacity: s.max_capacity,
+                status: s.status,
+            })
+            .collect(),
+    ))
+}
+
+pub async fn get_my_enrollments_handler(
+    State(state): State<AppState>,
+    uri: Uri,
+    AuthenticatedUser(claims): AuthenticatedUser,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<MyEnrollmentsResponse>, ApiError> {
+    let instance = uri.path();
+    if !claims.has_role("STUDENT") {
+        return Err(ApiError::from(AuthError::Forbidden).with_instance(instance));
+    }
+    let term_id = parse_required_term_id(&params, instance)?;
+    let student_id = state
+        .engine
+        .resolve_student_id(&claims.sub, claims.student_id_claim)
+        .map_err(|err| ApiError::from(err).with_instance(instance))?;
+    let view = state
+        .engine
+        .get_student_enrollments(term_id, student_id)
+        .map_err(|err| ApiError::from(err).with_instance(instance))?;
+    Ok(Json(MyEnrollmentsResponse {
+        term_id: view.term_id,
+        student_id: view.student_id,
+        current_credits: view.current_credits,
+        items: view
+            .items
+            .into_iter()
+            .map(|item| MyEnrollmentItemResponse {
+                section_id: item.section_id,
+                course_id: item.course_id,
+                action: item.action,
+                status: item.status,
+                last_event_id: item.last_event_id,
+            })
+            .collect(),
+    }))
+}
+
+fn parse_required_term_id(
+    params: &HashMap<String, String>,
+    instance: &str,
+) -> Result<TermId, ApiError> {
+    let raw = params
+        .get("termId")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request("INVALID_TERM_ID", "Missing required termId query parameter")
+                .with_instance(instance)
+        })?;
+    TermId::from_str(raw).map_err(|_| {
+        ApiError::bad_request("INVALID_TERM_ID", format!("Invalid UUID termId: {raw}"))
+            .with_instance(instance)
+    })
 }
 
 pub async fn promote_handler(

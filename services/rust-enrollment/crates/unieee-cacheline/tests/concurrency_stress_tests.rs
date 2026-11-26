@@ -66,6 +66,9 @@ fn section_seat_slot_and_table_enforce_invariants_and_error_paths() {
         SectionSlotState::from(SectionStatus::Draft),
         SectionSlotState::Closed
     );
+    assert_eq!(SectionSlotState::Open.as_str(), "OPEN");
+    assert_eq!(SectionSlotState::Frozen.as_str(), "FROZEN");
+    assert_eq!(SectionSlotState::Closed.as_str(), "CLOSED");
     assert_eq!(
         SectionSlotState::from(SectionStatus::Frozen),
         SectionSlotState::Frozen

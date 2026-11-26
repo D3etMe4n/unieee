@@ -1,12 +1,12 @@
 use crate::core::models::{
-    FastBatchCommitResult, FastPathBatchError, OutboxRevertRow, RedisBatchUpdate,
-    SingleEventOutcome,
+    FastBatchCommitResult, FastPathBatchError, RedisBatchUpdate, SingleEventOutcome,
+    StaleRejectionOutcome,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
-use unieee_domain::{EventId, TermId};
-use unieee_events::{DeadLetterEvent, EnrollmentCommandEvent, RevertEvent};
+use unieee_domain::TermId;
+use unieee_events::{DeadLetterEvent, EnrollmentCommandEvent, EnrollmentOutcomeEvent, RevertEvent};
 
 #[async_trait]
 pub trait WriterRepository: Send + Sync {
@@ -29,14 +29,7 @@ pub trait WriterRepository: Send + Sync {
         event: &EnrollmentCommandEvent,
         current_epoch: u64,
         now: DateTime<Utc>,
-    ) -> Result<Option<RevertEvent>, String>;
-
-    async fn fetch_unpublished_revert_outbox(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<OutboxRevertRow>, String>;
-
-    async fn mark_revert_outbox_published(&self, event_ids: &[EventId]) -> Result<u64, String>;
+    ) -> Result<StaleRejectionOutcome, String>;
 }
 
 #[async_trait]
@@ -44,8 +37,6 @@ pub trait RedisWriterSink: Send + Sync {
     async fn apply_confirmed_batch(&self, update: &RedisBatchUpdate) -> Result<(), String>;
 
     async fn publish_revert_events(&self, events: &[RevertEvent]) -> Result<(), String>;
-
-    async fn publish_raw_revert_payloads(&self, payloads: &[String]) -> Result<(), String>;
 }
 
 #[async_trait]
@@ -53,19 +44,9 @@ pub trait DlqPublisher: Send + Sync {
     async fn publish_dead_letter(&self, event: &DeadLetterEvent) -> Result<(), String>;
 }
 
-/// Publishes replayable copies of `RevertEvent` onto `unieee.enrollment.deltas` so restarting
-/// `enrollment-engine` nodes recover rejected commands directly from Kafka without PG queries.
+/// Publishes authoritative `CONFIRMED` / `REVERTED` outcomes onto `unieee.enrollment.outcomes`
+/// before the writer commits its Kafka consumer offset on `unieee.enrollment.commands`.
 #[async_trait]
-pub trait DeltaRevertPublisher: Send + Sync {
-    async fn publish_revert_deltas(&self, events: &[RevertEvent]) -> Result<(), String>;
-}
-
-#[derive(Default)]
-pub struct NoopDeltaRevertPublisher;
-
-#[async_trait]
-impl DeltaRevertPublisher for NoopDeltaRevertPublisher {
-    async fn publish_revert_deltas(&self, _events: &[RevertEvent]) -> Result<(), String> {
-        Ok(())
-    }
+pub trait OutcomePublisher: Send + Sync {
+    async fn publish_outcomes(&self, events: &[EnrollmentOutcomeEvent]) -> Result<(), String>;
 }

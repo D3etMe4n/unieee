@@ -47,7 +47,7 @@ public class RedisRegistrationSeatCacheWarmer implements RegistrationSeatCacheWa
         if (!catalogFacade.existsTerm(termId)) {
             throw new RegistrationNotFoundException("ACADEMIC_TERM_NOT_FOUND", "Academic term not found: " + termId);
         }
-        List<CourseSectionSummaryResponse> sections = catalogFacade.listSectionsByTerm(termId);
+        List<CourseSectionSummaryResponse> sections = catalogFacade.listSectionsByTermAuthoritative(termId);
         Instant now = Instant.now();
         String termHashKey = TERM_KEY_PREFIX + termId + TERM_KEY_SUFFIX;
         Map<String, String> termHashEntries = new LinkedHashMap<>();

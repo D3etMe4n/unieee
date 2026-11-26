@@ -3,7 +3,8 @@ use crate::core::models::{
     ActiveEnrollment, BootstrapOptions, BootstrapReport, BootstrapSourceKind,
     CoursePrerequisiteEdge, DeltaOutcome, EngineError, EngineReadiness, EngineRuntimeOptions,
     EnrollmentAccepted, EventStatusRecord, NodeRole, PreloadDataset, PreloadSummarySnapshot,
-    ReplayEventRecord, RevertOutcome, SectionMeta, StudentState, SweepReport,
+    ReplayEventRecord, RevertOutcome, SectionMeta, SectionSeatView, StudentEnrollmentItemView,
+    StudentEnrollmentsView, StudentState, SweepReport,
 };
 use crate::core::ports::{
     CommandPublisher, EventStatusCacheReader, EventStatusFallbackStore, FallbackEventLogSource,
@@ -32,8 +33,8 @@ use unieee_domain::{
     StudentId, TermId, WindowId, WindowStatus,
 };
 use unieee_events::{
-    EnrollmentCommandEvent, EnrollmentDeltaEvent, GateControlEvent, RevertEvent,
-    SeatConfirmedEvent, SeatTentativeEvent, SectionCapacityUpdatedEvent,
+    EnrollmentCommandEvent, EnrollmentDeltaEvent, EnrollmentOutcomeEvent, EnrollmentOutcomeStatus,
+    GateControlEvent, RevertEvent, SeatTentativeEvent, SectionCapacityUpdatedEvent,
     StudentStandingUpdatedEvent,
 };
 
@@ -1427,16 +1428,19 @@ impl EnrollmentEngine {
         }
     }
 
-    pub fn apply_seat_confirmed(&self, ev: &SeatConfirmedEvent) {
+    pub(crate) fn apply_confirmed_outcome_in_ram(&self, ev: &EnrollmentOutcomeEvent) {
         if ev.term_id != self.term_id() {
             return;
         }
         let catalog = self.catalog.load();
+        self.advance_epoch_if_higher(&catalog, ev.engine_epoch);
         let mut tentative_to_emit: Option<SeatTentativeEvent> = None;
+
         self.students.with_write(&ev.student_id, |opt_student| {
             let Some(student) = opt_student else {
                 return;
             };
+
             if let Some(pos) = student
                 .active_enrollments
                 .iter()
@@ -1458,7 +1462,7 @@ impl EnrollmentEngine {
                                         rel.available_seats,
                                         rel.max_capacity,
                                         rel.epoch,
-                                        ev.confirmed_at,
+                                        ev.processed_at,
                                     ));
                                 }
                             }
@@ -1467,21 +1471,245 @@ impl EnrollmentEngine {
                     }
                     _ => {}
                 }
+                student.processed_event_ids.insert(ev.event_id);
+                return;
             }
+
+            // Out-of-order recovery on STANDBY or Kafka replay where `outcomes` arrived before `commands`
+            if student.processed_event_ids.contains(&ev.event_id)
+                || student.reverted_event_ids.contains(&ev.event_id)
+            {
+                return;
+            }
+
+            if ev.action == EnrollmentAction::Drop {
+                if let Some(pos) = student.active_enrollments.iter().position(|e| {
+                    e.section_id == ev.section_id
+                        && matches!(
+                            e.state,
+                            HotPathEnrollmentState::Reserved | HotPathEnrollmentState::Confirmed
+                        )
+                }) {
+                    student.active_enrollments.remove(pos);
+                    if let Some(slot) = catalog.seat_table.get(ev.section_id) {
+                        if let Ok(rel) = slot.try_release() {
+                            tentative_to_emit = Some(SeatTentativeEvent::new(
+                                ev.term_id,
+                                ev.section_id,
+                                rel.available_seats,
+                                rel.max_capacity,
+                                rel.epoch,
+                                ev.processed_at,
+                            ));
+                        }
+                    }
+                    student.recompute_schedule_and_credits(&catalog.sections_meta);
+                }
+                student.processed_event_ids.insert(ev.event_id);
+                return;
+            }
+
+            let Some(section_meta) = catalog.sections_meta.get(&ev.section_id) else {
+                return;
+            };
+            let Some(slot) = catalog.seat_table.get(ev.section_id) else {
+                return;
+            };
+            let policy_state = self.policy_state.load();
+            let already_holds = student.active_enrollments.iter().any(|e| {
+                e.section_id == ev.section_id
+                    && matches!(
+                        e.state,
+                        HotPathEnrollmentState::Reserved | HotPathEnrollmentState::Confirmed
+                    )
+            });
+            if !already_holds {
+                if let Ok(res) = slot.try_reserve() {
+                    tentative_to_emit = Some(SeatTentativeEvent::new(
+                        ev.term_id,
+                        ev.section_id,
+                        res.remaining_seats,
+                        res.max_capacity,
+                        res.epoch,
+                        ev.processed_at,
+                    ));
+                }
+                let credits_counted = policy_state
+                    .policy
+                    .credit_limit
+                    .counted_candidate_credits(ev.action, section_meta.credits);
+                student.active_enrollments.push(ActiveEnrollment {
+                    section_id: ev.section_id,
+                    course_id: ev.course_id,
+                    credits_counted,
+                    action: ev.action,
+                    state: HotPathEnrollmentState::Confirmed,
+                    last_event_id: ev.event_id,
+                    seat_released: false,
+                });
+                student.recompute_schedule_and_credits(&catalog.sections_meta);
+            }
+            student.processed_event_ids.insert(ev.event_id);
         });
-        if let Some(ev_tentative) = tentative_to_emit {
-            let _ = self.coalescer.enqueue_nonblocking(ev_tentative);
+
+        if self.role() == NodeRole::Active {
+            if let Some(ev_tentative) = tentative_to_emit {
+                let _ = self.coalescer.enqueue_nonblocking(ev_tentative);
+            }
         }
+
+        let target_state = if ev.action == EnrollmentAction::Drop {
+            HotPathEnrollmentState::Dropped
+        } else {
+            HotPathEnrollmentState::Confirmed
+        };
+        let mut updated_existing = false;
         self.event_index.with_write(&ev.event_id, |opt_rec| {
             if let Some(rec) = opt_rec {
-                if rec.state == HotPathEnrollmentState::DropPending {
-                    rec.state = HotPathEnrollmentState::Dropped;
-                } else if rec.state == HotPathEnrollmentState::Reserved {
-                    rec.state = HotPathEnrollmentState::Confirmed;
-                }
-                rec.updated_at = ev.confirmed_at;
+                rec.state = match rec.state {
+                    HotPathEnrollmentState::DropPending => HotPathEnrollmentState::Dropped,
+                    HotPathEnrollmentState::Reserved => HotPathEnrollmentState::Confirmed,
+                    other => other,
+                };
+                rec.updated_at = ev.processed_at;
+                updated_existing = true;
             }
         });
+        if !updated_existing {
+            self.event_index.insert(
+                ev.event_id,
+                EventStatusRecord {
+                    event_id: ev.event_id,
+                    term_id: ev.term_id,
+                    student_id: ev.student_id,
+                    section_id: ev.section_id,
+                    course_id: ev.course_id,
+                    action: ev.action,
+                    state: target_state,
+                    reason_code: None,
+                    engine_epoch: ev.engine_epoch,
+                    updated_at: ev.processed_at,
+                },
+            );
+        }
+    }
+
+    pub(crate) fn apply_outcome_in_ram(
+        &self,
+        ev: &EnrollmentOutcomeEvent,
+    ) -> Option<RevertOutcome> {
+        if ev.term_id != self.term_id() {
+            return None;
+        }
+        match ev.status {
+            EnrollmentOutcomeStatus::Confirmed => {
+                self.apply_confirmed_outcome_in_ram(ev);
+                None
+            }
+            EnrollmentOutcomeStatus::Reverted => ev
+                .to_revert_event()
+                .map(|revert| self.apply_revert_in_ram(&revert)),
+        }
+    }
+
+    /// Consume a durable `EnrollmentOutcomeEvent` from Kafka (`unieee.enrollment.outcomes`).
+    /// Updates both ACTIVE and STANDBY RAM state and performs best-effort Redis revert dedup write.
+    pub async fn apply_outcome_event(&self, ev: &EnrollmentOutcomeEvent) -> Option<RevertOutcome> {
+        let outcome = self.apply_outcome_in_ram(ev);
+        if outcome == Some(RevertOutcome::Applied) {
+            if let Err(err) = self.revert_dedup.mark_reverted(ev.event_id, 86_400).await {
+                warn!(
+                    event_id = %ev.event_id,
+                    error = %err,
+                    "best-effort Redis revert dedup write failed after Kafka outcome revert succeeded"
+                );
+            }
+        }
+        outcome
+    }
+
+    pub fn list_term_seats(&self, term_id: TermId) -> Result<Vec<SectionSeatView>, EngineError> {
+        let readiness = self.readiness();
+        if readiness != EngineReadiness::Ready {
+            return Err(EngineError::NotReady(readiness));
+        }
+        let catalog = self.catalog.load();
+        if catalog.term_id != term_id {
+            return Err(EngineError::TermNotFound(term_id));
+        }
+
+        let mut seats = Vec::with_capacity(catalog.sections_meta.len());
+        for (sec_id, meta) in &catalog.sections_meta {
+            if let Some(slot) = catalog.seat_table.get(*sec_id) {
+                let snap = slot.snapshot();
+                let status = match snap.status {
+                    SectionSlotState::Open => SectionStatus::Open,
+                    SectionSlotState::Frozen => SectionStatus::Frozen,
+                    SectionSlotState::Closed => {
+                        if meta.status == SectionStatus::Cancelled {
+                            SectionStatus::Cancelled
+                        } else {
+                            SectionStatus::Closed
+                        }
+                    }
+                };
+                seats.push(SectionSeatView {
+                    section_id: *sec_id,
+                    available_seats: snap.available_seats,
+                    max_capacity: snap.max_capacity,
+                    status,
+                });
+            }
+        }
+        seats.sort_by_key(|s| s.section_id.as_u64());
+        Ok(seats)
+    }
+
+    pub fn get_student_enrollments(
+        &self,
+        term_id: TermId,
+        student_id: StudentId,
+    ) -> Result<StudentEnrollmentsView, EngineError> {
+        let readiness = self.readiness();
+        if readiness != EngineReadiness::Ready {
+            return Err(EngineError::NotReady(readiness));
+        }
+        let catalog = self.catalog.load();
+        if catalog.term_id != term_id {
+            return Err(EngineError::TermNotFound(term_id));
+        }
+
+        let view = self
+            .students
+            .with_read(&student_id, |opt_student| match opt_student {
+                Some(student) => {
+                    let mut items: Vec<StudentEnrollmentItemView> = student
+                        .active_enrollments
+                        .iter()
+                        .map(|entry| StudentEnrollmentItemView {
+                            section_id: entry.section_id,
+                            course_id: entry.course_id,
+                            action: entry.action,
+                            status: entry.state,
+                            last_event_id: entry.last_event_id,
+                        })
+                        .collect();
+                    items.sort_by_key(|i| i.section_id.as_u64());
+                    StudentEnrollmentsView {
+                        term_id,
+                        student_id,
+                        current_credits: student.current_credits,
+                        items,
+                    }
+                }
+                None => StudentEnrollmentsView {
+                    term_id,
+                    student_id,
+                    current_credits: 0,
+                    items: Vec::new(),
+                },
+            });
+        Ok(view)
     }
 
     pub(crate) fn apply_revert_in_ram(&self, revert: &RevertEvent) -> RevertOutcome {
@@ -1578,26 +1806,6 @@ impl EnrollmentEngine {
             }
         }
 
-        outcome
-    }
-
-    /// Apply RevertEvent with RAM-first idempotency in student shard BEFORE best-effort Redis dedup write.
-    pub async fn apply_revert_event(&self, revert: &RevertEvent) -> RevertOutcome {
-        let outcome = self.apply_revert_in_ram(revert);
-        if outcome == RevertOutcome::Applied {
-            // Best-effort Redis dedup fallback key written strictly AFTER RAM-first idempotency update
-            if let Err(err) = self
-                .revert_dedup
-                .mark_reverted(revert.event_id, 86_400)
-                .await
-            {
-                warn!(
-                    event_id = %revert.event_id,
-                    error = %err,
-                    "best-effort Redis revert dedup write failed after RAM-first revert succeeded"
-                );
-            }
-        }
         outcome
     }
 
@@ -2026,23 +2234,29 @@ impl EnrollmentEngine {
         enum ReplayItem {
             Command(EnrollmentCommandEvent),
             Delta(EnrollmentDeltaEvent),
+            Outcome(EnrollmentOutcomeEvent),
         }
         impl ReplayItem {
             fn key(&self) -> (DateTime<Utc>, u8) {
                 match self {
                     Self::Delta(EnrollmentDeltaEvent::Revert(r)) => (r.reverted_at, 2),
+                    Self::Outcome(o) => (o.processed_at, 2),
                     Self::Delta(d) => (d.occurred_at(), 0),
                     Self::Command(c) => (c.occurred_at, 1),
                 }
             }
         }
 
-        let mut items = Vec::with_capacity(batch.commands.len() + batch.deltas.len());
+        let mut items =
+            Vec::with_capacity(batch.commands.len() + batch.deltas.len() + batch.outcomes.len());
         for d in batch.deltas {
             items.push(ReplayItem::Delta(d));
         }
         for c in batch.commands {
             items.push(ReplayItem::Command(c));
+        }
+        for o in batch.outcomes {
+            items.push(ReplayItem::Outcome(o));
         }
         items.sort_by_key(ReplayItem::key);
 
@@ -2054,6 +2268,9 @@ impl EnrollmentEngine {
                 }
                 ReplayItem::Command(c) => {
                     self.apply_replayed_command(&c);
+                }
+                ReplayItem::Outcome(o) => {
+                    let _ = self.apply_outcome_in_ram(&o);
                 }
             }
         }

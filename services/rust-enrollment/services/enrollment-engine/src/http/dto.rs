@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use unieee_domain::{
-    CourseId, EnrollmentAction, EventId, HotPathEnrollmentState, SectionId, StudentId, TermId,
+    CourseId, EnrollmentAction, EventId, HotPathEnrollmentState, SectionId, SectionStatus,
+    StudentId, TermId,
 };
 
 fn default_register_action() -> EnrollmentAction {
@@ -78,6 +79,34 @@ pub struct ReadinessResponse {
 pub struct PromoteResponse {
     pub role: &'static str,
     pub epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SectionSeatResponse {
+    pub section_id: SectionId,
+    pub available_seats: i32,
+    pub max_capacity: i32,
+    pub status: SectionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MyEnrollmentItemResponse {
+    pub section_id: SectionId,
+    pub course_id: CourseId,
+    pub action: EnrollmentAction,
+    pub status: HotPathEnrollmentState,
+    pub last_event_id: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MyEnrollmentsResponse {
+    pub term_id: TermId,
+    pub student_id: StudentId,
+    pub current_credits: i32,
+    pub items: Vec<MyEnrollmentItemResponse>,
 }
 
 pub use unieee_domain::{ProblemDetail, APPLICATION_PROBLEM_JSON};

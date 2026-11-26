@@ -6,6 +6,7 @@ import java.util.Locale;
 import java.util.Objects;
 import java.util.UUID;
 import lombok.RequiredArgsConstructor;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import vn.edu.unieee.account.AccountFacade;
@@ -14,11 +15,15 @@ import vn.edu.unieee.account.dto.StudentProfileResponse;
 import vn.edu.unieee.catalog.CatalogFacade;
 import vn.edu.unieee.catalog.dto.CoursePrerequisiteResponse;
 import vn.edu.unieee.catalog.dto.CourseSectionDetailResponse;
+import vn.edu.unieee.common.cache.ReadCacheProperties;
+import vn.edu.unieee.common.cache.ReadThroughCache;
+import vn.edu.unieee.common.cache.RedisCacheKeys;
 import vn.edu.unieee.registration.dto.CreateEnrollmentPolicyRequest;
 import vn.edu.unieee.registration.dto.EnrollmentPolicyResponse;
 import vn.edu.unieee.registration.dto.EvaluatePolicyRequest;
 import vn.edu.unieee.registration.dto.PolicyEvaluationResponse;
 import vn.edu.unieee.registration.dto.UpdateEnrollmentPolicyRequest;
+import vn.edu.unieee.registration.event.EnrollmentPolicyChangedEvent;
 import vn.edu.unieee.registration.internal.domain.enrollment.Enrollment;
 import vn.edu.unieee.registration.internal.domain.enrollment.EnrollmentStatus;
 import vn.edu.unieee.registration.internal.domain.policy.EnrollmentPolicy;
@@ -43,6 +48,9 @@ public class EnrollmentPolicyService {
     private final AccountFacade accountFacade;
     private final EnrollmentRuleEvaluator ruleEvaluator;
     private final RegistrationMapper mapper;
+    private final ReadThroughCache readThroughCache;
+    private final ReadCacheProperties readCacheProperties;
+    private final ApplicationEventPublisher eventPublisher;
 
     @Transactional
     public EnrollmentPolicyResponse createPolicy(CreateEnrollmentPolicyRequest request) {
@@ -101,12 +109,19 @@ public class EnrollmentPolicyService {
         if (!catalogFacade.existsTerm(termId)) {
             throw new RegistrationNotFoundException("ACADEMIC_TERM_NOT_FOUND", "Academic term not found: " + termId);
         }
-        EnrollmentPolicy active = policyRepository.findByTermIdAndActiveTrue(termId)
-            .orElseThrow(() -> new RegistrationNotFoundException(
-                "ACTIVE_POLICY_NOT_FOUND",
-                "No active enrollment policy configured for term: " + termId
-            ));
-        return mapper.toPolicyResponse(active);
+        return readThroughCache.getOrLoad(
+            RedisCacheKeys.activePolicy(termId),
+            EnrollmentPolicyResponse.class,
+            readCacheProperties.getPolicyActiveTtl(),
+            () -> {
+                EnrollmentPolicy active = policyRepository.findByTermIdAndActiveTrue(termId)
+                    .orElseThrow(() -> new RegistrationNotFoundException(
+                        "ACTIVE_POLICY_NOT_FOUND",
+                        "No active enrollment policy configured for term: " + termId
+                    ));
+                return mapper.toPolicyResponse(active);
+            }
+        );
     }
 
     @Transactional
@@ -132,7 +147,9 @@ public class EnrollmentPolicyService {
             request.allowBufferGapPeriods(),
             request.extendedRules()
         );
-        return mapper.toPolicyResponse(policyRepository.save(policy));
+        EnrollmentPolicy saved = policyRepository.save(policy);
+        eventPublisher.publishEvent(new EnrollmentPolicyChangedEvent(saved.getId(), saved.getTermId(), Instant.now()));
+        return mapper.toPolicyResponse(saved);
     }
 
     @Transactional
@@ -149,7 +166,9 @@ public class EnrollmentPolicyService {
             }
         });
         target.activate();
-        return mapper.toPolicyResponse(policyRepository.saveAndFlush(target));
+        EnrollmentPolicy saved = policyRepository.saveAndFlush(target);
+        eventPublisher.publishEvent(new EnrollmentPolicyChangedEvent(saved.getId(), saved.getTermId(), Instant.now()));
+        return mapper.toPolicyResponse(saved);
     }
 
     @Transactional(readOnly = true)

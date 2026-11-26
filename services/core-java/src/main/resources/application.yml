@@ -116,6 +116,13 @@ unieee:
       redis:
         enabled: ${POLICY_CACHE_REDIS_ENABLED:true}
         ttl: ${POLICY_CACHE_REDIS_TTL:1h}
+  read-cache:
+    enabled: ${READ_CACHE_ENABLED:true}
+    timetable-open-ttl: ${READ_CACHE_TIMETABLE_OPEN_TTL:45s}
+    timetable-closed-ttl: ${READ_CACHE_TIMETABLE_CLOSED_TTL:20m}
+    policy-active-ttl: ${READ_CACHE_POLICY_ACTIVE_TTL:1h}
+    catalog-ttl: ${READ_CACHE_CATALOG_TTL:45m}
+    sections-static-ttl: ${READ_CACHE_SECTIONS_STATIC_TTL:30m}
   hot-delta:
     kafka:
       enabled: ${UNIEEE_HOT_DELTA_KAFKA_ENABLED:true}

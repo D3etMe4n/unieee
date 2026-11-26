@@ -7,7 +7,7 @@
 Welcome to the public reader documentation for **unieee** — a university academic management and course credit registration platform built on a **Hybrid CQRS + Event Sourcing & Modular Monolith** architecture.
 
 > [!NOTE]
-> This directory (`guides/`) contains public-facing architecture, setup, operations, API, and testing guides for repository visitors, operators, and contributors. It reflects all features implemented through **Phase 11** on `dev` (`core-java` `0.3.0-SNAPSHOT`, `rust-enrollment` `0.5.0`), with **Phase 12** (E2E regression & load testing) next.
+> This directory (`guides/`) contains public-facing architecture, setup, operations, API, and testing guides for repository visitors, operators, and contributors. It reflects all features implemented through **Phase 11** plus the Kafka outcomes, Hot-Path read split, and Redis Read-Through Cache architecture (`core-java` `0.4.0-SNAPSHOT`, `rust-enrollment` `0.6.0`), with **Phase 12** (E2E regression & load testing) next.
 
 ---
 

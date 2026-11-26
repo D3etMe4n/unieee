@@ -1,5 +1,6 @@
 package vn.edu.unieee.catalog.internal.service.course;
 
+import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -10,10 +11,12 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import lombok.RequiredArgsConstructor;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import vn.edu.unieee.catalog.dto.AddCoursePrerequisiteRequest;
 import vn.edu.unieee.catalog.dto.CoursePrerequisiteResponse;
+import vn.edu.unieee.catalog.event.CatalogPrerequisiteChangedEvent;
 import vn.edu.unieee.catalog.internal.domain.course.Course;
 import vn.edu.unieee.catalog.internal.domain.course.CoursePrerequisite;
 import vn.edu.unieee.catalog.internal.domain.course.PrerequisiteRelationType;
@@ -23,6 +26,9 @@ import vn.edu.unieee.catalog.internal.exception.PrerequisiteCycleException;
 import vn.edu.unieee.catalog.internal.mapper.CatalogMapper;
 import vn.edu.unieee.catalog.internal.repository.CoursePrerequisiteRepository;
 import vn.edu.unieee.catalog.internal.repository.CourseRepository;
+import vn.edu.unieee.common.cache.ReadCacheProperties;
+import vn.edu.unieee.common.cache.ReadThroughCache;
+import vn.edu.unieee.common.cache.RedisCacheKeys;
 
 @Service
 @RequiredArgsConstructor
@@ -31,6 +37,9 @@ public class CoursePrerequisiteService {
     private final CourseRepository courseRepository;
     private final CoursePrerequisiteRepository prerequisiteRepository;
     private final CatalogMapper mapper;
+    private final ApplicationEventPublisher eventPublisher;
+    private final ReadThroughCache readThroughCache;
+    private final ReadCacheProperties readCacheProperties;
 
     @Transactional
     public CoursePrerequisiteResponse addPrerequisite(UUID courseId, AddCoursePrerequisiteRequest request) {
@@ -61,6 +70,7 @@ public class CoursePrerequisiteService {
         CoursePrerequisite saved = prerequisiteRepository.save(
             CoursePrerequisite.create(course, requiredCourse, relationType, request.minGrade())
         );
+        eventPublisher.publishEvent(new CatalogPrerequisiteChangedEvent(courseId, saved.getId(), Instant.now()));
         return mapper.toPrerequisiteResponse(saved);
     }
 
@@ -69,9 +79,14 @@ public class CoursePrerequisiteService {
         if (!courseRepository.existsById(courseId)) {
             throw new CatalogResourceNotFoundException("COURSE_NOT_FOUND", "Course not found: " + courseId);
         }
-        return prerequisiteRepository.findByCourseIdOrderByCreatedAtAsc(courseId).stream()
-            .map(mapper::toPrerequisiteResponse)
-            .toList();
+        return readThroughCache.getOrLoadList(
+            RedisCacheKeys.catalogCoursePrerequisites(courseId),
+            CoursePrerequisiteResponse.class,
+            readCacheProperties.getCatalogTtl(),
+            () -> prerequisiteRepository.findByCourseIdOrderByCreatedAtAsc(courseId).stream()
+                .map(mapper::toPrerequisiteResponse)
+                .toList()
+        );
     }
 
     @Transactional
@@ -88,6 +103,7 @@ public class CoursePrerequisiteService {
             );
         }
         prerequisiteRepository.delete(edge);
+        eventPublisher.publishEvent(new CatalogPrerequisiteChangedEvent(courseId, prerequisiteId, Instant.now()));
     }
 
     private void ensureNoCycle(UUID targetCourseId, UUID startRequiredCourseId) {
