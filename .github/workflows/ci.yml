@@ -56,6 +56,13 @@ jobs:
           auths = [ex["authenticator"] for ex in flows["unieee-first-broker-login-link-only"].get("authenticationExecutions", [])]
           assert "idp-detect-existing-broker-user" in auths and "idp-auto-link" in auths
           assert "idp-create-user-if-unique" not in auths, "Self-registration authenticator must NOT exist in link-only flow"
+          up_providers = realm.get("components", {}).get("org.keycloak.userprofile.UserProfileProvider", [])
+          assert up_providers, "Keycloak 26 UserProfileProvider config must declare student_id and lecturer_id"
+          up_cfg = json.loads(up_providers[0]["config"]["kc.user.profile.config"][0])
+          up_attrs = {a["name"]: a for a in up_cfg.get("attributes", [])}
+          for req_attr in ("student_id", "lecturer_id"):
+              assert req_attr in up_attrs, f"Missing User Profile attribute {req_attr}"
+              assert up_attrs[req_attr].get("permissions", {}).get("edit") == ["admin"], f"{req_attr} must only be admin-editable"
 
           with open("infra/reverse-proxy/nginx.conf", "r", encoding="utf-8") as f:
               nginx_conf = f.read()
