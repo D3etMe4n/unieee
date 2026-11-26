@@ -11,7 +11,7 @@
 > [!CAUTION]
 > **Security Notice — Rotate All Default Secrets Before Deployment:**
 > Because this repository is hosted publicly on GitHub, all default passwords, tokens, dev certificates, and sample accounts included in the codebase are strictly for local development. Before deploying to any non-local environment, **you must rotate and replace all secrets and default credentials** in the following files:
-> - [.env.example](./.env.example): Copy to `.env` (gitignored) and replace `POSTGRES_PASSWORD`, `REDIS_PASSWORD`, `KEYCLOAK_ADMIN_PASSWORD`, and `CLOUDFLARE_TUNNEL_TOKEN`.
+> - [.env.example](./.env.example): Copy to `.env` (gitignored) and replace `POSTGRES_PASSWORD`, `REDIS_PASSWORD`, `KEYCLOAK_ADMIN_PASSWORD`, `KEYCLOAK_ADMIN_CLIENT_SECRET`, `INTERNAL_OPS_TOKEN`, `UNIEEE_OPS_ADMIN_PASSWORD`, `CLOUDFLARE_TUNNEL_TOKEN`, and `OPENAI_API_KEY` (if enabling external LLM mode for `ai_advisor`).
 > - [infra/compose.base.yml](./infra/compose.base.yml): Contains development fallback defaults when environment variables are unset.
 > - [infra/compose.letsencrypt.yml](./infra/compose.letsencrypt.yml) & [infra/compose.cloudflared.yml](./infra/compose.cloudflared.yml): Let's Encrypt ACME and Cloudflare Tunnel (`TUNNEL_TOKEN`) configurations.
 > - [infra/keycloak/realm-unieee.json](./infra/keycloak/realm-unieee.json): Contains the `unieee-admin-cli` client secret and sample user passwords (`admin01`, `lecturer01`, `student01`) — rotate secrets and remove or reset sample accounts before use.
@@ -24,40 +24,43 @@
 Public guides for repository visitors, operators, and contributors live under `guides/` (in both **English** and **Tiếng Việt**):
 
 - **[Public Documentation Hub (English)](./guides/README.md)** | [Trung tâm Tài liệu (Tiếng Việt)](./guides/README.vi.md)
-- [Getting Started & Local Ops](./guides/en/getting-started.md) — prerequisites, `scripts/unieee.sh` usage, Keycloak dev tokens, and running `./gradlew check`.
-- [System Architecture & Database Design](./guides/en/architecture.md) — Hybrid Warm/Hot Path, 4 Bounded Contexts + `common` DAG, PostgreSQL schemas (`V001`–`V005`), Single-Writer Gate Guard, and Multi-University Policy Engine.
-- [REST API Reference](./guides/en/api-reference.md) — RBAC roles, RFC 9457 Problem Details (`application/problem+json`), and all implemented endpoints across `common`, `catalog`, `account`, and `registration`.
-- [Implementation Roadmap & Testing](./guides/en/roadmap-and-testing.md) — 12-phase delivery status (Phases 1–5 completed), tiered coverage policy (`>= 90%` core, `>= 65%` edge), and CI guardrails.
+- [Getting Started & Local Ops](./guides/en/getting-started.md) — prerequisites, `scripts/unieee.sh` usage, TLS modes, Keycloak dev tokens, and running Java + Rust test/coverage suites.
+- [Registration-Season Usage, Operations & Failover](./guides/en/operations-and-hotpath.md) — `prepare-registration`, `open-registration` (24/7 multi-window), `close-registration` (Kafka drain & 3-way reconciliation), Hot Delta Sync, student `curl` Hot Path + SSE + AI Advisor walkthroughs, LLM configuration, and Active–Standby failover.
+- [System Architecture & Database Design](./guides/en/architecture.md) — Hybrid Warm/Hot Path, 4 Bounded Contexts + `common` DAG (`catalog`, `account`, `registration`, `ai_advisor`), PostgreSQL schemas (`V001`–`V005`), Policy Engine, Rust Hot Path cluster, and Kafka/Redis event backbone.
+- [REST API Reference](./guides/en/api-reference.md) — JWT & public catalog auth rules, RBAC roles, unified RFC 9457 Problem Details, all `core-java` APIs (`/api/v1/public/*`, `warm-cache`, `ai_advisor`), Rust `enrollment-engine` & `sse-gateway` APIs, and internal ops probes.
+- [Implementation Roadmap & Testing](./guides/en/roadmap-and-testing.md) — 12-phase delivery status (Phases 1–11 completed), tiered JaCoCo & `cargo-llvm-cov` coverage policy (`>= 90%` core, `>= 65%` edge), and 3-job CI guardrails.
+- [Keycloak Registration-Season Tuning & Identity Brokering](./infra/keycloak/IDENTITY_BROKERING.md) — token refresh jitter (`0.70–0.85`) and link-only Microsoft Entra ID / Google Workspace SSO setup.
 
 ---
 
 ## Architecture Overview
 
-- **Warm / Cold Path — Spring Boot 4.1.3 Modular Monolith (`services/core-java/`):**
-  - Organized as **4 Bounded Contexts** (`catalog`, `account`, `registration`, and planned Phase 10 `ai_advisor`) over an open shared kernel (`common`) with a strict 1-way linear dependency DAG verified by Spring Modulith and schema-per-bounded-context PostgreSQL isolation (`V001`–`V005`).
-  - Manages academic terms, faculties/majors/curricula, courses & DAG prerequisites, course sections with 20-week bitmask schedules, Keycloak account provisioning, credit-weighted GPA, admin enrollment overrides protected by a **Single-Writer Gate Guard** (`409 REGISTRATION_GATE_OPEN` when `REGISTRATION_OPEN`), non-seat-reserving wish surveys, registration wave windows, and a configurable **Multi-University Policy Engine** with SHA-256 snapshot export (`unieee:cache:policy:{termId}:snapshot`).
-  - Built with **Java 25 (Virtual Threads)**, **Spring Modulith** (Event Publication Registry + Cleanup Job), **Spring Data JPA**, **Flyway**, **Spring Security** (Keycloak OIDC 1.0 / OAuth 2.0 / JWT), **MapStruct**, and upcoming **Spring AI** (`ai_advisor`).
-- **Hot Path — Rust Service Cluster (`services/rust-enrollment/` — Planned Phases 6–9):**
-  - **Enrollment State-Machine (`enrollment-engine`, Axum + Tokio):** Holds registration state in RAM using *cache-line* aligned structures (`#[repr(align(64))]`), per-student sharding, lock-free atomic seat reservations, and `O(1)` **Bitmask** schedule conflict checks; publishes events to **Kafka (KRaft)** and supports state recovery via event replay and Active–Standby failover.
-  - **Writer / Commit Service (`enrollment-writer`):** Consumes Kafka batches, validates and commits durably to **PostgreSQL** (via **PgBouncer**) using `UNNEST` + Atomic `UPDATE` + `CHECK` constraints; updates **Redis HA** (Read Cache & Pub/Sub) and emits compensating **Revert** events if PostgreSQL rejects a record.
-  - **SSE Live-Update Service (`sse-gateway`, Axum + Tokio):** Streams real-time seat availability and registration outcomes via Server-Sent Events.
+- **Warm / Cold Path — Spring Boot 4.1.3 Modular Monolith (`services/core-java/` `0.3.0-SNAPSHOT`):**
+  - Organized as **4 Bounded Contexts** (`catalog`, `account`, `registration`, `ai_advisor`) over an open shared kernel (`common`) with a strict 1-way linear dependency DAG verified by Spring Modulith and schema-per-bounded-context PostgreSQL isolation (`V001`–`V005`).
+  - Manages academic terms, faculties/majors/curricula, courses & DAG prerequisites, course sections with 20-week bitmask schedules, unauthenticated read-only **Public Catalog** endpoints (`/api/v1/public/*` backed by Nginx `proxy_cache_lock on`), Keycloak account provisioning, credit-weighted GPA, admin enrollment overrides protected by a **Single-Writer Gate Guard** (`409 REGISTRATION_GATE_OPEN` when `REGISTRATION_OPEN`), non-seat-reserving wish surveys, registration wave windows, a configurable **Multi-University Policy Engine** with SHA-256 snapshot export (`unieee:cache:policy:{termId}:snapshot`), **Redis Seat Cache Warmer** (`warm-cache`), **Hot Delta Sync** (`unieee.enrollment.deltas` during `REGISTRATION_OPEN`), and the **Read-Only Spring AI `2.0.3` Schedule Advisor** (`ai_advisor`: 4 read-only `@Tool` functions, anti-IDOR/prompt-injection guardrails, deterministic Bitmask verification & fallback).
+  - Built with **Java 25 (Virtual Threads)**, **Spring Modulith 2.1.2** (Event Publication Registry + Cleanup Job), **Spring Data JPA**, **Flyway**, **Spring Security** (Keycloak OIDC 1.0 / OAuth 2.0 / JWT), **MapStruct**, and **Spring AI 2.0.3**.
+- **Hot Path — Rust Service Cluster (`services/rust-enrollment/` `0.5.0`):**
+  - Shared crates (`unieee-domain`, `unieee-events`, `unieee-cacheline`) provide `[u128; 20]` O(1) Bitmask schedule checks (`proptest`-verified), unified RFC 9457 `ProblemDetail`, versioned Kafka/PubSub schemas, and `#[repr(align(64))]` cache-line aligned slots.
+  - **Enrollment State-Machine (`enrollment-engine`, Axum 0.8 + Tokio):** Holds registration state in RAM (`SectionSeatSlot` + per-student `ShardedMap`), verifies JWTs locally with singleflight JWKS refresh + SHA-256 token cache, validates rules & reserves seats atomically, publishes to **Kafka (KRaft)**, coalesces `SeatTentativeEvent`s over Redis pipelines, supports RAM-first `RevertEvent` idempotency, Hot Delta Sync, zero-PG disk snapshot + Kafka replay recovery, and Active–Standby failover with `REJOIN_AS_STANDBY_ON_RECOVERY=true` and `epoch` fencing.
+  - **Writer / Commit Service (`enrollment-writer`):** Consumes Kafka micro-batches, commits durably to **PostgreSQL** (via **PgBouncer**) using `UNNEST` + Atomic `UPDATE` + `CHECK` constraints + `enrollment_events`, updates **Redis HA** Read Cache & Pub/Sub (`SeatConfirmedEvent`), and emits compensating **`RevertEvent`** via `writer_revert_outbox` if PostgreSQL rejects a record.
+  - **SSE Live-Update Service (`sse-gateway`, Axum 0.8 + Tokio):** Fans out real-time seat availability (`/api/v1/sse/sections`) and personal outcomes (`/api/v1/sse/me`) with 150ms coalescing, randomized `retry`/`maxAge` jitter, heartbeats, and lag resync notifications.
 - **Infrastructure & Security (`infra/`, `scripts/`):**
-  - Sits behind a **Reverse Proxy** (TLS termination, routing, rate limiting) and **Keycloak** (self-registration disabled; accounts are provisioned by Academic Affairs).
-  - Containerized with **Podman Compose** (default) and **Docker Compose** (fallback), without Kubernetes; supports toggling the hot-path cluster cyclically (`prepare-registration`, `open-registration`, `close-registration`).
+  - Sits behind **Nginx 1.27 Reverse Proxy** (TLS termination, routing, rate limiting, `proxy_cache_lock on` for `/api/v1/public/*`, Active–Standby `/readyz` failover monitor with no premature auto-failback, buffering disabled for SSE) and **Keycloak 26.1** (self-registration disabled, `accessTokenLifespan: 1800`, link-only external identity brokering).
+  - Containerized with **Podman Compose** (default) and **Docker Compose** (fallback), without Kubernetes; supports full registration-season lifecycle automation via [scripts/unieee.sh](./scripts/unieee.sh) (`prepare-registration`, `open-registration`, `close-registration`, Sentinel-aware `health`).
 
 ---
 
 ## Implementation Progress
 
-**Phases 1–5 are completed and merged into `dev`** (monorepo & container infrastructure, Spring Boot 4.1.3 Modulith core, `catalog`/`account`/`registration` bounded contexts with `V001`–`V005`, wish surveys, registration windows, and multi-university Policy Engine + snapshot export). **Phases 6–12** (Rust Hot Path cluster, Spring AI advisor, HA failover drills, and k6 load testing) follow next — see [Implementation Roadmap & Testing](./guides/en/roadmap-and-testing.md).
+**Phases 1–11 are completed and merged into `dev`** (`core-java` `0.3.0-SNAPSHOT`, `rust-enrollment` `0.5.0`) — covering container infrastructure, Spring Boot 4.1.3 Modulith core, `catalog`/`account`/`registration`/`ai_advisor` bounded contexts (`V001`–`V005`), Rust Hot Path cluster (`enrollment-engine`, `enrollment-writer`, `sse-gateway`), Hot Delta Sync, Public Catalog Cache Lock, Keycloak link-only brokering, Active–Standby failover, and the full lifecycle CLI. **Phase 12** (E2E Regression Suite & k6 Flash-Crowd Load Testing) follows next — see [Implementation Roadmap & Testing](./guides/en/roadmap-and-testing.md).
 
 ---
 
 ## User Roles
 
-1. **Student (`STUDENT`):** Submits pre-registration wish surveys (non-seat-reserving), registers/drops/retakes/improves courses, monitors live seat counts, views personal timetables, and consults the read-only AI schedule advisor.
+1. **Student (`STUDENT`):** Submits pre-registration wish surveys (non-seat-reserving), browses public open sections, consults the read-only AI schedule advisor, registers/drops/retakes/improves courses on the Hot Path, monitors live SSE seat counts & personal outcomes, and views personal timetables.
 2. **Lecturer (`LECTURER`):** Views assigned course sections, teaching schedules, and enrolled student rosters.
-3. **Academic Affairs (`ACADEMIC_ADMIN`):** Manages academic data, provisions student/lecturer accounts, creates and aggregates wish surveys, configures multi-institution registration policies, opens/closes registration waves, and performs direct enrollment overrides when needed.
+3. **Academic Affairs (`ACADEMIC_ADMIN`):** Manages academic data, provisions student/lecturer accounts, creates and aggregates wish surveys, configures multi-institution registration policies, opens/closes registration waves, monitors/reconciles Hot Path cycles, and performs direct enrollment overrides outside `REGISTRATION_OPEN`.
 
 ---
 
@@ -65,12 +68,12 @@ Public guides for repository visitors, operators, and contributors live under `g
 
 | Layer / Component | Technology |
 | :--- | :--- |
-| Core Monolith & AI | Java 25 (Virtual Threads), Spring Boot 4.1.3, Spring Modulith, Gradle Kotlin DSL, JPA, Flyway, MapStruct, Spring AI |
-| Hot Path Services | Rust, Axum, Tokio (`enrollment-engine`, `enrollment-writer`, `sse-gateway`) |
-| Database & Pooling | PostgreSQL (`CHECK` constraints + Event Sourcing), PgBouncer |
-| Cache & Pub/Sub | Redis HA (Master–Replica + Sentinel, AOF/RDB) |
-| Event Streaming | Apache Kafka (KRaft mode) |
-| Auth & Edge | Keycloak (OIDC / OAuth 2.0 / JWT), Reverse Proxy |
+| Core Monolith & AI | Java 25 (Virtual Threads), Spring Boot 4.1.3, Spring Modulith 2.1.2, Spring AI 2.0.3, Gradle Kotlin DSL, JPA, Flyway, MapStruct |
+| Hot Path Services | Rust, Axum 0.8, Tokio, SQLx 0.8, `rdkafka` (`enrollment-engine`, `enrollment-writer`, `sse-gateway`) |
+| Database & Pooling | PostgreSQL 17 (`CHECK` constraints + Event Sourcing), PgBouncer |
+| Cache & Pub/Sub | Redis 7.4 HA (1 Master + 2 Replicas + 3 Sentinels, AOF/RDB) |
+| Event Streaming | Apache Kafka 3.9 (KRaft mode) |
+| Auth & Edge | Keycloak 26.1 (OIDC / OAuth 2.0 / JWT + link-only brokering), Nginx 1.27 Reverse Proxy |
 | Container & Ops | Podman Compose (preferred), Docker Compose (fallback), Lifecycle CLI (`scripts/unieee.sh`) |
 
 ---
@@ -82,27 +85,27 @@ unieee/
 ├── guides/                      # Public bilingual reader documentation (EN & VI)
 │   ├── README.md                # English documentation hub
 │   ├── README.vi.md             # Vietnamese documentation hub
-│   ├── en/                      # English guides (setup, architecture, API, roadmap)
+│   ├── en/                      # English guides (setup, ops/hotpath, architecture, API, roadmap)
 │   └── vi/                      # Vietnamese guides
 ├── services/
-│   ├── core-java/               # Spring Boot 4.1.3 Modular Monolith (common, catalog, account, registration)
-│   └── rust-enrollment/         # Rust Cargo Workspace (crates/ + services/) [Phases 6-9]
+│   ├── core-java/               # Spring Boot 4.1.3 Modular Monolith (common, catalog, account, registration, ai_advisor)
+│   └── rust-enrollment/         # Rust Cargo Workspace (crates/ + services/ — implemented)
 ├── infra/
 │   ├── compose.base.yml         # Base stack (core profile)
 │   ├── compose.hotpath.yml      # High-throughput registration stack (hot-path)
 │   ├── compose.letsencrypt.yml  # Let's Encrypt auto-issuance & renewal overlay
 │   ├── compose.cloudflared.yml  # Cloudflare Tunnel overlay (Quick & Named)
 │   ├── letsencrypt/             # Certbot ACME HTTP-01 entrypoint
-│   ├── reverse-proxy/           # TLS, routing, rate limiting, active-standby failover
-│   ├── keycloak/                # Realm, roles, OIDC clients (no self-registration)
+│   ├── reverse-proxy/           # TLS, routing, rate limiting, catalog cache lock, active-standby failover
+│   ├── keycloak/                # Realm, roles, OIDC clients, link-only brokering guide
 │   ├── pgbouncer/               # Transaction pooling config
 │   └── redis/                   # Master-Replica & Sentinel configs
 ├── scripts/
 │   ├── unieee.sh                # Lifecycle CLI & Edge/TLS mode switcher
-│   └── lib/                     # Helpers (runtime, certs, healthcheck)
+│   └── lib/                     # Helpers (common, runtime, certs, health, lifecycle)
 ├── tests/
-│   ├── e2e/                     # Integration & Regression test suites
-│   └── load/                    # Flash-crowd load/stress tests
+│   ├── e2e/                     # Integration & Regression test suites (Phase 12)
+│   └── load/                    # Flash-crowd load/stress tests (Phase 12)
 ├── .editorconfig
 ├── .env.example
 ├── .gitignore
@@ -168,6 +171,28 @@ Nginx listens on an internal-only port `8088` (not published to the host) so `cl
      ```
 
 > While running in any mode, you can re-run `./scripts/unieee.sh up --tls-mode <other_mode>` to automatically remove the previous TLS overlay container and switch modes without losing database state.
+
+---
+
+## Registration-Season Lifecycle Quick Reference
+
+During peak registration windows, [scripts/unieee.sh](./scripts/unieee.sh) orchestrates the Hot Path cluster cyclically around the 24/7 `core` stack:
+
+```bash
+# 1. Freeze term, export Policy Snapshot, start hot-path, warm Redis cache & verify RAM == PostgreSQL checksum
+./scripts/unieee.sh prepare-registration --term 2026-FALL
+
+# 2. Open registration gate for a wave (re-run with next --window UUID for 24/7 multi-window transitions)
+./scripts/unieee.sh open-registration --term 2026-FALL --window <WINDOW_UUID>
+
+# 3. Inspect Sentinel-aware Redis HA, Kafka topics, core-java & Rust /readyz status
+./scripts/unieee.sh health
+
+# 4. Close gate, drain Kafka lag=0 & writer_revert_outbox, pass 3-way reconciliation & stop hot-path
+./scripts/unieee.sh close-registration --term 2026-FALL
+```
+
+For full operator and student `curl` walkthroughs, AI Advisor setup, and Active–Standby failover behavior, see [Registration-Season Usage, Operations & Failover](./guides/en/operations-and-hotpath.md).
 
 ---
 
