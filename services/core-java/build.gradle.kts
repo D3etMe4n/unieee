@@ -40,6 +40,7 @@ dependencies {
     implementation("org.springframework.boot:spring-boot-starter-validation")
     implementation("org.springframework.boot:spring-boot-starter-actuator")
     implementation("org.springframework.boot:spring-boot-starter-data-redis")
+    implementation("org.springframework.boot:spring-boot-starter-kafka")
     implementation("org.springframework.ai:spring-ai-starter-model-openai")
 
     implementation("org.springframework.modulith:spring-modulith-starter-core")

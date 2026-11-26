@@ -20,6 +20,7 @@ import vn.edu.unieee.registration.dto.AdminEnrollmentTransferRequest;
 import vn.edu.unieee.registration.dto.EnrollmentEventResponse;
 import vn.edu.unieee.registration.dto.EnrollmentResponse;
 import vn.edu.unieee.registration.dto.ReconciliationReportResponse;
+import vn.edu.unieee.registration.dto.RegistrationCacheWarmupResponse;
 
 @RestController
 @RequestMapping("/api/v1/admin/enrollments")
@@ -57,5 +58,11 @@ public class AdminEnrollmentController {
     @PreAuthorize("hasRole('ACADEMIC_ADMIN')")
     public ReconciliationReportResponse reconcileTerm(@PathVariable UUID termId) {
         return registrationFacade.reconcileTerm(termId);
+    }
+
+    @PostMapping("/terms/{termId}/warm-cache")
+    @PreAuthorize("hasRole('ACADEMIC_ADMIN')")
+    public RegistrationCacheWarmupResponse warmRegistrationCache(@PathVariable UUID termId) {
+        return registrationFacade.warmRegistrationCache(termId);
     }
 }

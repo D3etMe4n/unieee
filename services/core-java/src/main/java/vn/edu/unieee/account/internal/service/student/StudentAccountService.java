@@ -13,6 +13,7 @@ import vn.edu.unieee.account.dto.CreateStudentRequest;
 import vn.edu.unieee.account.dto.StudentProfileResponse;
 import vn.edu.unieee.account.dto.UpdateStudentAcademicStatusRequest;
 import vn.edu.unieee.account.dto.UpdateStudentFinancialRequest;
+import vn.edu.unieee.account.event.StudentAcademicStatusChangedEvent;
 import vn.edu.unieee.account.event.StudentAccountProvisionedEvent;
 import vn.edu.unieee.account.event.StudentFinancialStatusChangedEvent;
 import vn.edu.unieee.account.internal.domain.student.Student;
@@ -133,10 +134,18 @@ public class StudentAccountService {
     @Transactional
     public StudentProfileResponse updateAcademicStatus(UUID studentId, UpdateStudentAcademicStatusRequest request) {
         Student student = findOrThrow(studentId);
+        StudentAcademicStatus previous = student.getAcademicStatus();
         StudentAcademicStatus target = StudentAcademicStatus.fromCode(request.academicStatus());
         student.changeAcademicStatus(target);
         Student saved = studentRepository.save(student);
         provisioningHelper.syncUserEnabledState(saved.getKeycloakSub(), target.isLoginAllowed());
+        eventPublisher.publishEvent(new StudentAcademicStatusChangedEvent(
+            saved.getId(),
+            saved.getStudentCode(),
+            previous.name(),
+            saved.getAcademicStatus().name(),
+            Instant.now()
+        ));
         return mapper.toStudentProfileResponse(saved);
     }
 
