@@ -238,7 +238,7 @@ check_health() {
         fi
 
         if container_running "unieee-grafana" && \
-           curl -fsS "http://127.0.0.1:${grafana_port}/api/health" 2>/dev/null | grep -q '"database":"ok"'; then
+           curl -fsS "http://127.0.0.1:${grafana_port}/api/health" 2>/dev/null | grep -Eq '"database"[[:space:]]*:[[:space:]]*"ok"'; then
             log_ok "grafana: /api/health OK (http://127.0.0.1:${grafana_port})"
         else
             log_err "grafana: health check FAILED on port ${grafana_port}"
