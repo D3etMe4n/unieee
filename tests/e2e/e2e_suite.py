@@ -347,13 +347,21 @@ def finalize_keycloak_password(
         json_body={"type": "password", "value": password, "temporary": False},
         expected_statuses=(200, 204),
     )
-    client.expect_ok(
-        "PUT",
+    _, user_repr, _ = client.expect_ok(
+        "GET",
         f"/auth/admin/realms/unieee/users/{keycloak_sub}",
         token=admin_cli_token,
-        json_body={"requiredActions": []},
-        expected_statuses=(200, 204),
+        expected_statuses=(200,),
     )
+    if user_repr.get("requiredActions"):
+        user_repr["requiredActions"] = []
+        client.expect_ok(
+            "PUT",
+            f"/auth/admin/realms/unieee/users/{keycloak_sub}",
+            token=admin_cli_token,
+            json_body=user_repr,
+            expected_statuses=(200, 204),
+        )
 
 
 def poll_enrollment_status(

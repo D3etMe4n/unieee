@@ -303,12 +303,19 @@ def main() -> int:
             token=kc_admin_token,
             json_body={"type": "password", "value": student_pass, "temporary": False},
         )
-        http_json(
-            "PUT",
+        _, user_repr = http_json(
+            "GET",
             f"{base_url}/auth/admin/realms/unieee/users/{sub}",
             token=kc_admin_token,
-            json_body={"requiredActions": []},
         )
+        if user_repr.get("requiredActions"):
+            user_repr["requiredActions"] = []
+            http_json(
+                "PUT",
+                f"{base_url}/auth/admin/realms/unieee/users/{sub}",
+                token=kc_admin_token,
+                json_body=user_repr,
+            )
         tok = acquire_token(base_url, code, student_pass)
         return {"id": stu["id"], "code": code, "token": tok}
 
