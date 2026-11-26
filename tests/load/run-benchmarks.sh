@@ -208,7 +208,11 @@ run_k6_scenario() {
 
     log_info "=== Running k6 scenario: ${scenario_name} (profile=${PROFILE}) ==="
 
-    local -a k6_args=(run "--summary-export" "$summary_in_runner")
+    local -a k6_args=(
+        run
+        "--summary-export" "$summary_in_runner"
+        "--summary-trend-stats" "avg,min,med,max,p(90),p(95),p(99)"
+    )
     if [ "$ENABLE_PROM_RW" = true ]; then
         k6_args+=("-o" "experimental-prometheus-rw" "--tag" "testid=${RUN_ID}" "--tag" "scenario=${scenario_name}")
     fi
@@ -223,7 +227,11 @@ run_k6_scenario() {
         k6 "${k6_args[@]}" "$SCRIPT_DIR/$script_rel"
     else
         summary_in_runner="/results/$(basename "$summary_file")"
-        k6_args=(run "--summary-export" "$summary_in_runner")
+        k6_args=(
+            run
+            "--summary-export" "$summary_in_runner"
+            "--summary-trend-stats" "avg,min,med,max,p(90),p(95),p(99)"
+        )
         if [ "$ENABLE_PROM_RW" = true ]; then
             k6_args+=("-o" "experimental-prometheus-rw" "--tag" "testid=${RUN_ID}" "--tag" "scenario=${scenario_name}")
         fi

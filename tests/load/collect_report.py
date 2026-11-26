@@ -60,11 +60,26 @@ def parse_k6_summary(path: Path) -> dict[str, Any]:
     raw = json.loads(path.read_text(encoding="utf-8"))
     metrics = raw.get("metrics", {})
 
-    def extract_trend(name: str) -> dict[str, Any] | None:
+    def metric_vals(name: str) -> dict[str, Any]:
         m = metrics.get(name)
-        if not m:
+        if not isinstance(m, dict):
+            return {}
+        return m["values"] if isinstance(m.get("values"), dict) else m
+
+    def rate_val(name: str, default: float | None = None) -> float | None:
+        vals = metric_vals(name)
+        if not vals:
+            return default
+        if "rate" in vals:
+            return vals.get("rate")
+        if "value" in vals:
+            return vals.get("value")
+        return default
+
+    def extract_trend(name: str) -> dict[str, Any] | None:
+        vals = metric_vals(name)
+        if not vals:
             return None
-        vals = m.get("values", {})
         return {
             "p50": vals.get("med"),
             "avg": vals.get("avg"),
@@ -73,23 +88,20 @@ def parse_k6_summary(path: Path) -> dict[str, Any]:
             "max": vals.get("max"),
         }
 
-    reqs = metrics.get("http_reqs", {}).get("values", {})
-    unexp = metrics.get("unieee_unexpected_error_rate", {}).get("values", {})
-    cache_hit = metrics.get("unieee_nginx_cache_hit_rate", {}).get("values", {})
-    checks = metrics.get("checks", {}).get("values", {})
-
+    reqs = metric_vals("http_reqs")
     custom_trends = {}
     for k in sorted(metrics):
         if k.startswith("unieee_") and k.endswith("_ms"):
             custom_trends[k] = extract_trend(k)
 
     return {
-        "totalRequests": reqs.get("count", 0),
-        "rps": reqs.get("rate", 0.0),
+        "totalRequests": int(reqs.get("count", 0) or 0),
+        "rps": float(reqs.get("rate", 0.0) or 0.0),
         "httpDurationMs": extract_trend("http_req_duration"),
-        "unexpectedErrorRate": unexp.get("rate", 0.0),
-        "nginxCacheHitRate": cache_hit.get("rate") if cache_hit else None,
-        "checksRate": checks.get("rate"),
+        "unexpectedErrorRate": float(rate_val("unieee_unexpected_error_rate", 0.0) or 0.0),
+        "chaosFailover5xxRate": rate_val("unieee_chaos_failover_5xx_rate"),
+        "nginxCacheHitRate": rate_val("unieee_nginx_cache_hit_rate"),
+        "checksRate": rate_val("checks"),
         "customTrendsMs": custom_trends,
     }
 
@@ -209,6 +221,11 @@ def main() -> int:
                 lines.append(
                     f"| ↳ `{tname}` | — | — | `{fmt_ms(tvals.get('p50'))}` | `{fmt_ms(tvals.get('p95'))}` | `{fmt_ms(tvals.get('p99'))}` | — | — |"
                 )
+        chaos_rate = sdata.get("chaosFailover5xxRate")
+        if chaos_rate is not None and float(chaos_rate) > 0.0:
+            lines.append(
+                f"| ↳ `chaos_failover_502_503` | — | — | — | — | — | `{fmt_pct(chaos_rate)}` | — |"
+            )
 
     if sse_probe:
         lat = sse_probe.get("latencyMs", {})
