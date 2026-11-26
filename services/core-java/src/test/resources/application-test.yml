@@ -12,6 +12,16 @@ spring:
       repositories:
         enabled: false
 
+  ai:
+    model:
+      chat: none
+      embedding: none
+      image: none
+      moderation: none
+      audio:
+        transcription: none
+        speech: none
+
 management:
   health:
     redis:
@@ -29,3 +39,6 @@ unieee:
     cache:
       redis:
         enabled: false
+  ai-advisor:
+    redis-seat-cache:
+      enabled: false

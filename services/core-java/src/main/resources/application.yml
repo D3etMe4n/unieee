@@ -53,6 +53,23 @@ spring:
       port: ${REDIS_PORT:6379}
       password: ${REDIS_PASSWORD:unieee_redis_dev_password}
 
+  ai:
+    model:
+      chat: ${SPRING_AI_CHAT_PROVIDER:none}
+      embedding: none
+      image: none
+      moderation: none
+      audio:
+        transcription: none
+        speech: none
+    openai:
+      api-key: ${OPENAI_API_KEY:disabled}
+      base-url: ${OPENAI_BASE_URL:https://api.openai.com}
+      chat:
+        options:
+          model: ${OPENAI_CHAT_MODEL:gpt-4o-mini}
+          temperature: ${OPENAI_CHAT_TEMPERATURE:0.2}
+
 server:
   port: ${SERVER_PORT:8080}
 
@@ -87,3 +104,13 @@ unieee:
       redis:
         enabled: ${POLICY_CACHE_REDIS_ENABLED:true}
         ttl: ${POLICY_CACHE_REDIS_TTL:1h}
+  ai-advisor:
+    enabled: ${AI_ADVISOR_ENABLED:true}
+    timeout: ${AI_ADVISOR_TIMEOUT:15s}
+    rate-limit-per-minute: ${AI_ADVISOR_RATE_LIMIT_PER_MINUTE:10}
+    circuit-breaker-failure-threshold: ${AI_ADVISOR_CB_FAILURE_THRESHOLD:3}
+    circuit-breaker-open-duration: ${AI_ADVISOR_CB_OPEN_DURATION:30s}
+    max-message-length: ${AI_ADVISOR_MAX_MESSAGE_LENGTH:2000}
+    max-options: ${AI_ADVISOR_MAX_OPTIONS:3}
+    redis-seat-cache:
+      enabled: ${AI_ADVISOR_REDIS_SEAT_CACHE_ENABLED:true}
