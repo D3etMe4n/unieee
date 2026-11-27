@@ -1,28 +1,32 @@
 use crate::core::{
-    AuthError, EngineReadiness, EnrollmentEngine, OidcJwtVerifier, PreloadSummarySnapshot,
-    VerifiedClaims,
+    AuthError, EngineRateLimiter, EngineReadiness, EnrollmentEngine, OidcJwtVerifier,
+    PreloadSummarySnapshot, VerifiedClaims,
 };
 use crate::http::dto::{
     DropRequest, EnrollmentAcceptedResponse, EnrollmentStatusResponse, HealthResponse,
     MyEnrollmentItemResponse, MyEnrollmentsResponse, PromoteResponse, ReadinessResponse,
     RegisterRequest, SectionSeatResponse,
 };
-use crate::http::error::{ApiError, ProblemJson};
+use crate::http::error::{
+    ApiError, ProblemJson, HEADER_RATE_LIMIT_LIMIT, HEADER_RATE_LIMIT_REMAINING,
+};
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
-use axum::http::{header, HeaderMap, StatusCode, Uri};
-use axum::response::IntoResponse;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::Utc;
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
-use unieee_domain::{EventId, SectionId, TermId};
+use unieee_cacheline::RateLimitDecision;
+use unieee_domain::{EventId, SectionId, StudentId, TermId};
 
 #[derive(Clone)]
 pub struct AppState {
     pub engine: Arc<EnrollmentEngine>,
     pub verifier: Arc<OidcJwtVerifier>,
+    pub rate_limiter: Arc<EngineRateLimiter>,
     pub internal_ops_token: Option<String>,
 }
 
@@ -52,6 +56,7 @@ pub async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
         service: "enrollment-engine",
         role: state.engine.role().as_str(),
         epoch: state.engine.epoch(),
+        rate_limit_enabled: state.rate_limiter.is_enabled(),
     })
 }
 
@@ -65,6 +70,7 @@ pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
         gate_state: format!("{:?}", state.engine.gate_state()).to_ascii_uppercase(),
         epoch: state.engine.epoch(),
         checkpoint_seq: state.engine.checkpoint_seq(),
+        rate_limit_enabled: state.rate_limiter.is_enabled(),
     };
     let code = if ready {
         StatusCode::OK
@@ -80,17 +86,24 @@ pub async fn register_handler(
     headers: HeaderMap,
     AuthenticatedUser(claims): AuthenticatedUser,
     ProblemJson(req): ProblemJson<RegisterRequest>,
-) -> Result<(StatusCode, Json<EnrollmentAcceptedResponse>), ApiError> {
+) -> Result<Response, ApiError> {
     let instance = uri.path();
     if !claims.has_role("STUDENT") {
         return Err(ApiError::from(AuthError::Forbidden).with_instance(instance));
     }
+    let resolved_student = resolve_student_hint(&state, &claims);
+    let decision = state
+        .rate_limiter
+        .check_write_identity(resolved_student, &claims.sub, || {
+            extract_client_ip(&headers)
+        });
+    if !decision.allowed {
+        return Err(ApiError::rate_limited("write", decision, instance));
+    }
+
     let idempotency_key = extract_idempotency_key(&headers, instance)?;
     validate_positive_section_id(req.section_id, instance)?;
-    let student_id = state
-        .engine
-        .resolve_student_id(&claims.sub, claims.student_id_claim)
-        .map_err(|err| ApiError::from(err).with_instance(instance))?;
+    let student_id = resolve_required_student(&state, &claims, resolved_student, instance)?;
     let accepted = state
         .engine
         .register_with_idempotency(
@@ -103,7 +116,7 @@ pub async fn register_handler(
         .await
         .map_err(|err| ApiError::from(err).with_instance(instance))?;
 
-    Ok((
+    let resp = (
         StatusCode::ACCEPTED,
         Json(EnrollmentAcceptedResponse {
             event_id: accepted.event_id,
@@ -118,6 +131,12 @@ pub async fn register_handler(
             engine_epoch: accepted.engine_epoch,
             accepted_at: accepted.accepted_at,
         }),
+    )
+        .into_response();
+    Ok(attach_rate_limit_headers(
+        resp,
+        state.rate_limiter.is_enabled(),
+        decision,
     ))
 }
 
@@ -127,17 +146,24 @@ pub async fn drop_handler(
     headers: HeaderMap,
     AuthenticatedUser(claims): AuthenticatedUser,
     ProblemJson(req): ProblemJson<DropRequest>,
-) -> Result<(StatusCode, Json<EnrollmentAcceptedResponse>), ApiError> {
+) -> Result<Response, ApiError> {
     let instance = uri.path();
     if !claims.has_role("STUDENT") {
         return Err(ApiError::from(AuthError::Forbidden).with_instance(instance));
     }
+    let resolved_student = resolve_student_hint(&state, &claims);
+    let decision = state
+        .rate_limiter
+        .check_write_identity(resolved_student, &claims.sub, || {
+            extract_client_ip(&headers)
+        });
+    if !decision.allowed {
+        return Err(ApiError::rate_limited("write", decision, instance));
+    }
+
     let idempotency_key = extract_idempotency_key(&headers, instance)?;
     validate_positive_section_id(req.section_id, instance)?;
-    let student_id = state
-        .engine
-        .resolve_student_id(&claims.sub, claims.student_id_claim)
-        .map_err(|err| ApiError::from(err).with_instance(instance))?;
+    let student_id = resolve_required_student(&state, &claims, resolved_student, instance)?;
     let accepted = state
         .engine
         .drop_section_with_idempotency(
@@ -149,7 +175,7 @@ pub async fn drop_handler(
         .await
         .map_err(|err| ApiError::from(err).with_instance(instance))?;
 
-    Ok((
+    let resp = (
         StatusCode::ACCEPTED,
         Json(EnrollmentAcceptedResponse {
             event_id: accepted.event_id,
@@ -164,16 +190,38 @@ pub async fn drop_handler(
             engine_epoch: accepted.engine_epoch,
             accepted_at: accepted.accepted_at,
         }),
+    )
+        .into_response();
+    Ok(attach_rate_limit_headers(
+        resp,
+        state.rate_limiter.is_enabled(),
+        decision,
     ))
 }
 
 pub async fn get_status_handler(
     State(state): State<AppState>,
     uri: Uri,
+    headers: HeaderMap,
     AuthenticatedUser(claims): AuthenticatedUser,
     Path(raw_event_id): Path<String>,
-) -> Result<Json<EnrollmentStatusResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let instance = uri.path();
+    let is_admin = claims.has_role("ACADEMIC_ADMIN");
+    if !is_admin && !claims.has_role("STUDENT") {
+        return Err(ApiError::from(AuthError::Forbidden).with_instance(instance));
+    }
+
+    let resolved_student = resolve_student_hint(&state, &claims);
+    let decision = state
+        .rate_limiter
+        .check_read_identity(resolved_student, &claims.sub, || {
+            extract_client_ip(&headers)
+        });
+    if !decision.allowed {
+        return Err(ApiError::rate_limited("read", decision, instance));
+    }
+
     let event_id = EventId::from_str(&raw_event_id).map_err(|_| {
         ApiError::bad_request(
             "INVALID_EVENT_ID",
@@ -182,17 +230,13 @@ pub async fn get_status_handler(
         .with_instance(instance)
     })?;
 
-    let is_admin = claims.has_role("ACADEMIC_ADMIN");
     let caller_student_id = if !is_admin {
-        if !claims.has_role("STUDENT") {
-            return Err(ApiError::from(AuthError::Forbidden).with_instance(instance));
-        }
-        Some(
-            state
-                .engine
-                .resolve_student_id(&claims.sub, claims.student_id_claim)
-                .map_err(|err| ApiError::from(err).with_instance(instance))?,
-        )
+        Some(resolve_required_student(
+            &state,
+            &claims,
+            resolved_student,
+            instance,
+        )?)
     } else {
         None
     };
@@ -216,7 +260,7 @@ pub async fn get_status_handler(
         }
     }
 
-    Ok(Json(EnrollmentStatusResponse {
+    let resp = Json(EnrollmentStatusResponse {
         event_id: record.event_id,
         term_id: record.term_id,
         student_id: record.student_id,
@@ -227,15 +271,22 @@ pub async fn get_status_handler(
         reason_code: record.reason_code.map(|c| c.as_str().to_owned()),
         engine_epoch: record.engine_epoch,
         updated_at: record.updated_at,
-    }))
+    })
+    .into_response();
+    Ok(attach_rate_limit_headers(
+        resp,
+        state.rate_limiter.is_enabled(),
+        decision,
+    ))
 }
 
 pub async fn get_seats_handler(
     State(state): State<AppState>,
     uri: Uri,
+    headers: HeaderMap,
     AuthenticatedUser(claims): AuthenticatedUser,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<Vec<SectionSeatResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     let instance = uri.path();
     if !claims.has_role("STUDENT")
         && !claims.has_role("LECTURER")
@@ -243,12 +294,22 @@ pub async fn get_seats_handler(
     {
         return Err(ApiError::from(AuthError::Forbidden).with_instance(instance));
     }
+    let resolved_student = resolve_student_hint(&state, &claims);
+    let decision = state
+        .rate_limiter
+        .check_read_identity(resolved_student, &claims.sub, || {
+            extract_client_ip(&headers)
+        });
+    if !decision.allowed {
+        return Err(ApiError::rate_limited("read", decision, instance));
+    }
+
     let term_id = parse_required_term_id(&params, instance)?;
     let seats = state
         .engine
         .list_term_seats(term_id)
         .map_err(|err| ApiError::from(err).with_instance(instance))?;
-    Ok(Json(
+    let resp = Json(
         seats
             .into_iter()
             .map(|s| SectionSeatResponse {
@@ -257,30 +318,44 @@ pub async fn get_seats_handler(
                 max_capacity: s.max_capacity,
                 status: s.status,
             })
-            .collect(),
+            .collect::<Vec<_>>(),
+    )
+    .into_response();
+    Ok(attach_rate_limit_headers(
+        resp,
+        state.rate_limiter.is_enabled(),
+        decision,
     ))
 }
 
 pub async fn get_my_enrollments_handler(
     State(state): State<AppState>,
     uri: Uri,
+    headers: HeaderMap,
     AuthenticatedUser(claims): AuthenticatedUser,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<MyEnrollmentsResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let instance = uri.path();
     if !claims.has_role("STUDENT") {
         return Err(ApiError::from(AuthError::Forbidden).with_instance(instance));
     }
+    let resolved_student = resolve_student_hint(&state, &claims);
+    let decision = state
+        .rate_limiter
+        .check_read_identity(resolved_student, &claims.sub, || {
+            extract_client_ip(&headers)
+        });
+    if !decision.allowed {
+        return Err(ApiError::rate_limited("read", decision, instance));
+    }
+
     let term_id = parse_required_term_id(&params, instance)?;
-    let student_id = state
-        .engine
-        .resolve_student_id(&claims.sub, claims.student_id_claim)
-        .map_err(|err| ApiError::from(err).with_instance(instance))?;
+    let student_id = resolve_required_student(&state, &claims, resolved_student, instance)?;
     let view = state
         .engine
         .get_student_enrollments(term_id, student_id)
         .map_err(|err| ApiError::from(err).with_instance(instance))?;
-    Ok(Json(MyEnrollmentsResponse {
+    let resp = Json(MyEnrollmentsResponse {
         term_id: view.term_id,
         student_id: view.student_id,
         current_credits: view.current_credits,
@@ -295,7 +370,13 @@ pub async fn get_my_enrollments_handler(
                 last_event_id: item.last_event_id,
             })
             .collect(),
-    }))
+    })
+    .into_response();
+    Ok(attach_rate_limit_headers(
+        resp,
+        state.rate_limiter.is_enabled(),
+        decision,
+    ))
 }
 
 fn parse_required_term_id(
@@ -457,4 +538,64 @@ pub fn extract_bearer_token(header_val: &str) -> Option<&str> {
     } else {
         None
     }
+}
+
+fn extract_client_ip(headers: &HeaderMap) -> Option<String> {
+    if let Some(real_ip) = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(real_ip.to_owned());
+    }
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| raw.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn resolve_student_hint(state: &AppState, claims: &VerifiedClaims) -> Option<StudentId> {
+    if !state.rate_limiter.is_enabled() {
+        return claims.student_id_claim;
+    }
+    claims
+        .student_id_claim
+        .or_else(|| state.engine.resolve_student_id(&claims.sub, None).ok())
+}
+
+fn resolve_required_student(
+    state: &AppState,
+    claims: &VerifiedClaims,
+    resolved: Option<StudentId>,
+    instance: &str,
+) -> Result<StudentId, ApiError> {
+    match resolved {
+        Some(id) => Ok(id),
+        None => state
+            .engine
+            .resolve_student_id(&claims.sub, claims.student_id_claim)
+            .map_err(|err| ApiError::from(err).with_instance(instance)),
+    }
+}
+
+fn attach_rate_limit_headers(
+    mut resp: Response,
+    enabled: bool,
+    decision: RateLimitDecision,
+) -> Response {
+    if !enabled {
+        return resp;
+    }
+    let headers = resp.headers_mut();
+    if let Ok(limit_val) = HeaderValue::from_str(&decision.limit.to_string()) {
+        headers.insert(HEADER_RATE_LIMIT_LIMIT, limit_val);
+    }
+    if let Ok(rem_val) = HeaderValue::from_str(&decision.remaining.to_string()) {
+        headers.insert(HEADER_RATE_LIMIT_REMAINING, rem_val);
+    }
+    resp
 }

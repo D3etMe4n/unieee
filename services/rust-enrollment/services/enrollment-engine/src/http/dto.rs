@@ -61,6 +61,7 @@ pub struct HealthResponse {
     pub service: &'static str,
     pub role: &'static str,
     pub epoch: u64,
+    pub rate_limit_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +73,7 @@ pub struct ReadinessResponse {
     pub gate_state: String,
     pub epoch: u64,
     pub checkpoint_seq: i64,
+    pub rate_limit_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

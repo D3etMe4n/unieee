@@ -10,13 +10,17 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PROFILE="${BENCH_PROFILE:-laptop}"
 SCENARIO="all"
 CHAOS="none"
-BENCH_NGINX=false
+DISABLE_RATE_LIMIT=false
+NETWORK_MODE="host-tls"
+SSE_MODE="auto"
 RUNNER="auto"
 PROM_RW="auto"
 SKIP_SEED=false
 CLOSE_AFTER=false
 RUNTIME_ARG=""
 BASE_URL=""
+HOST_BASE_URL=""
+SSE_PROBE_IMAGE="${SSE_PROBE_IMAGE:-docker.io/library/python:3.12-alpine}"
 
 usage() {
     cat <<'EOF'
@@ -27,18 +31,23 @@ Options:
   --profile smoke|laptop|workstation|stress   Hardware preset (or env BENCH_PROFILE, default: laptop)
   --scenario 01|02|03|04|all                  Scenario(s) to run (default: all)
   --chaos none|engine|redis|both              Mid-Scenario-04 chaos failover drill (default: none)
-  --bench-nginx                               Apply single-host rate-limit lift overlay during test
-  --runner auto|local|container               Run via native k6 or grafana/k6 container (default: auto)
+  --network-mode host-tls|internal-http       Target path: host HTTPS edge (default) or internal unieee_app :8088 HTTP
+  --internal-http                             Shorthand for --network-mode internal-http
+  --sse-mode auto|host|internal               Where sse_probe.py runs (auto: internal for internal-http, else host)
+  --disable-rate-limit                        Apply isolated tests/load/compose.bench.yml (Nginx + service rate limits OFF; auto-restored on exit)
+  --bench-overlay / --bench-nginx             Backwards-compatible aliases for --disable-rate-limit
+  --runner auto|local|container               Run via native k6 or grafana/k6 container (default: auto; internal-http uses container)
   --prometheus-rw auto|true|false             Stream live metrics to Prometheus RW (default: auto)
   --runtime podman|docker                     Container runtime (default: auto-detect)
-  --base-url <url>                            Reverse Proxy base URL (default: https://127.0.0.1:$UNIEEE_HTTPS_PORT)
+  --base-url <url>                            Target URL for k6/SSE (default: https://127.0.0.1:$UNIEEE_HTTPS_PORT or http://reverse-proxy:8088)
+  --host-base-url <url>                       Host URL for seed.py & verify_invariants.py (default: https://127.0.0.1:$UNIEEE_HTTPS_PORT)
   --skip-seed                                 Reuse existing tests/load/.work/bench-context.json
   --close-after                               Run close-registration & re-verify 0|0|0 after benchmarks
   -h, --help                                  Show help
 
 Environment overrides:
   VUS, DURATION, TARGET_RPS, HOT_SECTIONS, HOT_SECTION_CAP, STUDENT_COUNT,
-  PROMETHEUS_RW_URL, BENCH_PROFILE
+  PROMETHEUS_RW_URL, BENCH_PROFILE, SSE_PROBE_IMAGE
 EOF
 }
 
@@ -56,8 +65,20 @@ while [ $# -gt 0 ]; do
             CHAOS="${2:?--chaos requires none|engine|redis|both}"
             shift 2
             ;;
-        --bench-nginx)
-            BENCH_NGINX=true
+        --network-mode)
+            NETWORK_MODE="${2:?--network-mode requires host-tls|internal-http}"
+            shift 2
+            ;;
+        --internal-http)
+            NETWORK_MODE="internal-http"
+            shift
+            ;;
+        --sse-mode)
+            SSE_MODE="${2:?--sse-mode requires auto|host|internal}"
+            shift 2
+            ;;
+        --disable-rate-limit|--bench-overlay|--bench-nginx)
+            DISABLE_RATE_LIMIT=true
             shift
             ;;
         --runner)
@@ -74,6 +95,10 @@ while [ $# -gt 0 ]; do
             ;;
         --base-url)
             BASE_URL="${2:?--base-url requires URL}"
+            shift 2
+            ;;
+        --host-base-url)
+            HOST_BASE_URL="${2:?--host-base-url requires URL}"
             shift 2
             ;;
         --skip-seed)
@@ -96,14 +121,53 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+case "$NETWORK_MODE" in
+    host-tls|internal-http) ;;
+    *)
+        log_err "Invalid --network-mode '$NETWORK_MODE'. Expected: host-tls | internal-http"
+        exit 1
+        ;;
+esac
+
+case "$SSE_MODE" in
+    auto|host|internal) ;;
+    *)
+        log_err "Invalid --sse-mode '$SSE_MODE'. Expected: auto | host | internal"
+        exit 1
+        ;;
+esac
+
 load_env_file "$ROOT_DIR"
 detect_runtime "$RUNTIME_ARG"
 
 HTTPS_PORT="${UNIEEE_HTTPS_PORT:-8443}"
 PROM_PORT="${UNIEEE_PROMETHEUS_PORT:-9090}"
-BASE_URL="${BASE_URL:-https://127.0.0.1:${HTTPS_PORT}}"
+DEFAULT_HOST_BASE_URL="https://127.0.0.1:${HTTPS_PORT}"
+if [ -n "$HOST_BASE_URL" ]; then
+    EFFECTIVE_HOST_BASE_URL="$HOST_BASE_URL"
+elif [ "$NETWORK_MODE" = "host-tls" ] && [ -n "$BASE_URL" ]; then
+    EFFECTIVE_HOST_BASE_URL="$BASE_URL"
+else
+    EFFECTIVE_HOST_BASE_URL="$DEFAULT_HOST_BASE_URL"
+fi
+
+if [ "$NETWORK_MODE" = "internal-http" ]; then
+    K6_BASE_URL="${BASE_URL:-http://reverse-proxy:8088}"
+    K6_PROM_RW_URL="${PROMETHEUS_RW_URL:-http://prometheus:9090/api/v1/write}"
+else
+    K6_BASE_URL="${BASE_URL:-$EFFECTIVE_HOST_BASE_URL}"
+    K6_PROM_RW_URL="${PROMETHEUS_RW_URL:-http://127.0.0.1:${PROM_PORT}/api/v1/write}"
+fi
 PROM_BASE_URL="http://127.0.0.1:${PROM_PORT}"
-PROM_RW_URL="${PROMETHEUS_RW_URL:-${PROM_BASE_URL}/api/v1/write}"
+
+RESOLVED_SSE_MODE="$SSE_MODE"
+if [ "$RESOLVED_SSE_MODE" = "auto" ]; then
+    if [ "$NETWORK_MODE" = "internal-http" ]; then
+        RESOLVED_SSE_MODE="internal"
+    else
+        RESOLVED_SSE_MODE="host"
+    fi
+fi
 
 WORK_DIR="$SCRIPT_DIR/.work"
 RESULTS_DIR="$SCRIPT_DIR/results"
@@ -111,60 +175,292 @@ CTX_FILE="$WORK_DIR/bench-context.json"
 mkdir -p "$WORK_DIR" "$RESULTS_DIR"
 
 RUN_ID="bench-${PROFILE}-$(date -u +%Y%m%dT%H%M%SZ)"
-NGINX_PATCHED=false
+BENCH_OVERLAY_APPLIED=false
 K6_THRESHOLD_BREACHED=false
+APP_NETWORK=""
 
-cleanup_nginx_overlay() {
-    if [ "$NGINX_PATCHED" = true ]; then
-        log_info "Restoring default production Nginx rate-limit config..."
-        export UNIEEE_MONITORING_ENABLED="false"
-        if container_running "unieee-prometheus"; then
-            export UNIEEE_MONITORING_ENABLED="true"
-        fi
-        local restore_profile="core"
-        if container_running "unieee-enrollment-engine-active" || container_running "unieee-enrollment-engine-standby"; then
-            restore_profile="hot-path"
-        fi
-        run_compose_with_tls "$restore_profile" "${UNIEEE_TLS_MODE:-custom}" "" up -d --no-deps --force-recreate reverse-proxy >/dev/null || true
+discover_app_network() {
+    if [ -n "$APP_NETWORK" ]; then
+        return 0
+    fi
+    if container_running "unieee-reverse-proxy"; then
+        APP_NETWORK=$("$CTR_CLI" inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' unieee-reverse-proxy 2>/dev/null | grep -E '(^|_)app$' | head -n 1 || true)
+    fi
+    if [ -z "$APP_NETWORK" ]; then
+        APP_NETWORK="unieee_app"
     fi
 }
-trap cleanup_nginx_overlay EXIT
 
-apply_bench_nginx_overlay() {
-    log_info "Applying temporary single-host benchmark Nginx rate-limit overlay..."
-    local -a local_files=(-f "$ROOT_DIR/infra/compose.base.yml")
-    local -a profile_flags=()
-    if container_running "unieee-enrollment-engine-active" || container_running "unieee-enrollment-engine-standby"; then
-        local_files+=(-f "$ROOT_DIR/infra/compose.hotpath.yml")
+container_user_flags() {
+    local -n out_arr=$1
+    if [ "$CTR_RUNTIME" = "podman" ]; then
+        out_arr+=(--userns=keep-id --user "$(id -u):$(id -g)" -e "HOME=/tmp")
+    else
+        out_arr+=(--user "$(id -u):$(id -g)" -e "HOME=/tmp")
+    fi
+}
+
+wait_service_ready() {
+    local svc="$1"
+    local timeout_secs="${2:-60}"
+    local deadline=$(($(date +%s) + timeout_secs))
+    while [ "$(date +%s)" -le "$deadline" ]; do
+        case "$svc" in
+            reverse-proxy)
+                if "$CTR_CLI" exec unieee-reverse-proxy wget -qO- http://127.0.0.1/proxy-health 2>/dev/null | grep -qx "OK"; then
+                    return 0
+                fi
+                ;;
+            core-java)
+                if "$CTR_CLI" exec unieee-core-java wget -qO- http://127.0.0.1:8080/actuator/health/readiness 2>/dev/null | grep -q '"status":"UP"'; then
+                    return 0
+                fi
+                ;;
+            enrollment-engine-active|enrollment-engine-standby)
+                if "$CTR_CLI" exec "unieee-${svc}" curl -fsS http://127.0.0.1:8081/readyz >/dev/null 2>&1; then
+                    return 0
+                fi
+                ;;
+            sse-gateway)
+                if "$CTR_CLI" exec unieee-sse-gateway curl -fsS http://127.0.0.1:8083/readyz >/dev/null 2>&1; then
+                    return 0
+                fi
+                ;;
+        esac
+        sleep 1
+    done
+    log_err "Timed out waiting for service '${svc}' readiness after ${timeout_secs}s"
+    return 1
+}
+
+export_term_env_from_context() {
+    if [ -f "$CTX_FILE" ]; then
+        local pair
+        pair=$(PYTHONDONTWRITEBYTECODE=1 python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+print(d.get("termId", "") + "|" + d.get("termCode", "") + "|" + d.get("windowId", ""))
+' "$CTX_FILE" 2>/dev/null || true)
+        if [ -n "$pair" ]; then
+            export TERM_ID="${pair%%|*}"
+            local rest="${pair#*|}"
+            export TERM_CODE="${rest%%|*}"
+            BENCH_WINDOW_ID="${rest#*|}"
+        fi
+    fi
+}
+
+ensure_active_engine_after_recreate() {
+    local has_active=false
+    local any_running=false
+    local svc body role gate_state
+
+    for svc in unieee-enrollment-engine-active unieee-enrollment-engine-standby; do
+        if container_running "$svc"; then
+            any_running=true
+            body=$("$CTR_CLI" exec "$svc" curl -fsS http://127.0.0.1:8081/readyz 2>/dev/null || true)
+            role=$(printf "%s" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("role",""))' 2>/dev/null || true)
+            if [ "$role" = "ACTIVE" ]; then
+                has_active=true
+            fi
+        fi
+    done
+
+    if [ "$any_running" = false ]; then
+        return 0
+    fi
+
+    if [ "$has_active" = false ] && container_running "unieee-enrollment-engine-active"; then
+        log_info "Promoting unieee-enrollment-engine-active back to ACTIVE after recreate..."
+        local -a prom_cmd=("$CTR_CLI" exec unieee-enrollment-engine-active curl -fsS -X POST)
+        if [ -n "${INTERNAL_OPS_TOKEN:-}" ]; then
+            prom_cmd+=(-H "x-internal-ops-token: ${INTERNAL_OPS_TOKEN}")
+        fi
+        prom_cmd+=("http://127.0.0.1:8081/internal/promote")
+        "${prom_cmd[@]}" >/dev/null
+    fi
+
+    if [ -f "$CTX_FILE" ]; then
+        export_term_env_from_context
+        local needs_open=false
+        for svc in unieee-enrollment-engine-active unieee-enrollment-engine-standby; do
+            if container_running "$svc"; then
+                body=$("$CTR_CLI" exec "$svc" curl -fsS http://127.0.0.1:8081/readyz 2>/dev/null || true)
+                gate_state=$(printf "%s" "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("gateState",""))' 2>/dev/null || true)
+                if [ "$gate_state" != "OPEN" ]; then
+                    needs_open=true
+                fi
+            fi
+        done
+        if [ "$needs_open" = true ] && [ -n "${TERM_ID:-}" ]; then
+            log_info "Restoring GateState=OPEN after engine recreate..."
+            (
+                . "$ROOT_DIR/scripts/lib/lifecycle.sh"
+                local epoch
+                epoch=$(ops_max_engine_epoch)
+                ops_publish_gate_control "$TERM_ID" "OPEN" "${BENCH_WINDOW_ID:-}" "$epoch"
+                ops_wait_engines_gate_state "OPEN" 15
+            )
+        fi
+    fi
+
+    # Allow 20-enrollment-healthcheck.sh 1s loop to update /tmp/enrollment-primary.conf
+    sleep 2
+}
+
+build_compose_files_array() {
+    local -n files_ref=$1
+    local -n profile_ref=$2
+    local include_bench="$3"
+
+    files_ref=(-f "$ROOT_DIR/infra/compose.base.yml")
+    profile_ref=()
+
+    if [ "$include_bench" = true ] || container_running "unieee-enrollment-engine-active" || container_running "unieee-enrollment-engine-standby" || container_running "unieee-sse-gateway"; then
+        files_ref+=(-f "$ROOT_DIR/infra/compose.hotpath.yml")
         if container_running "unieee-prometheus"; then
-            local_files+=(-f "$ROOT_DIR/infra/compose.monitoring.yml")
-            profile_flags+=(--profile hot-path)
+            files_ref+=(-f "$ROOT_DIR/infra/compose.monitoring.yml")
+            if container_running "unieee-kafka-exporter"; then
+                profile_ref+=(--profile hot-path)
+            fi
         fi
     elif container_running "unieee-prometheus"; then
-        local_files+=(-f "$ROOT_DIR/infra/compose.monitoring.yml")
+        files_ref+=(-f "$ROOT_DIR/infra/compose.monitoring.yml")
     fi
+
     local tls_mode="${UNIEEE_TLS_MODE:-custom}"
     if [ "$tls_mode" = "letsencrypt" ]; then
-        local_files+=(-f "$ROOT_DIR/infra/compose.letsencrypt.yml")
+        files_ref+=(-f "$ROOT_DIR/infra/compose.letsencrypt.yml")
     elif [ "$tls_mode" = "cloudflared" ]; then
-        local_files+=(-f "$ROOT_DIR/infra/compose.cloudflared.yml")
+        files_ref+=(-f "$ROOT_DIR/infra/compose.cloudflared.yml")
     fi
-    local_files+=(-f "$SCRIPT_DIR/compose.bench-nginx.yml")
-    "${COMPOSE_CMD[@]}" --env-file "$ENV_FILE_ARG" "${local_files[@]}" "${profile_flags[@]}" up -d --no-deps --force-recreate reverse-proxy
-    NGINX_PATCHED=true
-    sleep 2
+
+    if [ "$include_bench" = true ]; then
+        files_ref+=(-f "$SCRIPT_DIR/compose.bench.yml")
+    fi
+}
+
+cleanup_bench_overlay() {
+    if [ "$BENCH_OVERLAY_APPLIED" != true ]; then
+        return 0
+    fi
+    log_info "Restoring default production rate-limit config (Nginx + Core Java + Rust services)..."
+    export_term_env_from_context
+    local -a restore_files=()
+    local -a restore_profiles=()
+    build_compose_files_array restore_files restore_profiles false
+
+    local -a target_svcs=(reverse-proxy)
+    if container_running "unieee-core-java"; then
+        target_svcs+=(core-java)
+    fi
+    if container_running "unieee-enrollment-engine-active"; then
+        target_svcs+=(enrollment-engine-active)
+    fi
+    if container_running "unieee-enrollment-engine-standby"; then
+        target_svcs+=(enrollment-engine-standby)
+    fi
+    if container_running "unieee-sse-gateway"; then
+        target_svcs+=(sse-gateway)
+    fi
+
+    "${COMPOSE_CMD[@]}" --env-file "$ENV_FILE_ARG" "${restore_files[@]}" "${restore_profiles[@]}" \
+        up -d --no-deps --force-recreate "${target_svcs[@]}" >/dev/null || true
+
+    local svc
+    for svc in "${target_svcs[@]}"; do
+        wait_service_ready "$svc" 90 || true
+    done
+    ensure_active_engine_after_recreate || true
+
+    # Verify rate-limiting is restored to ON
+    if container_running "unieee-core-java"; then
+        if "$CTR_CLI" exec unieee-core-java wget -qO- http://127.0.0.1:8080/actuator/prometheus 2>/dev/null | grep -Eq 'unieee_rate_limit_enabled\{.*\} 1\.0'; then
+            log_ok "Restored core-java rate limiting (unieee_rate_limit_enabled=1.0)"
+        else
+            log_warn "Could not verify core-java unieee_rate_limit_enabled=1.0 after restore"
+        fi
+    fi
+    for svc in unieee-enrollment-engine-active unieee-enrollment-engine-standby; do
+        if container_running "$svc"; then
+            if "$CTR_CLI" exec "$svc" curl -fsS http://127.0.0.1:8081/healthz 2>/dev/null | grep -q '"rateLimitEnabled":true'; then
+                log_ok "Restored ${svc#unieee-} rate limiting (rateLimitEnabled=true)"
+            else
+                log_warn "Could not verify ${svc#unieee-} rateLimitEnabled=true after restore"
+            fi
+        fi
+    done
+    if container_running "unieee-sse-gateway"; then
+        if "$CTR_CLI" exec unieee-sse-gateway curl -fsS http://127.0.0.1:8083/healthz 2>/dev/null | grep -q '"rateLimitEnabled":true'; then
+            log_ok "Restored sse-gateway rate limiting (rateLimitEnabled=true)"
+        else
+            log_warn "Could not verify sse-gateway rateLimitEnabled=true after restore"
+        fi
+    fi
+}
+trap cleanup_bench_overlay EXIT
+
+apply_bench_overlay() {
+    local phase="${1:-full}"
+    log_info "Applying isolated benchmark overlay (tests/load/compose.bench.yml, phase=${phase})..."
+    export_term_env_from_context
+
+    local -a local_files=()
+    local -a profile_flags=()
+    build_compose_files_array local_files profile_flags true
+
+    local -a target_svcs=(reverse-proxy)
+    if container_running "unieee-core-java"; then
+        target_svcs+=(core-java)
+    fi
+    if [ "$phase" = "full" ]; then
+        if container_running "unieee-enrollment-engine-active"; then
+            target_svcs+=(enrollment-engine-active)
+        fi
+        if container_running "unieee-enrollment-engine-standby"; then
+            target_svcs+=(enrollment-engine-standby)
+        fi
+        if container_running "unieee-sse-gateway"; then
+            target_svcs+=(sse-gateway)
+        fi
+    fi
+
+    "${COMPOSE_CMD[@]}" --env-file "$ENV_FILE_ARG" "${local_files[@]}" "${profile_flags[@]}" \
+        up -d --no-deps --force-recreate "${target_svcs[@]}"
+    BENCH_OVERLAY_APPLIED=true
+
+    local svc
+    for svc in "${target_svcs[@]}"; do
+        wait_service_ready "$svc" 90
+    done
+    if [ "$phase" = "full" ]; then
+        ensure_active_engine_after_recreate
+    fi
 }
 
 # Resolve k6 execution mode
 K6_MODE="$RUNNER"
-if [ "$K6_MODE" = "auto" ]; then
+if [ "$NETWORK_MODE" = "internal-http" ]; then
+    if [ "$K6_MODE" = "local" ]; then
+        log_err "--runner local is incompatible with --network-mode internal-http (use --runner container or auto)"
+        exit 1
+    fi
+    K6_MODE="container"
+    discover_app_network
+elif [ "$K6_MODE" = "auto" ]; then
     if command -v k6 >/dev/null 2>&1; then
         K6_MODE="local"
     else
         K6_MODE="container"
     fi
 fi
-log_info "k6 runner mode: $K6_MODE | profile=$PROFILE | scenario=$SCENARIO | chaos=$CHAOS"
+
+if [ "$RESOLVED_SSE_MODE" = "internal" ]; then
+    discover_app_network
+fi
+
+log_info "Benchmark config: network_mode=${NETWORK_MODE} | sse_mode=${RESOLVED_SSE_MODE} | k6_runner=${K6_MODE} | disable_rate_limit=${DISABLE_RATE_LIMIT} | profile=${PROFILE} | scenario=${SCENARIO} | chaos=${CHAOS}"
+log_info "Target URLs: host=${EFFECTIVE_HOST_BASE_URL} | k6=${K6_BASE_URL}"
 
 # Resolve Prometheus remote write availability
 ENABLE_PROM_RW=false
@@ -175,27 +471,30 @@ elif [ "$PROM_RW" = "auto" ]; then
         ENABLE_PROM_RW=true
     fi
 fi
-log_info "Prometheus remote-write streaming: $ENABLE_PROM_RW ($PROM_RW_URL)"
+log_info "Prometheus remote-write streaming: $ENABLE_PROM_RW ($K6_PROM_RW_URL)"
 
-if [ "$BENCH_NGINX" = true ]; then
-    apply_bench_nginx_overlay
+if [ "$DISABLE_RATE_LIMIT" = true ]; then
+    apply_bench_overlay "pre-seed"
 fi
 
 if [ "$SKIP_SEED" = false ]; then
     PYTHONDONTWRITEBYTECODE=1 python3 "$SCRIPT_DIR/seed.py" \
         --profile "$PROFILE" \
-        --base-url "$BASE_URL" \
+        --base-url "$EFFECTIVE_HOST_BASE_URL" \
         --runtime "$CTR_RUNTIME" \
         --output "$CTX_FILE"
-    # seed.py invokes prepare-registration which runs cmd_up --hot-path without compose.bench-nginx.yml;
-    # re-apply the benchmark Nginx overlay if enabled.
-    if [ "$BENCH_NGINX" = true ]; then
-        apply_bench_nginx_overlay
+    # seed.py invokes prepare-registration which recreates core/hot-path without compose.bench.yml;
+    # re-apply the benchmark overlay across Nginx, Core Java, and Rust Hot Path services if enabled.
+    if [ "$DISABLE_RATE_LIMIT" = true ]; then
+        apply_bench_overlay "full"
     fi
 else
     if [ ! -f "$CTX_FILE" ]; then
         log_err "--skip-seed specified but $CTX_FILE does not exist"
         exit 1
+    fi
+    if [ "$DISABLE_RATE_LIMIT" = true ]; then
+        apply_bench_overlay "full"
     fi
 fi
 
@@ -206,7 +505,7 @@ run_k6_scenario() {
     local summary_in_runner="$summary_file"
     local ctx_in_runner="$CTX_FILE"
 
-    log_info "=== Running k6 scenario: ${scenario_name} (profile=${PROFILE}) ==="
+    log_info "=== Running k6 scenario: ${scenario_name} (profile=${PROFILE}, network=${NETWORK_MODE}) ==="
 
     local -a k6_args=(
         run
@@ -220,9 +519,9 @@ run_k6_scenario() {
     if [ "$K6_MODE" = "local" ]; then
         BENCH_PROFILE="$PROFILE" \
         BENCH_CHAOS="$CHAOS" \
-        BASE_URL="$BASE_URL" \
+        BASE_URL="$K6_BASE_URL" \
         BENCH_CONTEXT_FILE="$ctx_in_runner" \
-        K6_PROMETHEUS_RW_SERVER_URL="$PROM_RW_URL" \
+        K6_PROMETHEUS_RW_SERVER_URL="$K6_PROM_RW_URL" \
         K6_PROMETHEUS_RW_TREND_STATS="p(50),p(95),p(99),avg,max" \
         k6 "${k6_args[@]}" "$SCRIPT_DIR/$script_rel"
     else
@@ -235,18 +534,27 @@ run_k6_scenario() {
         if [ "$ENABLE_PROM_RW" = true ]; then
             k6_args+=("-o" "experimental-prometheus-rw" "--tag" "testid=${RUN_ID}" "--tag" "scenario=${scenario_name}")
         fi
-        "$CTR_CLI" run --rm --network host \
+
+        local net_flag="host"
+        if [ "$NETWORK_MODE" = "internal-http" ]; then
+            discover_app_network
+            net_flag="$APP_NETWORK"
+        fi
+        local -a extra_ctr_flags=()
+        container_user_flags extra_ctr_flags
+
+        "$CTR_CLI" run --rm --network "$net_flag" "${extra_ctr_flags[@]}" \
             -v "$SCRIPT_DIR:/load:ro" \
             -v "$WORK_DIR:/work:ro" \
             -v "$RESULTS_DIR:/results:rw" \
             -e "BENCH_PROFILE=$PROFILE" \
             -e "BENCH_CHAOS=$CHAOS" \
-            -e "BASE_URL=$BASE_URL" \
+            -e "BASE_URL=$K6_BASE_URL" \
             -e "BENCH_CONTEXT_FILE=/work/bench-context.json" \
             -e "VUS=${VUS:-}" \
             -e "DURATION=${DURATION:-}" \
             -e "TARGET_RPS=${TARGET_RPS:-}" \
-            -e "K6_PROMETHEUS_RW_SERVER_URL=$PROM_RW_URL" \
+            -e "K6_PROMETHEUS_RW_SERVER_URL=$K6_PROM_RW_URL" \
             -e "K6_PROMETHEUS_RW_TREND_STATS=p(50),p(95),p(99),avg,max" \
             docker.io/grafana/k6:latest "${k6_args[@]}" "/load/$script_rel"
     fi
@@ -264,6 +572,37 @@ run_k6_capture() {
         fi
         K6_THRESHOLD_BREACHED=true
     fi
+}
+
+start_sse_probe() {
+    local clients="$1"
+    local duration_secs="$2"
+    local out_file="${RESULTS_DIR}/${RUN_ID}-sse-probe.json"
+
+    if [ "$RESOLVED_SSE_MODE" = "internal" ]; then
+        discover_app_network
+        local -a extra_ctr_flags=()
+        container_user_flags extra_ctr_flags
+        "$CTR_CLI" run --rm --network "$APP_NETWORK" "${extra_ctr_flags[@]}" \
+            -v "$SCRIPT_DIR:/load:ro" \
+            -v "$WORK_DIR:/work:ro" \
+            -v "$RESULTS_DIR:/results:rw" \
+            "$SSE_PROBE_IMAGE" \
+            python3 /load/sse_probe.py \
+                --base-url "$K6_BASE_URL" \
+                --context /work/bench-context.json \
+                --clients "$clients" \
+                --duration "$duration_secs" \
+                --output "/results/$(basename "$out_file")" &
+    else
+        PYTHONDONTWRITEBYTECODE=1 python3 "$SCRIPT_DIR/sse_probe.py" \
+            --base-url "$EFFECTIVE_HOST_BASE_URL" \
+            --context "$CTX_FILE" \
+            --clients "$clients" \
+            --duration "$duration_secs" \
+            --output "$out_file" &
+    fi
+    SSE_PID=$!
 }
 
 run_chaos_drill() {
@@ -321,13 +660,7 @@ case "$SCENARIO" in
         if [ "$PROFILE" = "workstation" ]; then SSE_CLIENTS=50; fi
         if [ "$PROFILE" = "stress" ]; then SSE_CLIENTS=100; fi
         SSE_DUR=$(PYTHONDONTWRITEBYTECODE=1 python3 -c "import os, re; d=os.environ.get('DURATION','30s'); m=re.match(r'^(\d+)([sm]?)$', d); print(int(m.group(1))*(60 if m.group(2)=='m' else 1) if m else 30)" 2>/dev/null || echo "30")
-        PYTHONDONTWRITEBYTECODE=1 python3 "$SCRIPT_DIR/sse_probe.py" \
-            --base-url "$BASE_URL" \
-            --context "$CTX_FILE" \
-            --clients "$SSE_CLIENTS" \
-            --duration "$SSE_DUR" \
-            --output "${RESULTS_DIR}/${RUN_ID}-sse-probe.json" &
-        SSE_PID=$!
+        start_sse_probe "$SSE_CLIENTS" "$SSE_DUR"
 
         if [ "$CHAOS" != "none" ]; then
             run_chaos_drill "$CHAOS" &
@@ -353,13 +686,7 @@ case "$SCENARIO" in
         if [ "$PROFILE" = "workstation" ]; then SSE_DUR=42; fi
         if [ "$PROFILE" = "stress" ]; then SSE_DUR=56; fi
 
-        PYTHONDONTWRITEBYTECODE=1 python3 "$SCRIPT_DIR/sse_probe.py" \
-            --base-url "$BASE_URL" \
-            --context "$CTX_FILE" \
-            --clients "$SSE_CLIENTS" \
-            --duration "$SSE_DUR" \
-            --output "${RESULTS_DIR}/${RUN_ID}-sse-probe.json" &
-        SSE_PID=$!
+        start_sse_probe "$SSE_CLIENTS" "$SSE_DUR"
 
         if [ "$CHAOS" != "none" ]; then
             run_chaos_drill "$CHAOS" &
@@ -382,7 +709,7 @@ sleep 2
 INV_RC=0
 PYTHONDONTWRITEBYTECODE=1 python3 "$SCRIPT_DIR/verify_invariants.py" \
     --context "$CTX_FILE" \
-    --base-url "$BASE_URL" \
+    --base-url "$EFFECTIVE_HOST_BASE_URL" \
     --runtime "$CTR_RUNTIME" \
     --output "${RESULTS_DIR}/${RUN_ID}-invariants.json" || INV_RC=$?
 
@@ -393,7 +720,9 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$SCRIPT_DIR/collect_report.py" \
     --results-dir "$RESULTS_DIR" \
     --prom-url "$PROM_BASE_URL" \
     --runtime "$CTR_RUNTIME" \
-    --chaos "$CHAOS" || REPORT_RC=$?
+    --chaos "$CHAOS" \
+    --network-mode "$NETWORK_MODE" \
+    --rate-limit-disabled "$DISABLE_RATE_LIMIT" || REPORT_RC=$?
 
 if [ "$CLOSE_AFTER" = true ]; then
     TERM_CODE=$(PYTHONDONTWRITEBYTECODE=1 python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["termCode"])' "$CTX_FILE")

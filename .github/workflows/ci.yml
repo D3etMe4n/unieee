@@ -102,6 +102,7 @@ jobs:
           docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.letsencrypt.yml config --quiet
           docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.cloudflared.yml --profile cf-quick config --quiet
           docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.cloudflared.yml --profile cf-named config --quiet
+          docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.hotpath.yml -f tests/load/compose.bench.yml config --quiet
 
       - name: Verify relative links in README files
         run: |

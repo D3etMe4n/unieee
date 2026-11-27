@@ -1,4 +1,6 @@
-use crate::core::{BootstrapOptions, EngineRuntimeOptions, NodeRole, OidcVerifierConfig};
+use crate::core::{
+    BootstrapOptions, EngineRateLimitConfig, EngineRuntimeOptions, NodeRole, OidcVerifierConfig,
+};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -46,6 +48,14 @@ pub struct EngineConfig {
     pub status_pg_lookup_concurrency: usize,
     pub status_negative_cache_ttl_secs: u64,
     pub drain_timeout_ms: u64,
+    pub rate_limit_enabled: bool,
+    pub rate_limit_write_capacity: u32,
+    pub rate_limit_write_refill_milli_per_sec: u64,
+    pub rate_limit_read_capacity: u32,
+    pub rate_limit_read_refill_milli_per_sec: u64,
+    pub rate_limit_idle_ttl_secs: u64,
+    pub rate_limit_max_entries: usize,
+    pub rate_limit_sweep_interval_secs: u64,
 }
 
 impl EngineConfig {
@@ -202,6 +212,48 @@ impl EngineConfig {
         )?;
         let drain_timeout_ms =
             parse_u64_min(non_empty("DRAIN_TIMEOUT_MS"), "DRAIN_TIMEOUT_MS", 5000, 100)?;
+        let rate_limit_enabled =
+            parse_bool_or(non_empty("RATE_LIMIT_ENABLED"), "RATE_LIMIT_ENABLED", true)?;
+        let rate_limit_write_capacity = parse_u32_min(
+            non_empty("RATE_LIMIT_WRITE_CAPACITY"),
+            "RATE_LIMIT_WRITE_CAPACITY",
+            10,
+            1,
+        )?;
+        let rate_limit_write_refill_milli_per_sec = parse_rate_milli_or(
+            non_empty("RATE_LIMIT_WRITE_REFILL_PER_SEC"),
+            "RATE_LIMIT_WRITE_REFILL_PER_SEC",
+            2_000,
+        )?;
+        let rate_limit_read_capacity = parse_u32_min(
+            non_empty("RATE_LIMIT_READ_CAPACITY"),
+            "RATE_LIMIT_READ_CAPACITY",
+            40,
+            1,
+        )?;
+        let rate_limit_read_refill_milli_per_sec = parse_rate_milli_or(
+            non_empty("RATE_LIMIT_READ_REFILL_PER_SEC"),
+            "RATE_LIMIT_READ_REFILL_PER_SEC",
+            15_000,
+        )?;
+        let rate_limit_idle_ttl_secs = parse_u64_min(
+            non_empty("RATE_LIMIT_IDLE_TTL_SECS"),
+            "RATE_LIMIT_IDLE_TTL_SECS",
+            600,
+            1,
+        )?;
+        let rate_limit_max_entries = parse_usize_min(
+            non_empty("RATE_LIMIT_MAX_ENTRIES"),
+            "RATE_LIMIT_MAX_ENTRIES",
+            131_072,
+            256,
+        )?;
+        let rate_limit_sweep_interval_secs = parse_u64_min(
+            non_empty("RATE_LIMIT_SWEEP_INTERVAL_SECS"),
+            "RATE_LIMIT_SWEEP_INTERVAL_SECS",
+            60,
+            1,
+        )?;
 
         Ok(Self {
             bind_addr,
@@ -234,6 +286,14 @@ impl EngineConfig {
             status_pg_lookup_concurrency,
             status_negative_cache_ttl_secs,
             drain_timeout_ms,
+            rate_limit_enabled,
+            rate_limit_write_capacity,
+            rate_limit_write_refill_milli_per_sec,
+            rate_limit_read_capacity,
+            rate_limit_read_refill_milli_per_sec,
+            rate_limit_idle_ttl_secs,
+            rate_limit_max_entries,
+            rate_limit_sweep_interval_secs,
         })
     }
 
@@ -272,6 +332,19 @@ impl EngineConfig {
             status_negative_cache_ttl: Duration::from_secs(self.status_negative_cache_ttl_secs),
             status_negative_cache_max_entries: 65_536,
             drain_timeout: Duration::from_millis(self.drain_timeout_ms),
+        }
+    }
+
+    #[must_use]
+    pub fn to_rate_limit_config(&self) -> EngineRateLimitConfig {
+        EngineRateLimitConfig {
+            enabled: self.rate_limit_enabled,
+            write_capacity: self.rate_limit_write_capacity,
+            write_refill_milli_per_sec: self.rate_limit_write_refill_milli_per_sec,
+            read_capacity: self.rate_limit_read_capacity,
+            read_refill_milli_per_sec: self.rate_limit_read_refill_milli_per_sec,
+            idle_ttl: Duration::from_secs(self.rate_limit_idle_ttl_secs),
+            max_entries: self.rate_limit_max_entries,
         }
     }
 }
@@ -328,6 +401,58 @@ fn parse_u64_min(
         });
     }
     Ok(val)
+}
+
+fn parse_u32_min(
+    raw: Option<String>,
+    key: &'static str,
+    default: u32,
+    min: u32,
+) -> Result<u32, ConfigError> {
+    let val = match raw {
+        None => default,
+        Some(v) => v.parse::<u32>().map_err(|e| ConfigError::InvalidValue {
+            key,
+            reason: e.to_string(),
+        })?,
+    };
+    if val < min {
+        return Err(ConfigError::InvalidValue {
+            key,
+            reason: format!("must be >= {min}"),
+        });
+    }
+    Ok(val)
+}
+
+fn parse_rate_milli_or(
+    raw: Option<String>,
+    key: &'static str,
+    default_milli: u64,
+) -> Result<u64, ConfigError> {
+    match raw {
+        None => Ok(default_milli),
+        Some(v) => {
+            let parsed = v.parse::<f64>().map_err(|e| ConfigError::InvalidValue {
+                key,
+                reason: e.to_string(),
+            })?;
+            if !parsed.is_finite() || parsed <= 0.0 {
+                return Err(ConfigError::InvalidValue {
+                    key,
+                    reason: "must be finite and > 0".to_owned(),
+                });
+            }
+            let scaled = (parsed * 1000.0).round();
+            if !scaled.is_finite() || scaled > (u64::MAX as f64) {
+                return Err(ConfigError::InvalidValue {
+                    key,
+                    reason: "refill rate overflow".to_owned(),
+                });
+            }
+            Ok((scaled as u64).max(1))
+        }
+    }
 }
 
 fn parse_usize_min(

@@ -133,6 +133,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Seed dataset & JWT pool for unieee k6 benchmarks")
     parser.add_argument("--profile", default="laptop", choices=tuple(PROFILE_DEFAULTS.keys()))
     parser.add_argument("--base-url", default=None)
+    parser.add_argument("--keycloak-admin-url", default=None)
     parser.add_argument("--runtime", default=None, choices=("podman", "docker"))
     parser.add_argument("--students", type=int, default=None)
     parser.add_argument("--hot-sections", type=int, default=None)
@@ -143,7 +144,9 @@ def main() -> int:
 
     env = load_env_defaults()
     https_port = env.get("UNIEEE_HTTPS_PORT", "8443")
+    kc_admin_port = env.get("UNIEEE_KEYCLOAK_ADMIN_PORT", "8180")
     base_url = (args.base_url or f"https://127.0.0.1:{https_port}").rstrip("/")
+    kc_admin_url = (args.keycloak_admin_url or f"http://127.0.0.1:{kc_admin_port}").rstrip("/")
     preset = PROFILE_DEFAULTS[args.profile]
     num_students = args.students or int(env.get("STUDENT_COUNT") or preset["students"])
     num_hot = args.hot_sections or int(env.get("HOT_SECTIONS") or preset["hot_sections"])
@@ -163,7 +166,7 @@ def main() -> int:
         env.get("UNIEEE_OPS_ADMIN_PASSWORD", "Admin@123"),
     )
     kc_admin_token = acquire_admin_cli_token(
-        base_url, env.get("KEYCLOAK_ADMIN_CLIENT_SECRET", "unieee-admin-cli-dev-secret")
+        kc_admin_url, env.get("KEYCLOAK_ADMIN_CLIENT_SECRET", "unieee-admin-cli-dev-secret")
     )
 
     print(
@@ -299,20 +302,20 @@ def main() -> int:
         sub = stu["keycloakSub"]
         http_json(
             "PUT",
-            f"{base_url}/auth/admin/realms/unieee/users/{sub}/reset-password",
+            f"{kc_admin_url}/auth/admin/realms/unieee/users/{sub}/reset-password",
             token=kc_admin_token,
             json_body={"type": "password", "value": student_pass, "temporary": False},
         )
         _, user_repr = http_json(
             "GET",
-            f"{base_url}/auth/admin/realms/unieee/users/{sub}",
+            f"{kc_admin_url}/auth/admin/realms/unieee/users/{sub}",
             token=kc_admin_token,
         )
         if user_repr.get("requiredActions"):
             user_repr["requiredActions"] = []
             http_json(
                 "PUT",
-                f"{base_url}/auth/admin/realms/unieee/users/{sub}",
+                f"{kc_admin_url}/auth/admin/realms/unieee/users/{sub}",
                 token=kc_admin_token,
                 json_body=user_repr,
             )

@@ -228,9 +228,12 @@ services:
       KC_HOSTNAME_STRICT: "false"
       KC_HEALTH_ENABLED: "true"
     command: ["start-dev", "--import-realm"]
+    ports:
+      - "127.0.0.1:${UNIEEE_KEYCLOAK_ADMIN_PORT:-8180}:8080"
     volumes:
       - ./keycloak/realm-unieee.json:/opt/keycloak/data/import/realm-unieee.json:ro
     networks:
+      - edge
       - app
       - data
     healthcheck:

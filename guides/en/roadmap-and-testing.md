@@ -14,8 +14,9 @@ This page provides a high-level overview of **unieee**'s product milestones (`1.
 | **Core Academic Platform & Policy Engine** | Spring Boot 4.1.3 + Java 25 Virtual Threads Modular Monolith (`catalog`, `account`, `registration`), PostgreSQL schema-per-bounded-context (`V001`–`V005`), fail-open Redis Read-Through Cache, credit-weighted GPA, non-seat-reserving wish surveys, multi-wave registration windows, configurable 6-rule Policy Engine with SHA-256 snapshots, and Single-Writer Gate Guard. | **Released (`1.0.0`)** |
 | **Rust Hot Path & Live SSE Updates** | In-memory `enrollment-engine` (`#[repr(align(64))]`, 20-week Bitmask, local JWKS verify, zero-PG disk snapshot recovery, Hot Delta Sync), conflict-free chunked `UNNEST` `enrollment-writer` with crash-safe Kafka `unieee.enrollment.outcomes`, and `sse-gateway` real-time seat/outcome streaming. | **Released (`1.0.0`)** |
 | **Read-Only AI Advisor & Observability** | Spring AI 2.0.3 `ai_advisor` (4 read-only `@Tool` functions, anti-IDOR/prompt-injection guardrails, deterministic Bitmask verification & offline fallback), Micrometer `/actuator/prometheus`, Rust `/metrics`, and auto-provisioned Prometheus + Grafana dashboards. | **Released (`1.0.0`)** |
-| **Verification, E2E & Load Benchmarks** | Tiered JaCoCo & `cargo-llvm-cov` CI guardrails, automated 7-scenario E2E regression suite ([tests/e2e/](../../tests/e2e/run-e2e.sh)), and multi-device `k6` load & chaos failover benchmarks ([tests/load/](../../tests/load/run-benchmarks.sh)). | **Released (`1.0.0`)** |
-| **Future Directions** | Dedicated web frontend portals (Student, Lecturer, Academic Admin), multi-host / external managed cluster deployment profiles, and formal security auditing for production readiness. | **Planned** |
+| **Verification, E2E & Load Benchmarks** | Tiered JaCoCo & `cargo-llvm-cov` CI guardrails, automated 7-scenario E2E regression suite ([tests/e2e/](../../tests/e2e/run-e2e.sh)), and multi-device `k6` load & chaos failover benchmarks ([tests/load/](../../tests/load/run-benchmarks.sh)) supporting both edge `host-tls` and internal `unieee_app` HTTP (`--internal-http`). | **Released (`1.1.0`)** |
+| **Fairness, Rate Limiting & Anti-Bot Readiness** | Per-service identity-aware Token Bucket rate limiters (`core-java`, `enrollment-engine`, `sse-gateway`), RFC 9457 `429`, isolated [compose.bench.yml](../../tests/load/compose.bench.yml) benchmark overlay with auto-restore, and bilingual [Rate Limiting & Anti-Bot Guide](./rate-limiting-and-anti-bot.md). | **Released (`1.1.0`)** |
+| **Future Directions** | Dedicated web frontend portals (Student, Lecturer, Academic Admin), live Cloudflare Turnstile Gate Ticket & adaptive ALTCHA PoW challenge enforcement, multi-host / external managed cluster deployment profiles, and formal security auditing. | **Planned** |
 
 ---
 
@@ -50,17 +51,23 @@ Runs end-to-end against the full Compose stack with Python 3 stdlib ([e2e_suite.
 
 ### 3.2 Multi-Device `k6` Load Benchmarks ([tests/load/run-benchmarks.sh](../../tests/load/run-benchmarks.sh))
 
-Supports hardware-scaled presets (`BENCH_PROFILE=smoke|laptop|workstation|stress`), custom overrides (`VUS`, `DURATION`, `TARGET_RPS`, `HOT_SECTIONS`, `HOT_SECTION_CAP`, `STUDENT_COUNT`), native `k6` or `grafana/k6` container fallback (`--runner local|container`), single-host Nginx rate-limit lift overlay (`--bench-nginx`), optional Prometheus remote-write (`--prometheus-rw`), post-run bitmask + `0|0|0` reconciliation ([verify_invariants.py](../../tests/load/verify_invariants.py)), and Markdown/JSON SLO reports ([collect_report.py](../../tests/load/collect_report.py)):
+Supports hardware-scaled presets (`BENCH_PROFILE=smoke|laptop|workstation|stress`), custom overrides (`VUS`, `DURATION`, `TARGET_RPS`, `HOT_SECTIONS`, `HOT_SECTION_CAP`, `STUDENT_COUNT`), native `k6` or `grafana/k6` container execution (`--runner local|container`), two target network paths (`--network-mode host-tls|internal-http`, or shorthand `--internal-http`), configurable SSE probe placement (`--sse-mode auto|host|internal`), isolated rate-limit lift overlay ([compose.bench.yml](../../tests/load/compose.bench.yml) via `--disable-rate-limit` / backwards-compatible `--bench-nginx` with automatic `EXIT` restoration), optional Prometheus remote-write (`--prometheus-rw`), post-run bitmask + `0|0|0` reconciliation ([verify_invariants.py](../../tests/load/verify_invariants.py)), and Markdown/JSON SLO reports ([collect_report.py](../../tests/load/collect_report.py)):
+
+- **`host-tls` (Default):** Targets `https://127.0.0.1:${UNIEEE_HTTPS_PORT:-8443}` to measure full end-to-end throughput including edge TLS termination.
+- **`--internal-http` (`--network-mode internal-http`):** Attaches both `grafana/k6` and an internal `python:3.12-alpine` `sse_probe.py` container directly to the isolated `unieee_app` container network, targeting Nginx's internal non-TLS listener `http://reverse-proxy:8088` and streaming `k6` remote-write metrics directly to `http://prometheus:9090/api/v1/write` without opening any unencrypted HTTP ports on the host.
 
 ```bash
 # Start core + loopback monitoring (Prometheus :9090 + Grafana :3000)
 ./scripts/unieee.sh up --monitoring
 
-# Full steady-state benchmark suite (Warm Read, Hot Read, Hot Write Contention, Mixed Peak-Hour + SSE probe)
-./tests/load/run-benchmarks.sh --profile laptop --scenario all --bench-nginx --close-after
+# Edge TLS benchmark suite (automatically disables & restores all service + Nginx rate limits)
+./tests/load/run-benchmarks.sh --profile laptop --scenario all --disable-rate-limit --close-after
+
+# Internal HTTP benchmark inside unieee_app (eliminates TLS termination overhead; keeps zero host HTTP ports)
+./tests/load/run-benchmarks.sh --profile laptop --scenario all --internal-http --disable-rate-limit --close-after
 
 # Intentional chaos Active-engine kill drill during Mixed Peak-Hour (verifies standby promote + zero drift)
-./tests/load/run-benchmarks.sh --profile smoke --scenario 04 --chaos engine --bench-nginx --close-after
+./tests/load/run-benchmarks.sh --profile smoke --scenario 04 --chaos engine --disable-rate-limit --close-after
 ```
 
 **Measured `1.0.0` Reference Benchmark Summary (Single-Host Consumer Laptop):**
@@ -88,7 +95,7 @@ Every Pull Request into `dev` or `main` must pass **3 GitHub Actions jobs**:
    - Rejects any tracked secret files (`.env`, `*.pem`, `*.key`, `*.crt`, `*.p12`) or local-only workspace files.
    - Validates shell script syntax (`bash -n` / `sh -n`), including `20-enrollment-healthcheck.sh`, `tests/e2e/run-e2e.sh`, and `tests/load/run-benchmarks.sh` *(without executing `k6` in CI)*.
    - Validates Keycloak realm integrity (`registrationAllowed == false`, `accessTokenLifespan` in `1800..3600s`, all 3 roles, `unieee-first-broker-login-link-only` flow without `idp-create-user-if-unique`, and `UserProfileProvider` declaring admin-only editable `student_id` & `lecturer_id`), Nginx cache lock / read-write split / `:8089 stub_status` / failover config, Grafana JSON dashboards, and `compose.hotpath.yml` (`unieee.enrollment.outcomes`).
-   - Validates all Compose configuration overlays (`compose.base.yml`, `compose.hotpath.yml`, `compose.monitoring.yml` standalone & combined `--profile hot-path`, `compose.letsencrypt.yml`, `compose.cloudflared.yml` quick & named).
+   - Validates all Compose configuration overlays (`compose.base.yml`, `compose.hotpath.yml`, `compose.monitoring.yml` standalone & combined `--profile hot-path`, `compose.letsencrypt.yml`, `compose.cloudflared.yml` quick & named, and `tests/load/compose.bench.yml`).
    - Verifies that all relative links in `README.md` and `README.vi.md` resolve cleanly.
 2. **Spring Boot 4.1.3 Core & Modulith:**
    - Runs `./gradlew check --no-daemon` on Java 25 against real Testcontainers PostgreSQL, enforcing `ModularityVerificationTest` and JaCoCo tiered coverage rules.
