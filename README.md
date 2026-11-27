@@ -78,7 +78,7 @@ Public guides for repository visitors, operators, and contributors live under `g
 | Auth & Edge | Keycloak 26.1 (OIDC / OAuth 2.0 / JWT + link-only brokering), Nginx 1.27 Reverse Proxy |
 | Observability | Prometheus v3.2.1 (remote-write receiver), Grafana 11.5.2 (auto-provisioned dashboards), Micrometer, `metrics-exporter-prometheus`, exporter suite |
 | Container & Ops | Podman Compose (preferred), Docker Compose (fallback), Lifecycle CLI (`scripts/unieee.sh`) |
-| E2E & Benchmarks | Python 3 stdlib 7-scenario E2E suite ([tests/e2e/run-e2e.sh](./tests/e2e/run-e2e.sh)), multi-device `k6` load suite ([tests/load/run-benchmarks.sh](./tests/load/run-benchmarks.sh)) |
+| E2E & Benchmarks | Python 3 stdlib 7-scenario E2E suite ([tests/e2e/run-e2e.sh](./tests/e2e/run-e2e.sh)), full-stack `k6` suite ([tests/load/run-benchmarks.sh](./tests/load/run-benchmarks.sh)), isolated Rust Hot Path suite (`k6` + `oha` + `asyncio` SSE in [tests/load-rust/](./tests/load-rust/README.md)) |
 
 ---
 
@@ -111,7 +111,8 @@ unieee/
 │   └── lib/                     # Helpers (common, runtime, certs, health, lifecycle)
 ├── tests/
 │   ├── e2e/                     # 7-scenario automated E2E & regression suite
-│   └── load/                    # Multi-device, multi-scenario k6 load benchmarks + SLO collector
+│   ├── load/                    # Full-stack k6 load benchmarks + SLO collector
+│   └── load-rust/               # Isolated Rust Hot Path benchmarks (k6 + host oha CLI + asyncio SSE)
 ├── .editorconfig
 ├── .env.example
 ├── .gitignore
@@ -200,14 +201,30 @@ During peak registration windows, [scripts/unieee.sh](./scripts/unieee.sh) orche
 # 4. Close gate, drain Kafka commands+outcomes lag=0, pass 3-way reconciliation, warm final Redis cache & stop hot-path
 ./scripts/unieee.sh close-registration --term 2026-FALL
 
-# 5. Run the automated 7-scenario E2E regression suite or multi-device k6 benchmarks on demand
+# 5. Run the automated 7-scenario E2E regression suite, full-stack k6 benchmarks, or isolated Rust Hot Path benchmarks
 ./tests/e2e/run-e2e.sh
 ./tests/load/run-benchmarks.sh --profile laptop --scenario all --disable-rate-limit --close-after
-# Or run k6 + SSE inside internal container network unieee_app (no TLS overhead):
-./tests/load/run-benchmarks.sh --profile laptop --scenario all --internal-http --disable-rate-limit --close-after
+./tests/load-rust/run-rust-bench.sh --profile laptop
 ```
 
 For full operator and student `curl` walkthroughs, AI Advisor setup, and Active–Standby failover behavior, see [Registration-Season Usage, Operations & Failover](./guides/en/operations-and-hotpath.md).
+
+---
+
+## Isolated Rust Hot Path Benchmark (`tests/load-rust/`)
+
+> [!IMPORTANT]
+> **Isolated Rust Stack Only (Excludes Java / Keycloak / Nginx):**
+> These measurements cover the **isolated Rust Hot Path stack** (`enrollment-engine`, `enrollment-writer`, `sse-gateway`, `PostgreSQL 17 + PgBouncer`, `Kafka 3.9`, `Redis 7.4`, static `jwks-server`) and **do NOT include** Spring Boot `core-java`, Keycloak, or Nginx Reverse Proxy/TLS termination. Host-native CLI scenarios require [`oha`](https://github.com/hatoo/oha) (`cargo install oha`). See [tests/load-rust/README.md](./tests/load-rust/README.md) for prerequisites, scenarios, and presets.
+
+- **Benchmark Environment:** `CPU: AMD Ryzen 5 PRO 5650U (6C/12T)` | `GPU: AMD Radeon Graphics (integrated Vega / Cezanne, unused)` | `RAM: 24 GB` | Single-host Linux (`laptop` profile, `--rate-limit off`).
+- **Host-Native `oha` CLI (`oha 1.17.0`, `c=100`, no Docker):**
+  - `05a-oha-read` (`GET /seats` + `GET /me`): **`64,987.8 req/s`** (`1,300,017` reqs), HTTP `p50=1.41 ms`, `p95=2.81 ms`, `p99=4.33 ms`, `p99.9=8.82 ms`, `0.000%` error.
+  - `05b-oha-write` (`POST /register`): **`66,282.6 req/s`** (`1,325,953` reqs), HTTP `p50=1.36 ms`, `p95=2.87 ms`, `p99=4.40 ms`, `p99.9=7.97 ms`, `0.000%` error.
+- **In-Network `k6` (60 VUs) & Concurrent `asyncio` SSE (`500/500` streams):**
+  - `01-engine-read-rps`: **`25,869.5 req/s`** (`p95=4.92 ms`, `p99=7.81 ms`); `02-engine-write-contention`: **`13,410.3 req/s`** (`p95=13.80 ms`); `04-fullstack-mixed-peak`: **`17,164.2 req/s`** (`p95=8.33 ms`, `p99=14.77 ms`).
+  - Concurrent SSE: **`500/500` streams** (`350` section + `150` personal), `0` drops/errors; `03-sse` delivered `786,677` events (`24,323.6 ev/s`, seat lag `p50=117.3 ms`, `p95=909.3 ms`), `04-sse` delivered `1,189,041` events (`27,676.5 ev/s`).
+- **Internal Service & Correctness Summary:** `enrollment-engine` server-side `p50=0.26 ms` / `p95=0.49 ms` (`83.08 MB` peak RAM); `enrollment-writer` committed `55,185` PostgreSQL events across `795` batches (`0` DLQ); **`0` overbooking**, **`0` 20-week Bitmask conflicts**, **`0` duplicates**, **`0|0|0` reconciliation**, and `RAM == PostgreSQL` (`597 == 597`).
 
 ---
 

@@ -70,21 +70,37 @@ Hỗ trợ các preset cấu hình (`BENCH_PROFILE=smoke|laptop|workstation|stre
 ./tests/load/run-benchmarks.sh --profile smoke --scenario 04 --chaos engine --disable-rate-limit --close-after
 ```
 
-**Kết quả Benchmark Tham khảo Bản `1.0.0` (Chạy Single-Host trên Laptop Cá nhân):**
+### 3.3 Bộ Benchmark Cô lập Cụm Rust Hot Path ([tests/load-rust/](../../tests/load-rust/README.vi.md))
 
-> [!NOTE]
-> **Lưu ý về Môi trường & Phương pháp Đo (Benchmark Disclaimer):**
-> - **Chạy toàn bộ trên một chiếc laptop phổ thông:** Các số liệu dưới đây chỉ mang tính tham khảo, được đo trên một máy laptop Linux cá nhân chạy đồng thời **hơn 20 container** (PostgreSQL, PgBouncer, Redis HA kèm 3 Sentinel, Kafka, Keycloak, Nginx, `core-java`, cụm Rust Hot Path, Prometheus và Grafana) **cùng với chính trình phát tải `k6` trên cùng một máy**.
-> - **Lý do thông lượng đo được ở mức trung bình:** Trong mô hình single-host, **quá trình mã hóa/giải mã TLS của Nginx** và **trình phát tải `k6` chạy chung máy** đã chiếm phần lớn tài nguyên CPU trước khi cụm Rust `enrollment-engine` kịp chạm ngưỡng bão hòa (metrics nội bộ từ Prometheus cho thấy bản thân Rust engine vẫn xử lý ở mức dưới 1 ms ở `p95`, trong khi số liệu phía client chịu ảnh hưởng bởi tranh chấp CPU cùng máy).
-> - **Định hướng đo chuẩn xác hơn trong tương lai:** Để đánh giá đúng giới hạn tải thực tế của hệ thống, bài benchmark cần được tách riêng máy phát tải `k6` sang node độc lập, tách tầng Reverse Proxy / TLS termination ra biên riêng và triển khai các thành phần dữ liệu (PostgreSQL, Kafka, Redis HA) cùng tầng ứng dụng trên cụm nhiều máy chủ chuyên dụng.
+> [!IMPORTANT]
+> **Lưu ý Phạm vi — Chỉ Benchmark Stack Rust Cô lập (Chưa tính Java / Keycloak / Nginx):**
+> Bộ benchmark tại `tests/load-rust/` chỉ đo **riêng cụm dịch vụ Rust Hot Path** (`enrollment-engine`, `enrollment-writer`, `sse-gateway`, `PostgreSQL 17 + PgBouncer`, `Kafka 3.9 KRaft`, `Redis 7.4` và `jwks-server` tĩnh), **không bao gồm** Spring Boot `core-java`, Keycloak hay Nginx Reverse Proxy / TLS termination, và hoàn toàn không chỉnh sửa API gốc của dự án.
 
-- **Bất biến Đúng đắn (Cả Steady-State lẫn Chaos Failover):** **`0`** lớp overbooking (`0%`), **`0`** cặp trùng lịch Bitmask 20 tuần (`0%`), **`0`** trùng môn học `CONFIRMED`, đối soát 3 chiều đạt **`0|0|0`** (`reconcileApiMismatchCount = 0`) và khớp 100% RAM == PostgreSQL trên cả hai node `ACTIVE` & `STANDBY`.
-- **Benchmark Steady-State (Cấu hình `laptop`, 40 VUs):**
-  - `01-warm-read` (`core-java` + Redis): **`5,347.2 RPS`**, `p50 = 6.39 ms`, `p95 = 17.79 ms`, `p99 = 26.20 ms`, `0.000%` 5xx, Nginx cache hit `99.892%` (tỷ lệ Hit Read-Through Cache trên `core-java` `99.336%`).
-  - `02-hot-read` (Rust Standby RAM + `seats_cache`): **`16,978.3 RPS`**, `p50 = 1.79 ms`, `p95 = 4.84 ms`, `p99 = 7.64 ms`, `0.000%` 5xx, Nginx cache hit `99.924%`.
-  - `03-hot-write-contention` (`enrollment-engine` Active + Kafka + Writer): **`7,018.7 RPS`**, `p50 = 4.22 ms`, `p95 = 12.47 ms`, `p99 = 21.24 ms`, `0.009%` 5xx ngoài dự kiến.
-  - `04-mixed-peak-hour` (Đọc + Ghi + AI + SSE): **`7,105.6 RPS`**, `p95 = 17.09 ms`, `p99 = 31.08 ms`, `0.000%` 5xx; 20 client SSE đồng thời nhận `75,125` biến động chỗ trống với độ trễ **`p95 = 263.48 ms`**, **`p99 = 325.92 ms`** (đạt SLO `< 500 ms`).
-- **Diễn tập Chaos Active-Engine Failover (Cấu hình `smoke`, `5,679.7 RPS`):** Standby tự động thăng cấp (`epoch=2`), node chết phục hồi từ snapshot + Kafka gia nhập lại vai trò `STANDBY` (không cướp quyền Active sớm), `0.000%` lỗi ngoài dự kiến (`0.151%` `502/503` trong ~1s chuyển mạch) và đối soát `0|0|0`.
+- **Phụ thuộc cho Kịch bản 05 (CLI trên host):** [`oha`](https://github.com/hatoo/oha) (`cargo install oha`, đã kiểm thử với `oha 1.17.0`) chạy trực tiếp trên máy host (không qua Docker/Podman) trỏ tới `127.0.0.1:18081`.
+- **Môi trường Benchmark Single-Host:**
+  - **CPU:** `AMD Ryzen 5 PRO 5650U` (`6 cores / 12 threads`)
+  - **GPU:** `AMD Radeon Graphics (tích hợp Vega / Cezanne, không tham gia tính toán — tải thuần CPU/I/O)`
+  - **RAM:** `24 GB`
+  - **Mô hình:** Single-host Linux chạy cụm container cô lập song song với `k6`, trình đo `asyncio` SSE và `oha` CLI trên máy host (`--profile laptop`, `--rate-limit off`).
+
+```bash
+# Chạy đầy đủ benchmark Rust cô lập (k6 + 500 SSE đồng thời + oha CLI trực tiếp trên host)
+./tests/load-rust/run-rust-bench.sh --profile laptop
+```
+
+**Kết quả Đo thực tế Cấu hình `laptop` (Cụm Rust Hot Path Cô lập):**
+
+| Công cụ & Kịch bản | Tổng Request / Kết nối | Thông lượng | Độ trễ (`p50 / p95 / p99`) | Lỗi ngoài dự kiến |
+| :--- | ---: | ---: | ---: | ---: |
+| **`oha` Host CLI (`05a-oha-read`, `c=100`)** | `1,300,017` reqs | **`64,987.8 req/s`** | `1.41 / 2.81 / 4.33 ms` *(p99.9: `8.82 ms`)* | `0.000%` |
+| **`oha` Host CLI (`05b-oha-write`, `c=100`)** | `1,325,953` reqs | **`66,282.6 req/s`** | `1.36 / 2.87 / 4.40 ms` *(p99.9: `7.97 ms`)* | `0.000%` |
+| **`k6` Nội bộ (`01-engine-read-rps`, 60 VUs)** | `776,126` reqs | **`25,869.5 req/s`** | `1.71 / 4.92 / 7.81 ms` | `0.000%` |
+| **`k6` Nội bộ (`02-engine-write-contention`, 60 VUs)** | `402,377` reqs | **`13,410.3 req/s`** | `2.28 / 13.80 / 28.44 ms` | `0.000%` |
+| **`k6` Nội bộ (`04-fullstack-mixed-peak`, 60 VUs + SSE)** | `515,002` reqs | **`17,164.2 req/s`** | `2.33 / 8.33 / 14.77 ms` | `0.000%` |
+| **`asyncio` SSE (`03-sse` + churn, `500/500` streams)** | `786,677` events | **`24,323.6 ev/s`** | Seat lag `p50=117.3 ms`, `p95=909.3 ms`; Personal `p95=766.9 ms` | `0` drops / `0` lỗi |
+| **`asyncio` SSE (`04-sse` mixed peak, `500/500` streams)** | `1,189,041` events | **`27,676.5 ev/s`** | Handshake `p95=1.84 ms` *(hàng đợi `json.loads` 1 luồng Python khi CPU bão hòa ở pha hỗn hợp)* | `0` drops / `0` lỗi |
+
+- **Telemetry nội bộ & Bất biến Đúng đắn:** `enrollment-engine` xử lý `4,349,030` request với độ trễ nội bộ **`p50 = 0.26 ms`**, **`p95 = 0.49 ms`**, **`p99 = 5.97 ms`** (`83.08 MB` RAM đỉnh); `enrollment-writer` commit `55,185` event xuống PostgreSQL qua `795` batch (`p50 = 14.86 ms`, `p95 = 47.16 ms`, `0` DLQ); `sse-gateway` giữ `500/500` kết nối đồng thời với `0` `slow_consumer_lagged_events` (`40.07 MB` RAM đỉnh); kiểm chứng sau tải đạt **`0` overbooking**, **`0` trùng lịch Bitmask 20 tuần**, **`0` trùng môn học**, đối soát **`0|0|0`** và khớp `RAM == PostgreSQL` (`597 == 597`).
 
 ---
 
@@ -93,9 +109,9 @@ Hỗ trợ các preset cấu hình (`BENCH_PROFILE=smoke|laptop|workstation|stre
 Mọi Pull Request vào `dev` hoặc `main` đều phải vượt qua **3 job tự động**:
 1. **Infra, Scripts & Guardrails:**
    - Chặn tuyệt đối nếu phát hiện file secret (`.env`, `*.pem`, `*.key`, `*.crt`, `*.p12`) hoặc tệp chỉ lưu cục bộ lọt vào Git.
-   - Kiểm tra syntax toàn bộ script shell (`bash -n` / `sh -n`), bao gồm `20-enrollment-healthcheck.sh`, `tests/e2e/run-e2e.sh` và `tests/load/run-benchmarks.sh` *(tuyệt đối không chạy `k6` trong CI)*.
+   - Kiểm tra syntax toàn bộ script shell (`bash -n` / `sh -n`), bao gồm `20-enrollment-healthcheck.sh`, `tests/e2e/run-e2e.sh`, `tests/load/run-benchmarks.sh` và `tests/load-rust/run-rust-bench.sh` *(tuyệt đối không chạy `k6` hay `oha` trong CI)*, cùng `python3 -m py_compile` cho `tests/load-rust/*.py`.
    - Xác thực realm Keycloak (`registrationAllowed == false`, `accessTokenLifespan` in `1800..3600s`, đủ 3 role, flow `unieee-first-broker-login-link-only` và `UserProfileProvider` khai báo `student_id` & `lecturer_id` chỉ Admin sửa được), cấu hình Nginx (`:8089 /stub_status`, `catalog_cache`, `seats_cache`, `proxy_cache_lock on`, `$enrollment_read_upstream`), file dashboard JSON Grafana và `compose.hotpath.yml` (`unieee.enrollment.outcomes`).
-   - Xác thực toàn bộ tổ hợp Compose (`compose.base.yml`, `compose.hotpath.yml`, `compose.monitoring.yml` độc lập & kèm `--profile hot-path`, `compose.letsencrypt.yml`, `compose.cloudflared.yml` quick & named, và `tests/load/compose.bench.yml`).
+   - Xác thực toàn bộ tổ hợp Compose (`compose.base.yml`, `compose.hotpath.yml`, `compose.monitoring.yml` độc lập & kèm `--profile hot-path`, `compose.letsencrypt.yml`, `compose.cloudflared.yml` quick & named, `tests/load/compose.bench.yml` và `tests/load-rust/compose.rust-bench.yml`).
    - Kiểm tra toàn bộ liên kết tương đối trong `README.md` và `README.vi.md`.
 2. **Spring Boot 4.1.3 Core & Modulith:**
    - Chạy `./gradlew check --no-daemon` trên Java 25 với PostgreSQL Testcontainers thật, cưỡng chế `ModularityVerificationTest` và ngưỡng JaCoCo phân tầng.

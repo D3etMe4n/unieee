@@ -78,7 +78,7 @@ Bộ tài liệu công khai dành cho người xem repository, kỹ sư vận h�
 | Auth & Edge | Keycloak 26.1 (OIDC / OAuth 2.0 / JWT + link-only brokering), Nginx 1.27 Reverse Proxy |
 | Giám sát (Observability) | Prometheus v3.2.1 (remote-write receiver), Grafana 11.5.2 (dashboard tự nạp), Micrometer, `metrics-exporter-prometheus`, bộ exporter |
 | Container & Ops | Podman Compose (ưu tiên), Docker Compose (fallback), Lifecycle CLI (`scripts/unieee.sh`) |
-| E2E & Benchmarks | Bộ E2E 7 kịch bản bằng Python 3 stdlib ([tests/e2e/run-e2e.sh](./tests/e2e/run-e2e.sh)), benchmark `k6` đa thiết bị ([tests/load/run-benchmarks.sh](./tests/load/run-benchmarks.sh)) |
+| E2E & Benchmarks | Bộ E2E 7 kịch bản bằng Python 3 stdlib ([tests/e2e/run-e2e.sh](./tests/e2e/run-e2e.sh)), benchmark toàn stack `k6` ([tests/load/run-benchmarks.sh](./tests/load/run-benchmarks.sh)), bộ benchmark Rust Hot Path cô lập (`k6` + `oha` + `asyncio` SSE tại [tests/load-rust/](./tests/load-rust/README.vi.md)) |
 
 ---
 
@@ -111,7 +111,8 @@ unieee/
 │   └── lib/                     # Helpers (common, runtime, certs, health, lifecycle)
 ├── tests/
 │   ├── e2e/                     # Bộ kiểm thử E2E & Regression 7 kịch bản tự động
-│   └── load/                    # Bộ benchmark chịu tải k6 đa thiết bị, đa kịch bản + báo cáo SLO
+│   ├── load/                    # Bộ benchmark toàn stack k6 đa kịch bản + báo cáo SLO
+│   └── load-rust/               # Bộ benchmark cô lập cụm Rust Hot Path (k6 + oha CLI trên host + asyncio SSE)
 ├── .editorconfig
 ├── .env.example
 ├── .gitignore
@@ -200,14 +201,30 @@ Trong giờ cao điểm, [scripts/unieee.sh](./scripts/unieee.sh) bật/tắt c�
 # 4. Đóng cổng, drain lag=0 cả Kafka commands & outcomes, đối soát 3 chiều 0|0|0, warm-cache cuối kỳ & dừng hot-path
 ./scripts/unieee.sh close-registration --term 2026-FALL
 
-# 5. Chạy chủ động bộ kiểm thử E2E 7 kịch bản hoặc bộ benchmark k6 đa thiết bị
+# 5. Chạy chủ động bộ kiểm thử E2E 7 kịch bản, benchmark toàn stack k6 hoặc benchmark cụm Rust cô lập
 ./tests/e2e/run-e2e.sh
 ./tests/load/run-benchmarks.sh --profile laptop --scenario all --disable-rate-limit --close-after
-# Hoặc chạy k6 + SSE probe qua mạng container nội bộ unieee_app (loại bỏ TLS biên):
-./tests/load/run-benchmarks.sh --profile laptop --scenario all --internal-http --disable-rate-limit --close-after
+./tests/load-rust/run-rust-bench.sh --profile laptop
 ```
 
 Xem đầy đủ hướng dẫn vận hành, ví dụ `curl` cho sinh viên, cấu hình Trợ lý AI và cơ chế Active–Standby failover tại [Hướng dẫn Sử dụng, Vận hành Mùa Đăng ký & Failover](./guides/vi/operations-and-hotpath.md).
+
+---
+
+## Benchmark Cụm Rust Hot Path Cô lập (`tests/load-rust/`)
+
+> [!IMPORTANT]
+> **Chỉ Benchmark Stack Rust Cô lập (Chưa bao gồm Java / Keycloak / Nginx):**
+> Các số liệu dưới đây chỉ đo **riêng cụm Rust Hot Path cô lập** (`enrollment-engine`, `enrollment-writer`, `sse-gateway`, `PostgreSQL 17 + PgBouncer`, `Kafka 3.9`, `Redis 7.4`, `jwks-server` tĩnh) và **chưa tính** Spring Boot `core-java`, Keycloak hay Nginx Reverse Proxy / TLS. Kịch bản chạy trực tiếp trên host yêu cầu công cụ [`oha`](https://github.com/hatoo/oha) (`cargo install oha`). Xem chi tiết cài đặt và kịch bản tại [tests/load-rust/README.vi.md](./tests/load-rust/README.vi.md).
+
+- **Môi trường Benchmark:** `CPU: AMD Ryzen 5 PRO 5650U (6C/12T)` | `GPU: AMD Radeon Graphics (tích hợp Vega / Cezanne, không tham gia xử lý)` | `RAM: 24 GB` | Single-host Linux (cấu hình `laptop`, `--rate-limit off`).
+- **`oha` CLI trực tiếp trên Host (`oha 1.17.0`, `c=100`, không Docker):**
+  - `05a-oha-read` (`GET /seats` + `GET /me`): **`64,987.8 req/s`** (`1,300,017` reqs), HTTP `p50=1.41 ms`, `p95=2.81 ms`, `p99=4.33 ms`, `p99.9=8.82 ms`, `0.000%` lỗi.
+  - `05b-oha-write` (`POST /register`): **`66,282.6 req/s`** (`1,325,953` reqs), HTTP `p50=1.36 ms`, `p95=2.87 ms`, `p99=4.40 ms`, `p99.9=7.97 ms`, `0.000%` lỗi.
+- **`k6` Nội bộ (60 VUs) & SSE Đồng thời (`500/500` kết nối):**
+  - `01-engine-read-rps`: **`25,869.5 req/s`** (`p95=4.92 ms`, `p99=7.81 ms`); `02-engine-write-contention`: **`13,410.3 req/s`** (`p95=13.80 ms`); `04-fullstack-mixed-peak`: **`17,164.2 req/s`** (`p95=8.33 ms`, `p99=14.77 ms`).
+  - Kết nối SSE đồng thời: **`500/500` streams** (`350` lớp + `150` cá nhân), `0` drops/lỗi; `03-sse` nhận `786,677` events (`24,323.6 ev/s`, độ trễ ghế `p50=117.3 ms`, `p95=909.3 ms`), `04-sse` nhận `1,189,041` events (`27,676.5 ev/s`).
+- **Telemetry nội bộ & Bất biến:** `enrollment-engine` xử lý nội bộ `p50=0.26 ms` / `p95=0.49 ms` (`83.08 MB` RAM đỉnh); `enrollment-writer` commit `55,185` event xuống PostgreSQL qua `795` batch (`0` DLQ); **`0` overbooking**, **`0` trùng lịch Bitmask 20 tuần**, **`0` trùng môn**, đối soát **`0|0|0`** và `RAM == PostgreSQL` (`597 == 597`).
 
 ---
 
