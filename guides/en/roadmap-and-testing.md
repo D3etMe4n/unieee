@@ -79,7 +79,6 @@ Supports hardware-scaled presets (`BENCH_PROFILE=smoke|laptop|workstation|stress
 - **Required Dependency for Scenario 05 (Host-Native CLI):** [`oha`](https://github.com/hatoo/oha) (`cargo install oha`, tested on `oha 1.17.0`) runs directly on the host machine (outside Docker/Podman) targeting `127.0.0.1:18081`.
 - **Single-Host Benchmark Environment:**
   - **CPU:** `AMD Ryzen 5 PRO 5650U` (`6 cores / 12 threads`)
-  - **GPU:** `AMD Radeon Graphics (integrated Vega / Cezanne, unused — workload is CPU/I/O-bound)`
   - **RAM:** `24 GB`
   - **Topology:** Single-host Linux running isolated Compose containers alongside `k6`, `asyncio` SSE harness, and host-native `oha` (`--profile laptop`, `--rate-limit off`).
 

@@ -217,7 +217,7 @@ Xem đầy đủ hướng dẫn vận hành, ví dụ `curl` cho sinh viên, c�
 > **Chỉ Benchmark Stack Rust Cô lập (Chưa bao gồm Java / Keycloak / Nginx):**
 > Các số liệu dưới đây chỉ đo **riêng cụm Rust Hot Path cô lập** (`enrollment-engine`, `enrollment-writer`, `sse-gateway`, `PostgreSQL 17 + PgBouncer`, `Kafka 3.9`, `Redis 7.4`, `jwks-server` tĩnh) và **chưa tính** Spring Boot `core-java`, Keycloak hay Nginx Reverse Proxy / TLS. Kịch bản chạy trực tiếp trên host yêu cầu công cụ [`oha`](https://github.com/hatoo/oha) (`cargo install oha`). Xem chi tiết cài đặt và kịch bản tại [tests/load-rust/README.vi.md](./tests/load-rust/README.vi.md).
 
-- **Môi trường Benchmark:** `CPU: AMD Ryzen 5 PRO 5650U (6C/12T)` | `GPU: AMD Radeon Graphics (tích hợp Vega / Cezanne, không tham gia xử lý)` | `RAM: 24 GB` | Single-host Linux (cấu hình `laptop`, `--rate-limit off`).
+- **Môi trường Benchmark:** `CPU: AMD Ryzen 5 PRO 5650U (6C/12T)` | `RAM: 24 GB` | Single-host Linux (cấu hình `laptop`, `--rate-limit off`).
 - **`oha` CLI trực tiếp trên Host (`oha 1.17.0`, `c=100`, không Docker):**
   - `05a-oha-read` (`GET /seats` + `GET /me`): **`64,987.8 req/s`** (`1,300,017` reqs), HTTP `p50=1.41 ms`, `p95=2.81 ms`, `p99=4.33 ms`, `p99.9=8.82 ms`, `0.000%` lỗi.
   - `05b-oha-write` (`POST /register`): **`66,282.6 req/s`** (`1,325,953` reqs), HTTP `p50=1.36 ms`, `p95=2.87 ms`, `p99=4.40 ms`, `p99.9=7.97 ms`, `0.000%` lỗi.

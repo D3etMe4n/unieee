@@ -217,7 +217,7 @@ For full operator and student `curl` walkthroughs, AI Advisor setup, and Activeâ
 > **Isolated Rust Stack Only (Excludes Java / Keycloak / Nginx):**
 > These measurements cover the **isolated Rust Hot Path stack** (`enrollment-engine`, `enrollment-writer`, `sse-gateway`, `PostgreSQL 17 + PgBouncer`, `Kafka 3.9`, `Redis 7.4`, static `jwks-server`) and **do NOT include** Spring Boot `core-java`, Keycloak, or Nginx Reverse Proxy/TLS termination. Host-native CLI scenarios require [`oha`](https://github.com/hatoo/oha) (`cargo install oha`). See [tests/load-rust/README.md](./tests/load-rust/README.md) for prerequisites, scenarios, and presets.
 
-- **Benchmark Environment:** `CPU: AMD Ryzen 5 PRO 5650U (6C/12T)` | `GPU: AMD Radeon Graphics (integrated Vega / Cezanne, unused)` | `RAM: 24 GB` | Single-host Linux (`laptop` profile, `--rate-limit off`).
+- **Benchmark Environment:** `CPU: AMD Ryzen 5 PRO 5650U (6C/12T)` | `RAM: 24 GB` | Single-host Linux (`laptop` profile, `--rate-limit off`).
 - **Host-Native `oha` CLI (`oha 1.17.0`, `c=100`, no Docker):**
   - `05a-oha-read` (`GET /seats` + `GET /me`): **`64,987.8 req/s`** (`1,300,017` reqs), HTTP `p50=1.41 ms`, `p95=2.81 ms`, `p99=4.33 ms`, `p99.9=8.82 ms`, `0.000%` error.
   - `05b-oha-write` (`POST /register`): **`66,282.6 req/s`** (`1,325,953` reqs), HTTP `p50=1.36 ms`, `p95=2.87 ms`, `p99=4.40 ms`, `p99.9=7.97 ms`, `0.000%` error.

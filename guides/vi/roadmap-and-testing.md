@@ -79,7 +79,6 @@ Hỗ trợ các preset cấu hình (`BENCH_PROFILE=smoke|laptop|workstation|stre
 - **Phụ thuộc cho Kịch bản 05 (CLI trên host):** [`oha`](https://github.com/hatoo/oha) (`cargo install oha`, đã kiểm thử với `oha 1.17.0`) chạy trực tiếp trên máy host (không qua Docker/Podman) trỏ tới `127.0.0.1:18081`.
 - **Môi trường Benchmark Single-Host:**
   - **CPU:** `AMD Ryzen 5 PRO 5650U` (`6 cores / 12 threads`)
-  - **GPU:** `AMD Radeon Graphics (tích hợp Vega / Cezanne, không tham gia tính toán — tải thuần CPU/I/O)`
   - **RAM:** `24 GB`
   - **Mô hình:** Single-host Linux chạy cụm container cô lập song song với `k6`, trình đo `asyncio` SSE và `oha` CLI trên máy host (`--profile laptop`, `--rate-limit off`).
 

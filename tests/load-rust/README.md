@@ -85,7 +85,6 @@ Generated Markdown and JSON reports are saved to `tests/load-rust/results/<run-i
 
 - **Scope:** **Isolated Rust Hot Path stack only** (`enrollment-engine`, `enrollment-writer`, `sse-gateway`, `PostgreSQL 17 + PgBouncer`, `Kafka 3.9 KRaft`, `Redis 7.4`, `jwks-server`) — **excludes Spring Boot `core-java`, Keycloak, and Nginx**.
 - **CPU:** `AMD Ryzen 5 PRO 5650U` (`6 cores / 12 threads`)
-- **GPU:** `AMD Radeon Graphics (integrated Vega / Cezanne, unused — workload is CPU/I/O-bound)`
 - **RAM:** `24 GB`
 - **Topology:** Single-host Linux running all containers alongside `k6`, `asyncio` SSE client, and host-native `oha 1.17.0` (`--rate-limit off`).
 
