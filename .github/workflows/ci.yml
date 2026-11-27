@@ -37,8 +37,12 @@ jobs:
 
       - name: Validate shell script syntax
         run: |
-          bash -n scripts/unieee.sh scripts/lib/*.sh tests/e2e/run-e2e.sh tests/load/run-benchmarks.sh
+          bash -n scripts/unieee.sh scripts/lib/*.sh tests/e2e/run-e2e.sh tests/load/run-benchmarks.sh tests/load-rust/run-rust-bench.sh
           sh -n infra/pgbouncer/entrypoint.sh infra/redis/entrypoint-sentinel.sh infra/letsencrypt/entrypoint.sh infra/reverse-proxy/10-detect-resolver.envsh infra/reverse-proxy/20-enrollment-healthcheck.sh
+
+      - name: Validate isolated Rust benchmark Python syntax
+        run: |
+          python3 -m py_compile tests/load-rust/seed_isolated.py tests/load-rust/sse_bench.py tests/load-rust/verify_invariants_isolated.py tests/load-rust/collect_rust_report.py
 
       - name: Validate Keycloak realm & Nginx hardening configuration
         run: |
@@ -103,6 +107,7 @@ jobs:
           docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.cloudflared.yml --profile cf-quick config --quiet
           docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.cloudflared.yml --profile cf-named config --quiet
           docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.hotpath.yml -f tests/load/compose.bench.yml config --quiet
+          docker compose -f tests/load-rust/compose.rust-bench.yml config --quiet
 
       - name: Verify relative links in README files
         run: |

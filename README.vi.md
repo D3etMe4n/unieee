@@ -2,67 +2,37 @@
 
 **Ngôn ngữ:** [English](./README.md) | **Tiếng Việt**
 
-**unieee** là hệ thống quản lý đào tạo và đăng ký tín chỉ đại học được thiết kế cho tải đột biến (*flash crowd*) trong các khung giờ mở cổng đăng ký, sử dụng kiến trúc lai **Hybrid CQRS + Event Sourcing & Modular Monolith**.
+**unieee** là hệ thống quản lý đào tạo và đăng ký tín chỉ đại học được thiết kế cho tải đột biến (*flash crowd*) dựa trên kiến trúc **Hybrid CQRS + Event Sourcing & Modular Monolith**. Xem toàn bộ tài liệu tại [Trung tâm Tài liệu](./guides/README.vi.md).
 
 > [!WARNING]
-> **Lưu ý về Phạm vi Dự án:**
-> Đây là một **dự án cá nhân** phục vụ mục đích nghiên cứu, thiết kế và thử nghiệm kiến trúc hệ thống phân tán/hiệu năng cao. Dự án **chưa được kiểm toán bảo mật (security audit), chưa được kiểm thử đầy đủ cho môi trường vận hành thực tế** và **không khuyến khích triển khai trực tiếp vào production**.
+> **Phạm vi Dự án:** Đây là dự án cá nhân phục vụ nghiên cứu, thiết kế và thử nghiệm kiến trúc hiệu năng cao; chưa được kiểm toán bảo mật và không khuyến khích triển khai trực tiếp vào production.
 
 > [!CAUTION]
-> **Cảnh báo Bảo mật & Thay đổi Secrets trước khi Triển khai:**
-> Repository này được công khai trên GitHub public nên toàn bộ mật khẩu, secret, chứng chỉ dev và tài khoản mẫu trong mã nguồn chỉ nhằm mục đích chạy thử nghiệm cục bộ. Nếu bạn tham khảo hoặc triển khai ở bất kỳ môi trường nào ngoài local dev, **bắt buộc phải thay đổi toàn bộ các secret và thông tin xác thực mặc định** trong các tệp sau:
-> - [.env.example](./.env.example): Sao chép thành `.env` (gitignored) và thay toàn bộ `POSTGRES_PASSWORD`, `REDIS_PASSWORD`, `KEYCLOAK_ADMIN_PASSWORD`, `KEYCLOAK_ADMIN_CLIENT_SECRET`, `INTERNAL_OPS_TOKEN`, `UNIEEE_OPS_ADMIN_PASSWORD`, `GRAFANA_ADMIN_PASSWORD`, `CLOUDFLARE_TUNNEL_TOKEN` và `OPENAI_API_KEY` (nếu bật chế độ LLM ngoài cho `ai_advisor`).
-> - [infra/compose.base.yml](./infra/compose.base.yml) & [infra/compose.monitoring.yml](./infra/compose.monitoring.yml): Chứa giá trị fallback mặc định cho dev khi không truyền biến môi trường.
-> - [infra/compose.letsencrypt.yml](./infra/compose.letsencrypt.yml) & [infra/compose.cloudflared.yml](./infra/compose.cloudflared.yml): Cấu hình ACME Let's Encrypt và Cloudflare Tunnel (`TUNNEL_TOKEN`).
-> - [infra/keycloak/realm-unieee.json](./infra/keycloak/realm-unieee.json): Chứa client secret của `unieee-admin-cli` và mật khẩu tài khoản mẫu (`admin01`, `lecturer01`, `student01`) — cần đổi secret và xóa/thay đổi các tài khoản mẫu trước khi sử dụng.
-> - [scripts/lib/certs.sh](./scripts/lib/certs.sh): Tự động sinh chứng chỉ TLS self-signed cho dev (hoặc nạp cert riêng); cần dùng chứng chỉ hợp lệ từ CA uy tín hoặc Let's Encrypt / Cloudflare Tunnel khi triển khai thực tế.
-
----
-
-## Tài liệu Hướng dẫn
-
-Bộ tài liệu công khai dành cho người xem repository, kỹ sư vận hành và cộng tác viên được đặt trong thư mục `guides/` (hỗ trợ song ngữ **Tiếng Việt** và **English**):
-
-- **[Trung tâm Tài liệu (Tiếng Việt)](./guides/README.vi.md)** | [Public Documentation Hub (English)](./guides/README.md)
-- [Hướng dẫn Khởi chạy & Vận hành Cục bộ](./guides/vi/getting-started.md) — yêu cầu môi trường, dùng `scripts/unieee.sh`, chế độ TLS, lấy JWT Keycloak dev và chạy bộ test/coverage Java + Rust.
-- [Hướng dẫn Sử dụng, Vận hành Mùa Đăng ký & Failover](./guides/vi/operations-and-hotpath.md) — `prepare-registration`, `open-registration` (chuyển đợt 24/7), `close-registration` (drain Kafka & đối soát 3 chiều), Hot Delta Sync, luồng `curl` Hot Path + SSE + Trợ lý AI, cấu hình LLM và Active–Standby failover.
-- [Kiến trúc Hệ thống & Thiết kế CSDL](./guides/vi/architecture.md) — kiến trúc lai Warm/Hot Path, đồ thị 4 Bounded Contexts + `common` (`catalog`, `account`, `registration`, `ai_advisor`), PostgreSQL (`V001`–`V005`), Policy Engine, cụm Rust Hot Path, hệ thống Kafka/Redis và kiến trúc observability.
-- [Hướng dẫn Rate Limiting & Tích hợp Anti-Bot](./guides/vi/rate-limiting-and-anti-bot.md) — Token Bucket rate limiting ở từng service (`student_id` + IP fallback), overlay cô lập benchmark, thiết kế Cloudflare Turnstile Gate Ticket và Proof-of-Work tự host (ALTCHA / Hashcash).
-- [Tài liệu REST API](./guides/vi/api-reference.md) — quy tắc JWT & danh mục công khai, phân quyền RBAC, chuẩn lỗi RFC 9457 thống nhất, toàn bộ API `core-java` (`/api/v1/public/*`, `warm-cache`, `ai_advisor`), Rust `enrollment-engine` & `sse-gateway` và các probe/metrics nội bộ.
-- [Lộ trình Dự án & Chiến lược Kiểm thử](./guides/vi/roadmap-and-testing.md) — lộ trình tổng quan dự án, chính sách coverage phân tầng JaCoCo & `cargo-llvm-cov` (`>= 90%` core, `>= 65%` tầng biên), bộ E2E 7 kịch bản ([run-e2e.sh](./tests/e2e/run-e2e.sh)), benchmark `k6` đa thiết bị ([run-benchmarks.sh](./tests/load/run-benchmarks.sh)) và 3 job CI guardrails.
-- [Tinh chỉnh Keycloak Mùa Đăng ký & Identity Brokering](./infra/keycloak/IDENTITY_BROKERING.md) — refresh jitter (`0.70–0.85`), thuộc tính Declarative User Profile và cấu hình SSO liên kết chỉ đọc với Microsoft Entra ID / Google Workspace.
+> **Cảnh báo Bảo mật:** Mọi mật khẩu, OIDC secret và chứng chỉ self-signed mặc định chỉ dùng cho local dev. Trước khi triển khai ngoài môi trường local, hãy thay toàn bộ secret trong [`.env.example`](./.env.example), [`infra/keycloak/realm-unieee.json`](./infra/keycloak/realm-unieee.json), các tệp compose và thay thế dev cert do [`scripts/lib/certs.sh`](./scripts/lib/certs.sh) sinh ra.
 
 ---
 
 ## Kiến trúc Tổng quan
 
-- **Warm / Cold Path — Spring Boot 4.1.3 Modular Monolith (`services/core-java/` `1.1.0`):**
-  - Tổ chức thành **4 Bounded Contexts** (`catalog`, `account`, `registration`, `ai_advisor`) trên shared kernel `common` (kèm `RedisReadThroughCache` fail-open về PostgreSQL, `UnieeeMetrics` và Token Bucket rate limiting định danh theo user/IP) với đồ thị phụ thuộc tuyến tính 1 chiều (Spring Modulith verify) và phân tách PostgreSQL Schema-per-Bounded-Context (`V001`–`V005`).
-  - Quản lý học kỳ, khoa/ngành/chương trình khung, môn học & tiên quyết DFS, lớp học phần với lịch Bitmask 20 tuần, nhóm API **Danh mục Đọc Công khai** (`/api/v1/public/*` bọc bởi Nginx `proxy_cache_lock on`), **Redis Read-Through Cache** (TTL thích ứng `45s`/`20m` cho thời khóa biểu, `1h` cho quy chế kích hoạt, metadata catalog tĩnh trộn sĩ số live từ Redis; luôn bỏ qua cache cho đối soát, roster và audit log), cấp phát tài khoản Keycloak (gắn `student_id`/`lecturer_id` qua Declarative User Profile của Keycloak 26), GPA trọng số tín chỉ, Admin Override có **Single-Writer Gate Guard** (`409 REGISTRATION_GATE_OPEN` khi `REGISTRATION_OPEN`), khảo sát nguyện vọng không giữ ghế, đợt mở cổng, **Policy Engine đa trường** kèm SHA-256 snapshot exporter (`unieee:cache:policy:{termId}:snapshot`), **làm ấm Redis Read Cache** (`warm-cache`), **Hot Delta Sync** (`unieee.enrollment.deltas` khi cổng đang mở), **Trợ lý AI Xếp lịch Read-Only (`ai_advisor`)** trên Spring AI `2.0.3` (4 `@Tool` chỉ đọc, guardrails chống IDOR/prompt injection, kiểm chứng Bitmask & fallback xác định) và metrics Prometheus **`/actuator/prometheus`**.
-  - Dùng **Java 25 (Virtual Threads)**, **Spring Modulith 2.1.2** (Event Publication Registry + Cleanup Job), **Spring Data JPA**, **Flyway**, **Spring Security** (Keycloak OIDC 1.0 / OAuth 2.0 / JWT), **MapStruct** và **Spring AI 2.0.3**.
-- **Hot Path — Cụm dịch vụ Rust (`services/rust-enrollment/` `1.1.0`):**
-  - Các shared crate (`unieee-domain`, `unieee-events`, `unieee-cacheline`) cung cấp kiểm tra trùng lịch Bitmask `[u128; 20]` `O(1)` (`proptest`-verified), chuẩn lỗi RFC 9457 `ProblemDetail`, schema Kafka (`EnrollmentCommandEvent`, `EnrollmentOutcomeEvent`, `EnrollmentDeltaEvent`, `DeadLetterEvent`) & Redis Pub/Sub có phiên bản, slot căn lề `#[repr(align(64))]` và `ShardedTokenBucket` tốc độ cao.
-  - **Enrollment State-Machine (`enrollment-engine`, Axum 0.8 + Tokio):** Giữ state đăng ký trong RAM (`SectionSeatSlot` + `ShardedMap` theo sinh viên), bảo vệ công bằng theo từng sinh viên qua Token Bucket tách biệt luồng đọc/ghi (`429 RATE_LIMIT_EXCEEDED`), mở 2 endpoint đọc lock-free từ RAM (`/api/v1/enrollments/seats` & `/api/v1/enrollments/me`) bên cạnh `/register`, `/drop`, `/status/{event_id}` và `/metrics` Prometheus, xác thực JWT cục bộ với JWKS singleflight + cache SHA-256, trừ ghế nguyên tử lock-free, đẩy lệnh vào **Kafka (KRaft)**, tiêu thụ kết quả bền vững từ **`unieee.enrollment.outcomes`** trên cả `ACTIVE` & `STANDBY`, gộp `SeatTentativeEvent` (số ghế tuyệt đối) qua Redis pipeline, hỗ trợ RAM-first `RevertEvent` idempotency, Hot Delta Sync, phục hồi không truy vấn PG từ disk snapshot + Kafka replay và Active–Standby failover với `REJOIN_AS_STANDBY_ON_RECOVERY=true` cùng fencing `epoch`.
-  - **Writer / Commit Service (`enrollment-writer`):** Đọc micro-batch từ `unieee.enrollment.commands`, tách xung đột cùng sinh viên/môn thành chunk liên tiếp không xung đột (`split_into_conflict_free_chunks`) để ghi nhanh qua **PostgreSQL** `UNNEST` + Atomic `UPDATE` + `CHECK` constraint + `enrollment_events` (qua **PgBouncer**) với fallback tuần tự chỉ khi cần, pipeline `acks=all` **`EnrollmentOutcomeEvent`** (`try_join_all`) sang **`unieee.enrollment.outcomes`** TRƯỚC khi commit offset Kafka, cập nhật **Redis HA** Read Cache & Pub/Sub cho SSE và xuất `/metrics` Prometheus.
-  - **SSE Live-Update Service (`sse-gateway`, Axum 0.8 + Tokio):** Đẩy biến động chỗ ngồi (`/api/v1/sse/sections`) và kết quả cá nhân (`/api/v1/sse/me`) thời gian thực kèm Token Bucket giới hạn tần suất mở kết nối theo sinh viên/IP, gộp 150ms, jitter `retry`/`maxAge`, heartbeat, thông báo `resync_required` và `/metrics` Prometheus.
-- **Hạ tầng, Giám sát & Bảo mật (`infra/`, `scripts/`):**
-  - Đứng sau **Nginx 1.27 Reverse Proxy** (TLS termination, routing, rate limiting, `proxy_cache_lock on` cho `/api/v1/public/*` và micro-cache `1s` `seats_cache` cho `/api/v1/enrollments/seats`, tách luồng đọc `$enrollment_read_upstream` sang `STANDBY` đang khỏe & giám sát failover Active–Standby qua `/readyz` không tự auto-failback sớm, tắt buffering cho SSE, cùng listener nội bộ `:8089 /stub_status`) và **Keycloak 26.1** (tắt self-registration, `accessTokenLifespan: 1800`, Declarative User Profile, identity brokering dạng link-only).
-  - Overlay giám sát ([infra/compose.monitoring.yml](./infra/compose.monitoring.yml)) bổ sung **Prometheus** (`127.0.0.1:9090`, bật `--web.enable-remote-write-receiver` cho `k6`), **Grafana** (`127.0.0.1:3000`, auto-provision dashboard `Production Overview` & `k6 Load Benchmark`) và các exporter nội bộ (`nginx`, `postgres`, `pgbouncer`, `redis`, `kafka`) mà **không mở port nhạy cảm ra public network**.
-  - Đóng gói bằng **Podman Compose** (mặc định) và **Docker Compose** (fallback), không dùng Kubernetes; hỗ trợ tự động hóa vòng đời qua [scripts/unieee.sh](./scripts/unieee.sh).
+- **Warm / Cold Path — Spring Boot 4.1.3 Modular Monolith (`services/core-java/` `v1.1.0`):**
+  - Tổ chức thành 4 Bounded Contexts (`catalog`, `account`, `registration`, `ai_advisor`) trên shared kernel `common` với cô lập schema PostgreSQL theo ngữ cảnh (`V001`–`V005`).
+  - Quản lý học vụ, khảo sát nguyện vọng, Policy Engine đa trường, cấp tài khoản Keycloak, admin override (khóa ghi khi `REGISTRATION_OPEN`), Redis read-through cache, Hot Delta Sync và Trợ lý AI xếp lịch chỉ đọc (Spring AI).
+- **Hot Path — Cụm dịch vụ Rust (`services/rust-enrollment/` `v1.1.0`):**
+  - `enrollment-engine`: Giữ slot sĩ số trên RAM (`#[repr(align(64))]`) và kiểm tra trùng lịch Bitmask 20 tuần `O(1)`, xác thực JWT cục bộ, rate limiting Token Bucket theo sinh viên, đẩy lệnh sang Kafka và Active–Standby failover với disk snapshot + Kafka replay.
+  - `enrollment-writer`: Gom micro-batch Kafka không xung đột ghi vào PostgreSQL qua PgBouncer (`UNNEST` + `CHECK`), ghi kết quả bền vững (`unieee.enrollment.outcomes`) và cập nhật Redis cache/Pub/Sub.
+  - `sse-gateway`: Phát trực tiếp (SSE fan-out) biến động sĩ số (`/api/v1/sse/sections`) và kết quả cá nhân (`/api/v1/sse/me`).
+- **Dữ liệu, Biên & Vận hành (`infra/`, `scripts/`):**
+  - PostgreSQL 17 (Source of Truth), Apache Kafka 3.9 (KRaft), Redis 7.4 HA (Read Cache & Pub/Sub), Keycloak 26.1 (OIDC/JWT), Nginx 1.27 (TLS, caching, Active–Standby failover), tùy chọn Prometheus + Grafana, điều phối qua [`scripts/unieee.sh`](./scripts/unieee.sh) (Podman/Docker Compose, không dùng Kubernetes).
 
----
-
-## Tổng quan Bản phát hành (`1.1.0`)
-
-**Bản phát hành `1.1.0` (`core-java` `1.1.0`, `rust-enrollment` `1.1.0`)** mở rộng nền tảng `1.0.0` với Token Bucket Rate Limiting định danh theo người dùng/IP ở từng service (`core-java`, `enrollment-engine`, `sse-gateway`) chống bot spam sau NAT trường học, overlay cô lập benchmark (`tests/load/compose.bench.yml` tự động khôi phục khi thoát), chế độ benchmark nội bộ không TLS trên `unieee_app` (`--internal-http`), và tài liệu hướng dẫn tích hợp Anti-Bot (Cloudflare Turnstile & Proof-of-Work tự host) — vẫn bảo toàn tuyệt đối **`0` overbooking, `0` trùng lịch và `0|0|0` đối soát** trên cả steady-state lẫn chaos failover drill. Xem chi tiết tại [Lộ trình Dự án & Chiến lược Kiểm thử](./guides/vi/roadmap-and-testing.md).
+Xem sơ đồ kiến trúc, ranh giới module và thiết kế CSDL chi tiết tại [Kiến trúc Hệ thống & Thiết kế CSDL](./guides/vi/architecture.md).
 
 ---
 
 ## Nhóm Người dùng Chính
 
-1. **Sinh viên (`STUDENT`):** Khảo sát nguyện vọng (không giữ ghế), xem danh mục lớp mở công khai, hỏi Trợ lý AI xếp lịch Read-Only, đăng ký/hủy/học lại/cải thiện môn học trên Hot Path, theo dõi sĩ số & kết quả real-time qua SSE và xem thời khóa biểu.
-2. **Giảng viên (`LECTURER`):** Xem lớp học phần được phân công, lịch giảng dạy và danh sách sinh viên đã đăng ký.
-3. **Phòng Đào tạo (`ACADEMIC_ADMIN`):** Quản lý toàn bộ dữ liệu đào tạo, cấp tài khoản sinh viên/giảng viên, tạo & tổng hợp khảo sát, cấu hình quy chế đa trường, mở/đóng cổng theo đợt, vận hành/đối soát Hot Path và can thiệp trực tiếp khi cổng không mở.
+- **Sinh viên (`STUDENT`):** Khảo sát nguyện vọng (không giữ ghế), xem danh mục mở công khai, hỏi Trợ lý AI chỉ đọc, đăng ký/hủy môn trên Hot Path, theo dõi SSE và thời khóa biểu.
+- **Giảng viên (`LECTURER`):** Xem lớp học phần được phân công, lịch giảng dạy và danh sách sinh viên đăng ký.
+- **Phòng Đào tạo (`ACADEMIC_ADMIN`):** Quản lý dữ liệu đào tạo, cấp tài khoản, cấu hình quy chế/khảo sát, điều phối mở/đóng cổng, đối soát và can thiệp đăng ký khi cổng đóng.
 
 ---
 
@@ -70,15 +40,62 @@ Bộ tài liệu công khai dành cho người xem repository, kỹ sư vận h�
 
 | Thành phần | Công nghệ |
 | :--- | :--- |
-| Core Monolith & AI | Java 25 (Virtual Threads), Spring Boot 4.1.3, Spring Modulith 2.1.2, Spring AI 2.0.3, Gradle Kotlin DSL, JPA, Flyway, MapStruct |
+| Core Monolith & AI | Java 25 (Virtual Threads), Spring Boot 4.1.3, Spring Modulith 2.1.2, Spring AI 2.0.3, JPA, Flyway, MapStruct |
 | Hot Path Services | Rust, Axum 0.8, Tokio, SQLx 0.8, `rdkafka` (`enrollment-engine`, `enrollment-writer`, `sse-gateway`) |
-| Database & Pooling | PostgreSQL 17 (`CHECK` + Event Sourcing), PgBouncer |
+| Database & Pooling | PostgreSQL 17 (`CHECK` constraints + Event Sourcing), PgBouncer |
 | Cache & Pub/Sub | Redis 7.4 HA (1 Master + 2 Replicas + 3 Sentinels, AOF/RDB) |
-| Event Streaming | Apache Kafka 3.9 (KRaft mode) |
-| Auth & Edge | Keycloak 26.1 (OIDC / OAuth 2.0 / JWT + link-only brokering), Nginx 1.27 Reverse Proxy |
-| Giám sát (Observability) | Prometheus v3.2.1 (remote-write receiver), Grafana 11.5.2 (dashboard tự nạp), Micrometer, `metrics-exporter-prometheus`, bộ exporter |
-| Container & Ops | Podman Compose (ưu tiên), Docker Compose (fallback), Lifecycle CLI (`scripts/unieee.sh`) |
-| E2E & Benchmarks | Bộ E2E 7 kịch bản bằng Python 3 stdlib ([tests/e2e/run-e2e.sh](./tests/e2e/run-e2e.sh)), benchmark `k6` đa thiết bị ([tests/load/run-benchmarks.sh](./tests/load/run-benchmarks.sh)) |
+| Event Streaming | Apache Kafka 3.9 (KRaft) |
+| Auth & Edge | Keycloak 26.1 (OIDC / OAuth 2.0 / JWT), Nginx 1.27 Reverse Proxy |
+| Giám sát | Prometheus v3.2.1, Grafana 11.5.2, Micrometer, `metrics-exporter-prometheus` |
+| Container & Kiểm thử | Podman Compose (ưu tiên) / Docker Compose, [`scripts/unieee.sh`](./scripts/unieee.sh), Python E2E, `k6`, `oha` + `asyncio` SSE |
+
+---
+
+## Khởi chạy Nhanh & Vòng đời Mùa Đăng ký
+
+[`scripts/unieee.sh`](./scripts/unieee.sh) hỗ trợ 3 chế độ Edge/TLS (`custom` mặc định, `letsencrypt`, `cloudflared`):
+
+| Chế độ (`--tls-mode`) | Khi nào dùng | Lệnh nhanh |
+| :--- | :--- | :--- |
+| **`custom`** *(mặc định)* | Dev local (tự sinh self-signed) hoặc nạp chứng chỉ PEM | `./scripts/unieee.sh up` |
+| **`letsencrypt`** | Server public có domain trỏ thẳng và mở cổng `80`/`443` | `./scripts/unieee.sh up --tls-mode letsencrypt --domain reg.example.edu.vn --email admin@example.edu.vn` |
+| **`cloudflared`** | Không muốn mở inbound port trên firewall/router | `./scripts/unieee.sh up --tls-mode cloudflared` |
+
+Xem [Hướng dẫn Khởi chạy & Vận hành Cục bộ](./guides/vi/getting-started.md) để nạp chứng chỉ PEM riêng, cấp Let's Encrypt chính thức và cấu hình Cloudflare Named Tunnel.
+
+```bash
+./scripts/unieee.sh up --monitoring                                  # Bật core + Prometheus (:9090) & Grafana (:3000) nội bộ
+./scripts/unieee.sh prepare-registration --term 2026-FALL            # Xuất Policy Snapshot, bật hot-path, làm ấm Redis, kiểm tra checksum
+./scripts/unieee.sh open-registration --term 2026-FALL --window <UUID> # Mở đợt đăng ký (chạy lại với UUID mới để chuyển đợt 24/7)
+./scripts/unieee.sh health                                           # Kiểm tra Redis Sentinel, Kafka, core-java & Rust /readyz
+./scripts/unieee.sh close-registration --term 2026-FALL              # Drain Kafka, đối soát 0|0|0, warm-cache & tắt hot-path
+
+./tests/e2e/run-e2e.sh                                               # Bộ kiểm thử hồi quy E2E 7 kịch bản
+./tests/load/run-benchmarks.sh --profile laptop --scenario all --disable-rate-limit --close-after
+./tests/load-rust/run-rust-bench.sh --profile laptop                 # Bộ benchmark Rust Hot Path cô lập (k6 + oha trên host + asyncio SSE)
+```
+
+Xem hướng dẫn `curl` cho sinh viên, cấu hình LLM cho Trợ lý AI và kiểm thử failover tại [Vận hành Mùa Đăng ký & Failover](./guides/vi/operations-and-hotpath.md).
+
+---
+
+## Benchmark Cụm Rust Hot Path Cô lập (`tests/load-rust/`)
+
+> [!IMPORTANT]
+> **Chỉ Benchmark Stack Rust Cô lập:** Các số liệu dưới đây chỉ đo **riêng cụm Rust Hot Path** (`enrollment-engine`, `enrollment-writer`, `sse-gateway`, PostgreSQL 17 + PgBouncer, Kafka 3.9, Redis 7.4, `jwks-server` tĩnh) và **chưa bao gồm** Java `core-java`, Keycloak hay Nginx/TLS. Kịch bản chạy trên host yêu cầu [`oha`](https://github.com/hatoo/oha) (`cargo install oha`). Chi tiết tại [`tests/load-rust/README.vi.md`](./tests/load-rust/README.vi.md).
+
+- **Môi trường Benchmark:** `CPU: AMD Ryzen 5 PRO 5650U (6C/12T)` | `RAM: 24 GB` | Single-host Linux (cấu hình `laptop`, `--rate-limit off`).
+
+| Kịch bản / Công cụ | Thông lượng | Độ trễ / Giao nhận | Lỗi |
+| :--- | :--- | :--- | :--- |
+| `05a-oha-read` (host `oha 1.17.0`, `c=100`) | **64,987.8 req/s** (1,300,017 reqs) | `p50=1.41 ms`, `p95=2.81 ms`, `p99=4.33 ms` | `0.000%` |
+| `05b-oha-write` (host `oha 1.17.0`, `c=100`) | **66,282.6 req/s** (1,325,953 reqs) | `p50=1.36 ms`, `p95=2.87 ms`, `p99=4.40 ms` | `0.000%` |
+| `01-engine-read-rps` (`k6`, 60 VUs) | **25,869.5 req/s** | `p95=4.92 ms`, `p99=7.81 ms` | `0.000%` |
+| `02-engine-write-contention` (`k6`, 60 VUs) | **13,410.3 req/s** | `p95=13.80 ms` | `0.000%` |
+| `04-fullstack-mixed-peak` (`k6`, 60 VUs + SSE) | **17,164.2 req/s** | `p95=8.33 ms`, `p99=14.77 ms` | `0.000%` |
+| `03` / `04` SSE (`asyncio`, 500 streams) | **24,323.6** / **27,676.5 ev/s** | `500/500` streams (`350` lớp + `150` cá nhân) | `0` drop |
+
+- **Telemetry & Bất biến:** `enrollment-engine` xử lý nội bộ `p50=0.26 ms` / `p95=0.49 ms` (`83.08 MB` RAM đỉnh); `enrollment-writer` commit `55,185` event xuống PostgreSQL qua `795` batch (`0` DLQ); **`0` overbooking**, **`0` trùng lịch Bitmask 20 tuần**, **`0` trùng môn**, đối soát **`0|0|0`** và `RAM == PG` (`597 == 597`).
 
 ---
 
@@ -86,140 +103,35 @@ Bộ tài liệu công khai dành cho người xem repository, kỹ sư vận h�
 
 ```text
 unieee/
-├── guides/                      # Tài liệu hướng dẫn công khai song ngữ (EN & VI)
-│   ├── README.md                # Trung tâm tài liệu Tiếng Anh
-│   ├── README.vi.md             # Trung tâm tài liệu Tiếng Việt
-│   ├── en/                      # Tài liệu Tiếng Anh (cài đặt, vận hành, kiến trúc, API, lộ trình)
-│   └── vi/                      # Tài liệu Tiếng Việt
+├── guides/                  # Tài liệu công khai song ngữ (EN & VI)
 ├── services/
-│   ├── core-java/               # Spring Boot 4.1.3 Modular Monolith v1.1.0
-│   └── rust-enrollment/         # Rust Cargo Workspace v1.1.0 (crates/ + services/)
-├── infra/
-│   ├── compose.base.yml         # Stack cơ bản (core profile)
-│   ├── compose.hotpath.yml      # Stack đăng ký hiệu năng cao (hot-path)
-│   ├── compose.monitoring.yml   # Prometheus, Grafana & exporter nội bộ
-│   ├── compose.letsencrypt.yml  # Overlay tự động cấp/gia hạn Let's Encrypt
-│   ├── compose.cloudflared.yml  # Overlay Cloudflare Tunnel (Quick & Named)
-│   ├── monitoring/              # Cấu hình scrape Prometheus + provisioning & dashboard Grafana
-│   ├── letsencrypt/             # Entrypoint Certbot ACME HTTP-01
-│   ├── reverse-proxy/           # TLS, routing, rate limit, catalog cache lock, failover
-│   ├── keycloak/                # Realm, User Profile, roles, OIDC clients, hướng dẫn brokering
-│   ├── pgbouncer/               # Transaction pooling config
-│   └── redis/                   # Master-Replica & Sentinel configs
-├── scripts/
-│   ├── unieee.sh                # CLI điều khiển vòng đời, TLS & monitoring
-│   └── lib/                     # Helpers (common, runtime, certs, health, lifecycle)
-├── tests/
-│   ├── e2e/                     # Bộ kiểm thử E2E & Regression 7 kịch bản tự động
-│   └── load/                    # Bộ benchmark chịu tải k6 đa thiết bị, đa kịch bản + báo cáo SLO
-├── .editorconfig
-├── .env.example
-├── .gitignore
-├── LICENSE
-├── README.md
-└── README.vi.md
+│   ├── core-java/           # Spring Boot 4.1.3 Modular Monolith v1.1.0
+│   └── rust-enrollment/     # Rust Cargo Workspace v1.1.0 (crates/ + services/)
+├── infra/                   # Compose stacks, Nginx, Keycloak, PgBouncer, Redis HA, monitoring
+├── scripts/                 # CLI điều khiển vòng đời unieee.sh và helpers
+└── tests/
+    ├── e2e/                 # Bộ kiểm thử E2E & regression 7 kịch bản
+    ├── load/                # Bộ benchmark toàn stack k6
+    └── load-rust/           # Bộ benchmark Rust Hot Path cô lập (k6 + host oha + asyncio SSE)
 ```
 
 ---
 
-## Cấu hình Khởi động & Chế độ Reverse Proxy / TLS
+## Tài liệu Hướng dẫn
 
-Script [scripts/unieee.sh](./scripts/unieee.sh) hỗ trợ chuyển đổi dễ dàng giữa **3 chế độ Edge / TLS** bằng cờ `--tls-mode` (hoặc cấu hình cố định biến `UNIEEE_TLS_MODE` trong `.env` sao chép từ [.env.example](./.env.example)):
-
-| Chế độ (`--tls-mode`) | Khi nào dùng | Yêu cầu | Lệnh chuyển nhanh |
-| :--- | :--- | :--- | :--- |
-| **`custom`** *(mặc định)* | Dev local hoặc tự nạp cặp chứng chỉ có sẵn | Không cần domain (tự sinh self-signed) hoặc truyền `--cert` & `--key` | `./scripts/unieee.sh up` |
-| **`letsencrypt`** | Server có IP public & tên miền trỏ thẳng vào Reverse Proxy | Domain thật trỏ về máy chủ, mở cổng `80`/`443` cho ACME HTTP-01 | `./scripts/unieee.sh up --tls-mode letsencrypt --domain reg.example.edu.vn --email admin@example.edu.vn` |
-| **`cloudflared`** | Không muốn mở port trực tiếp trên router/firewall hoặc dùng Cloudflare Edge | Ra ngoài Internet được qua outbound HTTPS | `./scripts/unieee.sh up --tls-mode cloudflared` |
-
-### 1. Tự nạp chứng chỉ hoặc dùng Self-signed (`custom`)
-```bash
-# Mặc định dev local (tự sinh chứng chỉ self-signed trong infra/reverse-proxy/certs/)
-./scripts/unieee.sh up
-
-# Tự nạp chứng chỉ PEM có sẵn (script tự kiểm tra khớp public key giữa cert & key)
-./scripts/unieee.sh up --tls-mode custom \
-  --cert /path/to/fullchain.pem \
-  --key /path/to/privkey.pem
-```
-
-### 2. Tự động đăng ký & gia hạn Let's Encrypt (`letsencrypt`)
-```bash
-# Thử nghiệm với Let's Encrypt Staging CA (mặc định --staging)
-./scripts/unieee.sh up --tls-mode letsencrypt \
-  --domain reg.example.edu.vn \
-  --email admin@example.edu.vn
-
-# Cấp chứng chỉ chính thức (Production CA)
-./scripts/unieee.sh up --tls-mode letsencrypt \
-  --domain reg.example.edu.vn \
-  --email admin@example.edu.vn \
-  --no-staging
-
-# Gia hạn thủ công và reload Nginx không downtime (tự động chạy mỗi 12h trong container)
-./scripts/unieee.sh tls-renew
-```
-
-### 3. Triển khai qua Cloudflare Tunnel (`cloudflared`)
-Nginx lắng nghe cổng nội bộ `8088` (không mở port tunnel ra host) để `cloudflared` chuyển tiếp an toàn với đúng header `X-Forwarded-Proto: https` và `X-Forwarded-Port: 443`:
-- **Thử nghiệm nhanh không cần tên miền (Quick Tunnel `*.trycloudflare.com`):**
-  ```bash
-  ./scripts/unieee.sh up --tls-mode cloudflared
-  ./scripts/unieee.sh logs cloudflared-quick
-  ```
-- **Dùng tên miền riêng (Named Tunnel):**
-  1. Tạo Tunnel trong Cloudflare Zero Trust Dashboard, cấu hình **Public Hostname** (ví dụ `reg.example.edu.vn`) với Service Type `HTTP` trỏ tới `reverse-proxy:8088`.
-  2. Chạy kèm token và tên miền riêng:
-     ```bash
-     ./scripts/unieee.sh up --tls-mode cloudflared \
-       --cf-token "<CLOUDFLARE_TUNNEL_TOKEN>" \
-       --domain reg.example.edu.vn
-     ```
-
-> Khi đang chạy một chế độ, bạn có thể chạy lại `./scripts/unieee.sh up --tls-mode <chế_độ_khác>` để tự động dọn container chế độ cũ và chuyển sang chế độ mới mà không mất dữ liệu database.
+- **[Trung tâm Tài liệu (VI)](./guides/README.vi.md)** | [Documentation Hub (EN)](./guides/README.md)
+- [Khởi chạy & Vận hành Cục bộ](./guides/vi/getting-started.md) — yêu cầu môi trường, `scripts/unieee.sh`, chế độ TLS và bộ test/coverage.
+- [Vận hành Mùa Đăng ký & Failover](./guides/vi/operations-and-hotpath.md) — chu kỳ mở/đóng cổng, Hot Delta Sync, `curl`, LLM và failover.
+- [Kiến trúc Hệ thống & Thiết kế CSDL](./guides/vi/architecture.md) — Bounded Contexts, PostgreSQL (`V001`–`V005`), cụm Rust, Kafka/Redis, giám sát.
+- [Rate Limiting & Anti-Bot](./guides/vi/rate-limiting-and-anti-bot.md) — Token Bucket theo danh tính, Cloudflare Turnstile và ALTCHA / Hashcash PoW.
+- [Tài liệu REST API](./guides/vi/api-reference.md) — OIDC/JWT, lỗi RFC 9457, endpoints Warm/Hot/SSE và metrics probes.
+- [Lộ trình & Chiến lược Kiểm thử](./guides/vi/roadmap-and-testing.md) — lộ trình, coverage phân tầng (`>= 90%` / `>= 65%`), E2E, benchmark & CI.
+- [Tinh chỉnh Keycloak & Identity Brokering](./infra/keycloak/IDENTITY_BROKERING.md) — token jitter, Declarative User Profile và SSO liên kết chỉ đọc.
 
 ---
 
-## Tham khảo Nhanh Vòng đời Mùa Đăng ký
+## Đóng góp & Giấy phép
 
-Trong giờ cao điểm, [scripts/unieee.sh](./scripts/unieee.sh) bật/tắt cụm Hot Path theo chu kỳ xung quanh stack `core` chạy 24/7:
-
-```bash
-# 0. Tùy chọn: bật kèm Prometheus (127.0.0.1:9090) & Grafana (127.0.0.1:3000)
-./scripts/unieee.sh up --monitoring
-
-# 1. Chốt học kỳ, xuất Policy Snapshot, bật hot-path, làm ấm Redis cache & đối chiếu checksum RAM == PostgreSQL
-./scripts/unieee.sh prepare-registration --term 2026-FALL
-
-# 2. Mở cổng cho một đợt đăng ký (chạy lại với --window UUID mới để chuyển đợt 24/7 không cần restart)
-./scripts/unieee.sh open-registration --term 2026-FALL --window <WINDOW_UUID>
-
-# 3. Kiểm tra health nhận biết Sentinel master, Kafka topics, core-java, Rust /readyz & monitoring exporters
-./scripts/unieee.sh health
-
-# 4. Đóng cổng, drain lag=0 cả Kafka commands & outcomes, đối soát 3 chiều 0|0|0, warm-cache cuối kỳ & dừng hot-path
-./scripts/unieee.sh close-registration --term 2026-FALL
-
-# 5. Chạy chủ động bộ kiểm thử E2E 7 kịch bản hoặc bộ benchmark k6 đa thiết bị
-./tests/e2e/run-e2e.sh
-./tests/load/run-benchmarks.sh --profile laptop --scenario all --disable-rate-limit --close-after
-# Hoặc chạy k6 + SSE probe qua mạng container nội bộ unieee_app (loại bỏ TLS biên):
-./tests/load/run-benchmarks.sh --profile laptop --scenario all --internal-http --disable-rate-limit --close-after
-```
-
-Xem đầy đủ hướng dẫn vận hành, ví dụ `curl` cho sinh viên, cấu hình Trợ lý AI và cơ chế Active–Standby failover tại [Hướng dẫn Sử dụng, Vận hành Mùa Đăng ký & Failover](./guides/vi/operations-and-hotpath.md).
-
----
-
-## Quy trình Đóng góp (Git Workflow)
-
-1. Luôn bắt đầu từ nhánh `dev` mới nhất: `git checkout dev && git pull`.
-2. Tạo nhánh riêng theo quy ước `feat/<ten-tinh-nang>`, `fix/<ten-loi>` hoặc `docs/<chu-de>`.
-3. Thực hiện các **atomic commits** theo chuẩn **Conventional Commits** (`feat`, `fix`, `perf`, `refactor`, `test`, `chore`, `docs`).
-4. Khi hoàn thành thay đổi và pass toàn bộ kiểm thử, mở **Pull Request vào `dev`** để review; **không tự duyệt hoặc tự merge PR** trước khi được chấp thuận.
-
----
-
-## Giấy phép
+Tạo nhánh từ `dev` mới nhất (`feat/*`, `fix/*`, `docs/*`), chia **Conventional Commits** gọn gàng, kiểm tra test/link trước khi mở **Pull Request vào `dev`** (không tự duyệt hoặc tự merge PR).
 
 Phát hành theo [LICENSE](./LICENSE).

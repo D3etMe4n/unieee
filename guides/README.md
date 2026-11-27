@@ -20,7 +20,7 @@ Welcome to the public reader documentation for **unieee** — a university acade
 | [System Architecture & Database Design](./en/architecture.md) | Engineers & architects | Hybrid Warm/Hot Path architecture, 4-Bounded-Context Spring Modulith DAG (including `ai_advisor`), PostgreSQL schemas (`V001`–`V005`), Policy Engine, Rust Hot Path cluster, and Kafka/Redis event backbone. |
 | [Rate Limiting & Anti-Bot Architecture](./en/rate-limiting-and-anti-bot.md) | Architects & security/ops | Per-service Token Bucket rate limiting (`student_id` + IP fallback), RFC 9457 `429`, isolated benchmark overlay, Cloudflare Turnstile Gate Ticket integration, and self-hosted Proof-of-Work (ALTCHA / Hashcash). |
 | [REST API Reference](./en/api-reference.md) | Frontend/API consumers & QA | JWT & public catalog endpoints, RBAC roles, unified RFC 9457 Problem Details (including `429 RATE_LIMIT_EXCEEDED`), all `core-java` APIs, Rust `enrollment-engine` & `sse-gateway` APIs, and internal probes. |
-| [Project Roadmap & Testing](./en/roadmap-and-testing.md) | Contributors & reviewers | High-level project roadmap, tiered JaCoCo & `cargo-llvm-cov` coverage policy (`>= 90%` core, `>= 65%` edge), 7-scenario E2E suite, `k6` benchmarks (`host-tls` & `--internal-http`), and CI guardrails. |
+| [Project Roadmap & Testing](./en/roadmap-and-testing.md) | Contributors & reviewers | High-level project roadmap, tiered JaCoCo & `cargo-llvm-cov` coverage policy (`>= 90%` core, `>= 65%` edge), 7-scenario E2E suite, full-stack `k6` & isolated Rust (`k6` + `oha` + `asyncio` SSE) benchmarks, and CI guardrails. |
 
 ---
 
