@@ -2,6 +2,8 @@ pub mod dto;
 pub mod error;
 pub mod handlers;
 
+use crate::metrics::{http_metrics_middleware, metrics_handler};
+use axum::middleware;
 use axum::routing::{get, post};
 use axum::Router;
 use handlers::{
@@ -11,9 +13,11 @@ use handlers::{
 };
 
 pub fn build_router(state: AppState) -> Router {
+    let _ = crate::metrics::init_prometheus_recorder();
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics_handler))
         .route("/api/v1/enrollments/register", post(register_handler))
         .route("/api/v1/enrollments/drop", post(drop_handler))
         .route("/api/v1/enrollments/seats", get(get_seats_handler))
@@ -26,5 +30,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/internal/preload-summary", get(preload_summary_handler))
         .fallback(fallback_not_found)
         .method_not_allowed_fallback(fallback_method_not_allowed)
+        .layer(middleware::from_fn(http_metrics_middleware))
         .with_state(state)
 }

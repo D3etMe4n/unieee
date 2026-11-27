@@ -26,6 +26,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = SseConfig::from_env().context("failed to load SseConfig")?;
+    let _ = sse_gateway::metrics::init_prometheus_recorder();
     let redis_backend = connect_redis_backend(&cfg).map_err(anyhow::Error::msg)?;
     let jwks_fetcher = Arc::new(
         ReqwestJwksFetcher::new(cfg.oidc_jwks_uri.clone(), Duration::from_secs(5))

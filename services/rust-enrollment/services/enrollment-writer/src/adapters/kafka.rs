@@ -4,6 +4,7 @@ use crate::core::{
 };
 use async_trait::async_trait;
 use chrono::Utc;
+use futures_util::future::try_join_all;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::Message;
@@ -38,7 +39,8 @@ pub fn build_dlq_producer_config(brokers: &str) -> ClientConfig {
     let mut cfg = ClientConfig::new();
     cfg.set("bootstrap.servers", brokers)
         .set("acks", "all")
-        .set("message.timeout.ms", "3000")
+        .set("linger.ms", "5")
+        .set("message.timeout.ms", "10000")
         .set("enable.idempotence", "true");
     cfg
 }
@@ -83,16 +85,23 @@ pub fn encode_outcome_payload(ev: &EnrollmentOutcomeEvent) -> Result<(String, St
 #[async_trait]
 impl OutcomePublisher for RdkafkaDlqPublisher {
     async fn publish_outcomes(&self, events: &[EnrollmentOutcomeEvent]) -> Result<(), String> {
+        let mut encoded = Vec::with_capacity(events.len());
         for ev in events {
-            let (key, payload) = encode_outcome_payload(ev)?;
-            let record = FutureRecord::to(KAFKA_TOPIC_ENROLLMENT_OUTCOMES)
-                .payload(&payload)
-                .key(&key);
-            self.producer
-                .send(record, Duration::from_secs(3))
-                .await
-                .map_err(|(err, _)| format!("Kafka outcome send error: {err}"))?;
+            encoded.push(encode_outcome_payload(ev)?);
         }
+        let sends = encoded.iter().map(|(key, payload)| {
+            let record = FutureRecord::to(KAFKA_TOPIC_ENROLLMENT_OUTCOMES)
+                .payload(payload.as_str())
+                .key(key.as_str());
+            async move {
+                self.producer
+                    .send(record, Duration::from_secs(10))
+                    .await
+                    .map(|_| ())
+                    .map_err(|(err, _)| format!("Kafka outcome send error: {err}"))
+            }
+        });
+        try_join_all(sends).await?;
         Ok(())
     }
 }

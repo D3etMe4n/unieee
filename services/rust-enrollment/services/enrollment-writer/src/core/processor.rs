@@ -1,4 +1,4 @@
-use crate::core::batch::{deduplicate_commands_in_batch, has_intra_batch_student_course_conflict};
+use crate::core::batch::{deduplicate_commands_in_batch, split_into_conflict_free_chunks};
 use crate::core::models::{
     BatchExecutionReport, FastPathBatchError, IncomingKafkaRecord, PersistedEventOutcome,
     RedisBatchUpdate, SectionSeatSnapshot, SingleEventOutcome, StaleRejectionOutcome, WriterError,
@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 use unieee_domain::{
     EnrollmentAction, EnrollmentEventStatus, HotPathEnrollmentState, RuleErrorCode, SectionId,
@@ -157,6 +157,7 @@ impl WriterProcessor {
             self.metrics
                 .events_dlq
                 .fetch_add(dlq_count as u64, Ordering::Relaxed);
+            metrics::counter!("unieee_writer_events_dlq_total").increment(dlq_count as u64);
         }
 
         let mut report = self.process_commands_inner(&decoded.commands, now).await?;
@@ -165,6 +166,7 @@ impl WriterProcessor {
         self.metrics
             .batches_committed
             .fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("unieee_writer_batches_committed_total").increment(1);
         Ok(report)
     }
 
@@ -178,6 +180,7 @@ impl WriterProcessor {
         self.metrics
             .batches_committed
             .fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("unieee_writer_batches_committed_total").increment(1);
         Ok(report)
     }
 
@@ -195,6 +198,7 @@ impl WriterProcessor {
         if commands.is_empty() {
             return Ok(report);
         }
+        metrics::histogram!("unieee_writer_batch_size").record(commands.len() as f64);
 
         let (unique_commands, in_batch_dups) = deduplicate_commands_in_batch(commands);
         report.duplicate_skipped_count += in_batch_dups;
@@ -250,82 +254,104 @@ impl WriterProcessor {
         }
 
         if !eligible.is_empty() {
-            let needs_sequential_order = has_intra_batch_student_course_conflict(&eligible);
-            if needs_sequential_order {
-                report.used_isolation_fallback = true;
-                self.run_isolated_sequence(
-                    &eligible,
-                    now,
-                    &mut report,
-                    &mut latest_sections,
-                    &mut timetable_set,
-                    &mut confirmed_statuses,
-                    &mut sse_reverts,
-                    &mut outcomes,
-                )
-                .await?;
-            } else {
-                match self.try_fast_batch_with_retry(&eligible, now).await? {
-                    Ok(fast) => {
-                        report.duplicate_skipped_count += fast.duplicate_skipped;
-                        for (dup_cmd, persisted) in &fast.replayed_duplicate_outcomes {
-                            report.duplicate_reemitted_count += 1;
-                            let (outcome_ev, maybe_rev) =
-                                persisted_outcome_to_event(dup_cmd, persisted);
-                            outcomes.push(outcome_ev);
-                            if let Some(rev) = maybe_rev {
-                                sse_reverts.push(rev);
+            let chunks = split_into_conflict_free_chunks(&eligible);
+            let had_split = chunks.len() > 1;
+            for chunk in chunks {
+                if had_split && chunk.len() == 1 {
+                    report.used_isolation_fallback = true;
+                    let pg_started = Instant::now();
+                    self.run_isolated_sequence(
+                        &chunk,
+                        now,
+                        &mut report,
+                        &mut latest_sections,
+                        &mut timetable_set,
+                        &mut confirmed_statuses,
+                        &mut sse_reverts,
+                        &mut outcomes,
+                    )
+                    .await?;
+                    metrics::histogram!(
+                        "unieee_writer_pg_commit_duration_seconds",
+                        "path" => "isolated"
+                    )
+                    .record(pg_started.elapsed().as_secs_f64());
+                } else {
+                    let fast_started = Instant::now();
+                    match self.try_fast_batch_with_retry(&chunk, now).await? {
+                        Ok(fast) => {
+                            metrics::histogram!(
+                                "unieee_writer_pg_commit_duration_seconds",
+                                "path" => "fast_batch"
+                            )
+                            .record(fast_started.elapsed().as_secs_f64());
+                            report.duplicate_skipped_count += fast.duplicate_skipped;
+                            for (dup_cmd, persisted) in &fast.replayed_duplicate_outcomes {
+                                report.duplicate_reemitted_count += 1;
+                                let (outcome_ev, maybe_rev) =
+                                    persisted_outcome_to_event(dup_cmd, persisted);
+                                outcomes.push(outcome_ev);
+                                if let Some(rev) = maybe_rev {
+                                    sse_reverts.push(rev);
+                                }
                             }
-                        }
-                        for (sec_id, snap) in fast.updated_sections {
-                            latest_sections.insert(sec_id, snap);
-                        }
-                        for ev in &fast.committed_events {
-                            self.epochs.observe(ev.term_id, ev.engine_epoch);
-                            timetable_set.insert((ev.student_id, ev.term_id));
-                            confirmed_statuses.push(confirmed_command_to_status_payload(ev, now));
-                            outcomes.push(EnrollmentOutcomeEvent::confirmed(
-                                ev.event_id,
-                                ev.term_id,
-                                ev.student_id,
-                                ev.section_id,
-                                ev.course_id,
-                                ev.action,
-                                ev.engine_epoch,
-                                now,
-                            ));
-                            if let Some(snap) = latest_sections.get(&ev.section_id) {
-                                report.confirmed_events.push(SeatConfirmedEvent::new(
+                            for (sec_id, snap) in fast.updated_sections {
+                                latest_sections.insert(sec_id, snap);
+                            }
+                            for ev in &fast.committed_events {
+                                self.epochs.observe(ev.term_id, ev.engine_epoch);
+                                timetable_set.insert((ev.student_id, ev.term_id));
+                                confirmed_statuses
+                                    .push(confirmed_command_to_status_payload(ev, now));
+                                outcomes.push(EnrollmentOutcomeEvent::confirmed(
                                     ev.event_id,
                                     ev.term_id,
-                                    ev.section_id,
                                     ev.student_id,
-                                    snap.available_seats(),
-                                    snap.max_capacity,
-                                    EnrollmentEventStatus::Confirmed,
+                                    ev.section_id,
+                                    ev.course_id,
+                                    ev.action,
+                                    ev.engine_epoch,
                                     now,
                                 ));
+                                if let Some(snap) = latest_sections.get(&ev.section_id) {
+                                    report.confirmed_events.push(SeatConfirmedEvent::new(
+                                        ev.event_id,
+                                        ev.term_id,
+                                        ev.section_id,
+                                        ev.student_id,
+                                        snap.available_seats(),
+                                        snap.max_capacity,
+                                        EnrollmentEventStatus::Confirmed,
+                                        now,
+                                    ));
+                                }
                             }
                         }
-                    }
-                    Err(reason) => {
-                        debug!(
-                            reason = %reason,
-                            batch_len = eligible.len(),
-                            "fast-path batch fell back to per-event isolation"
-                        );
-                        report.used_isolation_fallback = true;
-                        self.run_isolated_sequence(
-                            &eligible,
-                            now,
-                            &mut report,
-                            &mut latest_sections,
-                            &mut timetable_set,
-                            &mut confirmed_statuses,
-                            &mut sse_reverts,
-                            &mut outcomes,
-                        )
-                        .await?;
+                        Err(reason) => {
+                            debug!(
+                                reason = %reason,
+                                chunk_len = chunk.len(),
+                                "fast-path batch chunk fell back to per-event isolation"
+                            );
+                            report.used_isolation_fallback = true;
+                            let iso_started = Instant::now();
+                            self.run_isolated_sequence(
+                                &chunk,
+                                now,
+                                &mut report,
+                                &mut latest_sections,
+                                &mut timetable_set,
+                                &mut confirmed_statuses,
+                                &mut sse_reverts,
+                                &mut outcomes,
+                            )
+                            .await?;
+                            metrics::histogram!(
+                                "unieee_writer_pg_commit_duration_seconds",
+                                "path" => "isolated"
+                            )
+                            .record(iso_started.elapsed().as_secs_f64());
+                        }
                     }
                 }
             }
@@ -334,10 +360,28 @@ impl WriterProcessor {
         // At-least-once invariant: Kafka consumer offsets on `unieee.enrollment.commands` MUST NOT
         // advance until all fresh and re-emitted duplicate outcomes succeed on `unieee.enrollment.outcomes`.
         if !outcomes.is_empty() {
-            self.outcome_publisher
-                .publish_outcomes(&outcomes)
-                .await
-                .map_err(WriterError::OutcomePublishFailed)?;
+            let out_started = Instant::now();
+            match self.outcome_publisher.publish_outcomes(&outcomes).await {
+                Ok(()) => {
+                    metrics::counter!(
+                        "unieee_writer_outcomes_published_total",
+                        "outcome" => "ok"
+                    )
+                    .increment(outcomes.len() as u64);
+                    metrics::histogram!("unieee_writer_outcomes_publish_duration_seconds")
+                        .record(out_started.elapsed().as_secs_f64());
+                }
+                Err(err) => {
+                    metrics::counter!(
+                        "unieee_writer_outcomes_published_total",
+                        "outcome" => "error"
+                    )
+                    .increment(1);
+                    metrics::histogram!("unieee_writer_outcomes_publish_duration_seconds")
+                        .record(out_started.elapsed().as_secs_f64());
+                    return Err(WriterError::OutcomePublishFailed(err));
+                }
+            }
         }
 
         report.confirmed_count = report.confirmed_events.len();
@@ -360,6 +404,12 @@ impl WriterProcessor {
         self.metrics
             .events_outcomes_published
             .fetch_add(report.outcomes_published_count as u64, Ordering::Relaxed);
+        metrics::counter!("unieee_writer_events_confirmed_total")
+            .increment(report.confirmed_count as u64);
+        metrics::counter!("unieee_writer_events_reverted_total")
+            .increment(report.rejected_count as u64);
+        metrics::counter!("unieee_writer_events_duplicate_skipped_total")
+            .increment(report.duplicate_skipped_count as u64);
 
         // Best-effort post-commit Redis Read Cache & SSE Pub/Sub fan-out.
         if !sse_reverts.is_empty() {
@@ -412,6 +462,7 @@ impl WriterProcessor {
                     self.metrics
                         .transient_retries
                         .fetch_add(1, Ordering::Relaxed);
+                    metrics::counter!("unieee_writer_transient_retries_total").increment(1);
                     tokio::time::sleep(self.backoff_for(attempt)).await;
                 }
             }
@@ -497,6 +548,7 @@ impl WriterProcessor {
                     self.metrics
                         .transient_retries
                         .fetch_add(1, Ordering::Relaxed);
+                    metrics::counter!("unieee_writer_transient_retries_total").increment(1);
                     tokio::time::sleep(self.backoff_for(attempt)).await;
                 }
             }

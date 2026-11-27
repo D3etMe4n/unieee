@@ -1,0 +1,6 @@
+name: unieee
+
+services:
+  reverse-proxy:
+    volumes:
+      - ../tests/load/nginx-bench.conf:/etc/nginx/nginx.conf:ro

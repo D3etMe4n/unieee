@@ -119,6 +119,7 @@ pub fn dispatch_pubsub_payload(hub: &SseHub, channel: &str, payload: &str) {
             hub.metrics()
                 .malformed_messages
                 .fetch_add(1, Ordering::Relaxed);
+            metrics::counter!("unieee_sse_malformed_messages_total").increment(1);
             warn!(channel, error = %err, "ignored invalid Redis Pub/Sub payload");
         }
     }
@@ -188,6 +189,7 @@ pub fn spawn_pubsub_subscriber(
                                                 Ok(payload) => dispatch_pubsub_payload(&hub, &channel, &payload),
                                                 Err(err) => {
                                                     hub.metrics().malformed_messages.fetch_add(1, Ordering::Relaxed);
+                                                    metrics::counter!("unieee_sse_malformed_messages_total").increment(1);
                                                     warn!(channel, error = %err, "ignored non-UTF8 Redis Pub/Sub payload");
                                                 }
                                             }

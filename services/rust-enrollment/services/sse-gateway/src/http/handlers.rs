@@ -315,6 +315,7 @@ fn sections_sse_stream(
                 }
                 _ = &mut st.deadline => {
                     st.hub.metrics().max_age_closes.fetch_add(1, Ordering::Relaxed);
+                    metrics::counter!("unieee_sse_max_age_closes_total").increment(1);
                     st.closed = true;
                     return Some((Ok(build_reconnect_event(ReconnectReason::MaxConnectionAge, st.retry_ms)), st));
                 }
@@ -330,6 +331,7 @@ fn sections_sse_stream(
                         }
                         Err(RecvError::Lagged(skipped)) => {
                             st.hub.metrics().lagged_events.fetch_add(1, Ordering::Relaxed);
+                            metrics::counter!("unieee_sse_slow_consumer_lagged_events_total").increment(1);
                             let resync = ResyncRequiredPayload {
                                 reason: ResyncReason::ConsumerLagged,
                                 skipped_events: Some(skipped),
@@ -353,6 +355,7 @@ fn sections_sse_stream(
                         }
                         Err(RecvError::Lagged(skipped)) => {
                             st.hub.metrics().lagged_events.fetch_add(1, Ordering::Relaxed);
+                            metrics::counter!("unieee_sse_slow_consumer_lagged_events_total").increment(1);
                             let resync = ResyncRequiredPayload {
                                 reason: ResyncReason::ConsumerLagged,
                                 skipped_events: Some(skipped),
@@ -429,6 +432,7 @@ fn personal_sse_stream(
                 }
                 _ = &mut st.deadline => {
                     st.hub.metrics().max_age_closes.fetch_add(1, Ordering::Relaxed);
+                    metrics::counter!("unieee_sse_max_age_closes_total").increment(1);
                     st.closed = true;
                     return Some((Ok(build_reconnect_event(ReconnectReason::MaxConnectionAge, st.retry_ms)), st));
                 }
@@ -448,6 +452,7 @@ fn personal_sse_stream(
                         }
                         Err(RecvError::Lagged(skipped)) => {
                             st.hub.metrics().lagged_events.fetch_add(1, Ordering::Relaxed);
+                            metrics::counter!("unieee_sse_slow_consumer_lagged_events_total").increment(1);
                             let resync = ResyncRequiredPayload {
                                 reason: ResyncReason::ConsumerLagged,
                                 skipped_events: Some(skipped),
@@ -472,6 +477,7 @@ fn personal_sse_stream(
                         }
                         Err(RecvError::Lagged(skipped)) => {
                             st.hub.metrics().lagged_events.fetch_add(1, Ordering::Relaxed);
+                            metrics::counter!("unieee_sse_slow_consumer_lagged_events_total").increment(1);
                             let resync = ResyncRequiredPayload {
                                 reason: ResyncReason::ConsumerLagged,
                                 skipped_events: Some(skipped),

@@ -208,6 +208,22 @@ The `ai_advisor` module (`POST /api/v1/ai/advisor/chat`) operates in two modes c
 
 ## 5. Keycloak Registration-Season Tuning & Identity Brokering
 
-- [realm-unieee.json](../../infra/keycloak/realm-unieee.json) configures `accessTokenLifespan: 1800` (30 minutes), `ssoSessionIdleTimeout: 3600` (60 minutes), and `registrationAllowed: false`.
+- [realm-unieee.json](../../infra/keycloak/realm-unieee.json) configures `accessTokenLifespan: 1800` (30 minutes), `ssoSessionIdleTimeout: 3600` (60 minutes), `registrationAllowed: false`, and Keycloak 26 `UserProfileProvider` rules keeping `student_id` & `lecturer_id` admin-editable only.
 - Web/mobile clients should apply randomized token refresh jitter (`[0.70, 0.85]` of `expires_in`) to prevent login thundering herds.
 - External SSO via **Microsoft Entra ID** or **Google Workspace** is supported through the pre-configured **`unieee-first-broker-login-link-only`** flow (links only to pre-provisioned Academic Affairs accounts; never auto-creates users). See [IDENTITY_BROKERING.md](../../infra/keycloak/IDENTITY_BROKERING.md) for step-by-step setup.
+
+---
+
+## 6. Production Monitoring & Benchmark Telemetry (`compose.monitoring.yml`)
+
+Start the stack with monitoring enabled at boot (or add `--monitoring` later without restarting PostgreSQL):
+
+```bash
+./scripts/unieee.sh up --monitoring
+# Stop only monitoring containers while keeping the core application up
+./scripts/unieee.sh down --monitoring-only
+```
+
+- **Loopback-Only UIs:**
+  - **Prometheus (`http://127.0.0.1:9090`):** Scrapes `core-java` (`/actuator/prometheus`), Rust services (`/metrics`), and internal exporters (`nginx`, `postgres`, `pgbouncer`, `redis`, `kafka` when `hot-path` is active), and enables `--web.enable-remote-write-receiver` for `k6`.
+  - **Grafana (`http://127.0.0.1:3000`):** Auto-provisions the Prometheus datasource and two dashboards — **`unieee — Production Overview`** (`unieee-production-overview`) and **`unieee — k6 Load Benchmark`** (`unieee-k6-benchmark`). Default `GRAFANA_ADMIN_USER=admin` / `GRAFANA_ADMIN_PASSWORD=admin_dev_password` in [.env.example](../../.env.example) **must be rotated in `.env`**.

@@ -7,7 +7,7 @@
 Welcome to the public reader documentation for **unieee** — a university academic management and course credit registration platform built on a **Hybrid CQRS + Event Sourcing & Modular Monolith** architecture.
 
 > [!NOTE]
-> This directory (`guides/`) contains public-facing architecture, setup, operations, API, and testing guides for repository visitors, operators, and contributors. It reflects all features implemented through **Phase 11** plus the Kafka outcomes, Hot-Path read split, and Redis Read-Through Cache architecture (`core-java` `0.4.0-SNAPSHOT`, `rust-enrollment` `0.6.0`), with **Phase 12** (E2E regression & load testing) next.
+> This directory (`guides/`) contains public-facing architecture, setup, operations, API, observability, and testing guides for repository visitors, operators, and contributors. It reflects **release `1.0.0` with all 12 phases completed** (`core-java` `1.0.0`, `rust-enrollment` `1.0.0`), including Prometheus + Grafana monitoring, the automated 7-scenario E2E regression suite, and multi-device `k6` load benchmarks.
 
 ---
 
@@ -19,7 +19,7 @@ Welcome to the public reader documentation for **unieee** — a university acade
 | [Registration-Season Usage, Operations & Failover](./en/operations-and-hotpath.md) | Operators & students/QA | `prepare-registration`, `open-registration` (24/7 multi-window), `close-registration` (drain & 3-way reconciliation), Hot Delta Sync, student `curl` Hot Path + SSE + AI Advisor flows, LLM setup, and Active–Standby failover. |
 | [System Architecture & Database Design](./en/architecture.md) | Engineers & architects | Hybrid Warm/Hot Path architecture, 4-Bounded-Context Spring Modulith DAG (including `ai_advisor`), PostgreSQL schemas (`V001`–`V005`), Policy Engine, Rust Hot Path cluster, and Kafka/Redis event backbone. |
 | [REST API Reference](./en/api-reference.md) | Frontend/API consumers & QA | JWT & public catalog endpoints, RBAC roles, unified RFC 9457 Problem Details, all `core-java` APIs (including `/api/v1/public/*`, `warm-cache`, `ai_advisor`), Rust `enrollment-engine` & `sse-gateway` APIs, and internal probes. |
-| [Implementation Roadmap & Testing](./en/roadmap-and-testing.md) | Contributors & reviewers | Status across all 12 phases (Phases 1–11 completed), tiered JaCoCo & `cargo-llvm-cov` coverage policy (`>= 90%` core, `>= 65%` edge), and the 3-job GitHub Actions CI workflow. |
+| [Implementation Roadmap & Testing](./en/roadmap-and-testing.md) | Contributors & reviewers | Status across all 12 phases (**12/12 completed, `1.0.0`**), tiered JaCoCo & `cargo-llvm-cov` coverage policy (`>= 90%` core, `>= 65%` edge), 7-scenario E2E suite, multi-device `k6` benchmarks, and CI guardrails. |
 
 ---
 

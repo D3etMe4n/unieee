@@ -225,6 +225,48 @@ check_health() {
         log_info "unieee-sse-gateway: inactive (core profile mode)"
     fi
 
+    # 11. Monitoring Stack (Prometheus + Grafana + Internal Exporters)
+    local prom_port="${UNIEEE_PROMETHEUS_PORT:-9090}"
+    local grafana_port="${UNIEEE_GRAFANA_PORT:-3000}"
+    if container_running "unieee-prometheus" || container_running "unieee-grafana"; then
+        if container_running "unieee-prometheus" && \
+           curl -fsS "http://127.0.0.1:${prom_port}/-/ready" >/dev/null 2>&1; then
+            log_ok "prometheus: /-/ready OK (http://127.0.0.1:${prom_port})"
+        else
+            log_err "prometheus: readiness check FAILED on port ${prom_port}"
+            failures=$((failures + 1))
+        fi
+
+        if container_running "unieee-grafana" && \
+           curl -fsS "http://127.0.0.1:${grafana_port}/api/health" 2>/dev/null | grep -Eq '"database"[[:space:]]*:[[:space:]]*"ok"'; then
+            log_ok "grafana: /api/health OK (http://127.0.0.1:${grafana_port})"
+        else
+            log_err "grafana: health check FAILED on port ${grafana_port}"
+            failures=$((failures + 1))
+        fi
+
+        local exp
+        for exp in unieee-nginx-exporter unieee-postgres-exporter unieee-pgbouncer-exporter unieee-redis-exporter; do
+            if container_running "$exp"; then
+                log_ok "${exp#unieee-}: running on internal network"
+            else
+                log_err "${exp#unieee-}: NOT running"
+                failures=$((failures + 1))
+            fi
+        done
+
+        if container_running "unieee-kafka"; then
+            if container_running "unieee-kafka-exporter"; then
+                log_ok "kafka-exporter: running on internal network"
+            else
+                log_err "kafka-exporter: NOT running alongside active Kafka"
+                failures=$((failures + 1))
+            fi
+        fi
+    else
+        log_info "monitoring: inactive (start with './scripts/unieee.sh up --monitoring')"
+    fi
+
     if [ "$failures" -gt 0 ]; then
         log_err "Health check completed with $failures failure(s)."
         return 1

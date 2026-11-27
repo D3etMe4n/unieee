@@ -78,6 +78,7 @@ pub fn spawn_seat_coalescer(
                                 if pending.remove(&key).is_some() {
                                     if let Some(strong) = hub.upgrade() {
                                         strong.metrics().seat_updates_coalesced.fetch_add(1, Ordering::Relaxed);
+                                        metrics::counter!("unieee_sse_seat_updates_coalesced_total").increment(1);
                                     }
                                 }
                                 if let Some(strong) = hub.upgrade() {
@@ -88,6 +89,7 @@ pub fn spawn_seat_coalescer(
                             } else if merge_seat_update(&mut pending, update) {
                                 if let Some(strong) = hub.upgrade() {
                                     strong.metrics().seat_updates_coalesced.fetch_add(1, Ordering::Relaxed);
+                                    metrics::counter!("unieee_sse_seat_updates_coalesced_total").increment(1);
                                 }
                             }
                         }

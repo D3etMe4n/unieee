@@ -3,8 +3,10 @@ package vn.edu.unieee.registration.internal.service.policy;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import vn.edu.unieee.catalog.dto.CourseSectionDetailResponse;
+import vn.edu.unieee.common.metrics.UnieeeMetrics;
 import vn.edu.unieee.registration.dto.PolicyEvaluationResponse;
 import vn.edu.unieee.registration.dto.PolicyRuleViolationResponse;
 import vn.edu.unieee.registration.internal.domain.policy.EnrollmentPolicy;
@@ -13,11 +15,18 @@ import vn.edu.unieee.registration.internal.domain.policy.EnrollmentPolicy;
 public class EnrollmentRuleEvaluator {
 
     private final List<EnrollmentRule> orderedRules;
+    private final UnieeeMetrics metrics;
 
     public EnrollmentRuleEvaluator(List<EnrollmentRule> rules) {
+        this(rules, UnieeeMetrics.noop());
+    }
+
+    @Autowired
+    public EnrollmentRuleEvaluator(List<EnrollmentRule> rules, UnieeeMetrics metrics) {
         this.orderedRules = rules.stream()
             .sorted(Comparator.comparingInt(EnrollmentRule::order))
             .toList();
+        this.metrics = metrics == null ? UnieeeMetrics.noop() : metrics;
     }
 
     public PolicyEvaluationResponse evaluate(
@@ -39,6 +48,11 @@ public class EnrollmentRuleEvaluator {
                 }
             }
         }
+
+        metrics.recordPolicyEvaluation(
+            violations.isEmpty(),
+            violations.stream().map(PolicyRuleViolationResponse::ruleCode).toList()
+        );
 
         int currentCredits = (context.existingSections() == null
             ? List.<CourseSectionDetailResponse>of()

@@ -59,3 +59,18 @@ server {
 
     include /etc/nginx/snippets/unieee-routes.conf;
 }
+
+# Internal listener for Prometheus nginx-exporter — NOT published to host
+server {
+    listen 8089;
+    server_name _;
+
+    location = /stub_status {
+        stub_status;
+        access_log off;
+    }
+
+    location / {
+        return 404;
+    }
+}

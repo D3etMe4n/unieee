@@ -2,7 +2,7 @@
 
 **Language:** **English** | [Tiếng Việt](../vi/architecture.md) | [Documentation Hub](../README.md)
 
-**unieee** combines a **Spring Boot 4.1.3 Modular Monolith** (Warm/Cold Path running 24/7, `0.4.0-SNAPSHOT`) with a **Rust Hot Path** (`0.6.0`, toggled on cyclically during peak registration windows), unified around **PostgreSQL 17** as the single Source of Truth and **Redis 7.4 HA** strictly as a Read Cache & SSE Pub/Sub backbone.
+**unieee** combines a **Spring Boot 4.1.3 Modular Monolith** (Warm/Cold Path running 24/7, **`1.0.0`**) with a **Rust Hot Path** (**`1.0.0`**, toggled on cyclically during peak registration windows), unified around **PostgreSQL 17** as the single Source of Truth and **Redis 7.4 HA** strictly as a Read Cache & SSE Pub/Sub backbone.
 
 ---
 
@@ -90,7 +90,7 @@ Before opening registration, `PolicySnapshotExporter` compiles the active policy
 
 ---
 
-## 5. Rust Hot Path Cluster (`services/rust-enrollment/` — Phases 6–9, 11)
+## 5. Rust Hot Path Cluster (`services/rust-enrollment/` — Phases 6–9, 11–12)
 
 ### Shared Workspace Crates (`crates/`)
 - **`unieee-domain`:** Strongly typed domain IDs (`TermId`, `StudentId`, `CourseId`, `SectionId`, `EventId`, `WindowId`), `RuleErrorCode`, unified RFC 9457 `ProblemDetail`, and `ScheduleBitmask` (`[u128; 20]` — 20 weeks x 112 bits) supporting `O(1)` bitwise overlap and buffer-gap checks verified against an interval oracle via `proptest`.
@@ -118,7 +118,7 @@ flowchart LR
 ```
 
 ### Resilience, Read/Write Split & Crash-Safe Outcome Delivery
-- **Crash-Safe At-Least-Once Outcomes (`enrollment-writer` -> Kafka):** `enrollment-writer` commits `unieee.enrollment.commands` consumer offsets ONLY after both PostgreSQL batch commit and `acks=all` produce of `EnrollmentOutcomeEvent` (`CONFIRMED` / `REVERTED`) to `unieee.enrollment.outcomes` succeed. On crash-recovery encountering a duplicate `event_id`, it reloads the persisted outcome from `registration.enrollment_events` and re-emits `EnrollmentOutcomeEvent` before committing offsets — eliminating dual-write drift without DB outbox polling.
+- **Crash-Safe At-Least-Once Outcomes & Chunked `UNNEST` Writes (`enrollment-writer` -> Kafka):** `enrollment-writer` splits mixed same-student/course churn chronologically into contiguous conflict-free waves (`split_into_conflict_free_chunks`) so PostgreSQL `UNNEST` fast-batch stays high-throughput (falling back per chunk only on constraint/missing-section conflicts), pipelines `acks=all` `EnrollmentOutcomeEvent` (`CONFIRMED` / `REVERTED`) produces to `unieee.enrollment.outcomes` concurrently via `try_join_all`, and commits `unieee.enrollment.commands` offsets ONLY after both PostgreSQL and outcome produce succeed. On crash-recovery encountering a duplicate `event_id`, it reloads the persisted outcome from `registration.enrollment_events` and re-emits `EnrollmentOutcomeEvent`.
 - **Dynamic Nginx Read/Write Split & `1s` `seats_cache`:** `/api/v1/enrollments/seats` and `/api/v1/enrollments/me` route to `$enrollment_read_upstream` (`STANDBY` when healthy & `READY`), offloading read traffic from the write primary. On primary crash or while a recovered Standby is `SYNCING` (`/readyz = 503`), reads transparently route to the surviving `ACTIVE` node protected by a `1s` `seats_cache` (`proxy_cache_lock on`, bypassing cache when `Authorization` is empty). Once Standby completes Kafka replay, reads automatically split back while writes stay pinned with zero auto-failback.
 - **Non-Blocking Auth & Coalesced Pub/Sub:** `enrollment-engine` and `sse-gateway` verify Keycloak JWTs locally via singleflight JWKS refresh (`JWKS_REFRESH_INTERVAL_SECS=300`) + SHA-256 token cache (`JWT_CACHE_TTL_SECS=30`). `SeatTentativeEvent` and `SeatConfirmedEvent` always carry absolute `availableSeats` / `maxCapacity` so SSE clients self-heal if a Pub/Sub frame drops.
 - **Zero-PG Snapshot Recovery & RAM-First Revert Idempotency:** Engines persist atomic disk snapshots (`SNAPSHOT_DIR`, SHA-256 + `checkpoint_seq`) and recover via snapshot + Kafka replay (`commands` + `deltas` + `outcomes`) with zero PostgreSQL queries, handling out-of-order `commands`/`outcomes` partitions idempotently in RAM (`processed_event_ids` / `reverted_event_ids`).
@@ -138,3 +138,11 @@ flowchart LR
 | **Redis Pub/Sub** | `unieee:enrollment:revert` | `enrollment-writer` -> `sse-gateway` | Compensating revert fan-out for SSE personal streams (`REVERTED`). |
 | **Redis Pub/Sub** | `unieee:gate:control` | `scripts/unieee.sh` -> `enrollment-engine`, `sse-gateway` | Synchronized gate transitions (`OPEN`, `DRAINING`, `CLOSED`) and wave switches with fencing `epoch`. |
 | **Redis Keys** | `unieee:cache:term:{termId}:sections`<br>`unieee:cache:section:{sectionId}:seats`<br>`unieee:cache:student:{studentId}:term:{termId}:timetable`<br>`unieee:cache:policy:{termId}:active`<br>`unieee:cache:policy:{termId}:snapshot`<br>`unieee:cache:catalog:{terms\|term:*\|courses\|course:*\|course:*:prerequisites\|sections:term:*\|section:*:detail}`<br>`unieee:event:status:{eventId}`<br>`unieee:revert:dedup:{eventId}` | `core-java` & `enrollment-writer` -> `core-java`, `ai_advisor`, `enrollment-engine` | Read-Through Cache (catalog, active policy, adaptive timetable), live seat overlay (`warm-cache` & post-commit sync), policy snapshot cache, async event status lookup, and 24h revert dedup backup. |
+
+---
+
+## 7. Production Observability Architecture (`infra/compose.monitoring.yml`, Phase 12)
+
+- **Instrumentation:** `core-java` exposes Micrometer `/actuator/prometheus` (`UnieeeMetrics` covering Redis Read-Through Cache hit/miss/fallback, Seat Overlay, Policy Engine, Admin Override, Hot Delta Sync, and AI Advisor); all 3 Rust services expose `/metrics` via `metrics-exporter-prometheus`.
+- **Internal Scraping & Network Isolation:** **Prometheus** (`127.0.0.1:9090`, `--web.enable-remote-write-receiver` for `k6`) scrapes internal-network targets over `app`/`data` (`core-java:8080`, `enrollment-engine-{active,standby}:8081`, `enrollment-writer:8082`, `sse-gateway:8083`, `nginx-exporter:9113` via Nginx `:8089 /stub_status`, `postgres-exporter:9187`, `pgbouncer-exporter:9127`, multi-target `redis-exporter:9121`, and `hot-path` `kafka-exporter:9308`). **PostgreSQL, PgBouncer, Redis, Kafka, and exporters publish zero host ports.**
+- **Dashboards:** **Grafana** (`127.0.0.1:3000`) auto-provisions the Prometheus datasource and two dashboards (`unieee-production-overview` and `unieee-k6-benchmark`).

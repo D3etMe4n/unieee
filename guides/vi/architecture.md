@@ -2,7 +2,7 @@
 
 **Ngôn ngữ:** [English](../en/architecture.md) | **Tiếng Việt** | [Trung tâm Tài liệu](../README.vi.md)
 
-**unieee** kết hợp một **Spring Boot 4.1.3 Modular Monolith** (Warm/Cold Path chạy 24/7, `0.4.0-SNAPSHOT`) với cụm **Rust Hot Path** (`0.6.0`, bật theo chu kỳ mở cổng đăng ký), xoay quanh **PostgreSQL 17** làm Source of Truth duy nhất và **Redis 7.4 HA** chỉ đóng vai trò Read Cache & Pub/Sub.
+**unieee** kết hợp một **Spring Boot 4.1.3 Modular Monolith** (Warm/Cold Path chạy 24/7, **`1.0.0`**) với cụm **Rust Hot Path** (**`1.0.0`**, bật theo chu kỳ mở cổng đăng ký), xoay quanh **PostgreSQL 17** làm Source of Truth duy nhất và **Redis 7.4 HA** chỉ đóng vai trò Read Cache & Pub/Sub.
 
 ---
 
@@ -86,7 +86,7 @@ Trước giờ mở cổng, `PolicySnapshotExporter` biên dịch policy đang k
 
 ---
 
-## 5. Cụm Rust Hot Path (`services/rust-enrollment/` — Phases 6–9, 11)
+## 5. Cụm Rust Hot Path (`services/rust-enrollment/` — Phases 6–9, 11–12)
 
 ### Các Shared Workspace Crates (`crates/`)
 - **`unieee-domain`:** Các kiểu ID định danh mạnh (`TermId`, `StudentId`, `CourseId`, `SectionId`, `EventId`, `WindowId`), `RuleErrorCode`, chuẩn lỗi `ProblemDetail` RFC 9457, và `ScheduleBitmask` (`[u128; 20]` — 20 tuần x 112 bit) hỗ trợ kiểm tra trùng lịch & khoảng đệm `O(1)` được kiểm chứng bằng `proptest`.
@@ -113,7 +113,7 @@ flowchart LR
 ```
 
 ### Các Điểm nhấn về Độ bền, Đọc RAM & Bảo vệ Biên
-- **Đồng bộ Bền vững qua Kafka (`unieee.enrollment.outcomes`) & Chống mất Revert:** `enrollment-writer` không còn ghi hay quét `writer_revert_outbox` ở runtime (vẫn giữ migration `V004` trong lịch sử Flyway). Writer chỉ commit consumer offset của `unieee.enrollment.commands` sau khi **cả** PostgreSQL batch commit lẫn `kafka.produce(EnrollmentOutcomeEvent, acks=all)` sang `unieee.enrollment.outcomes` thành công. Nếu crash giữa hai bước rồi gặp `duplicate event_id` trong `registration.enrollment_events`, writer đọc lại trạng thái đã lưu (`CONFIRMED` / `REJECTED` + `reason_code`) và **re-emit** `EnrollmentOutcomeEvent` trước khi commit offset.
+- **Đồng bộ Bền vững qua Kafka (`unieee.enrollment.outcomes`) & Chunking `UNNEST` Không xung đột:** `enrollment-writer` chia chuỗi thao tác xen kẽ cùng sinh viên/môn học theo thứ tự đến thành các chunk liên tiếp không xung đột (`split_into_conflict_free_chunks`) để giữ thông lượng PostgreSQL `UNNEST` fast-batch cực cao (chỉ fallback tuần tự từng chunk khi vướng constraint/thiếu lớp), đồng thời pipeline các lệnh gửi `EnrollmentOutcomeEvent` (`acks=all`) sang `unieee.enrollment.outcomes` qua `try_join_all` trước khi commit offset Kafka (tự đọc lại trạng thái PG & re-emit khi trùng `event_id` sau crash).
 - **State Machine Độc lập với Redis Pub/Sub & 2 Endpoint Đọc RAM:** Cả `ACTIVE` và `STANDBY` của `enrollment-engine` đều tiêu thụ `unieee.enrollment.outcomes` (ngừng subscribe `unieee:seat:confirmed` và `unieee:enrollment:revert` trên Redis Pub/Sub) để chuyển trạng thái idempotent trong RAM (`Reserved -> Confirmed`, `DropPending -> Dropped`, hoặc `Reverted` + hoàn ghế & tính lại bitmask). Ngoài ghi, engine mở `GET /api/v1/enrollments/seats?termId=...` (đọc lock-free từ `SectionSeatSlot`) và `GET /api/v1/enrollments/me?termId=...` (đọc shard của đúng `student_id` trong JWT).
 - **Xác thực JWT không nghẽn & Gộp Pub/Sub Giá trị Tuyệt đối:** `enrollment-engine` và `sse-gateway` xác thực JWT cục bộ qua một luồng background JWKS singleflight (`JWKS_REFRESH_INTERVAL_SECS=300`) kết hợp cache SHA-256 ngắn hạn (`JWT_CACHE_TTL_SECS=30`). `SeatTentativeEvent` (`enrollment-engine`) và `SeatConfirmedEvent` (`enrollment-writer`) luôn phát **số ghế trống tuyệt đối (`availableSeats`, `maxCapacity`)** thay vì delta `+1`/`-1`, nên dù Redis Pub/Sub rơi gói tin vẫn tự đồng bộ ở sự kiện kế tiếp. Biến động tạm thời được gộp (`COALESCE_WINDOW_MS=50`, flush tức thì khi `availableSeats == 0`) qua Redis pipeline.
 - **Phân tách Đọc/Ghi Nginx (`$enrollment_read_upstream`) & Micro-cache `1s`:** Khi cả hai node engine đều `READY`, Nginx tách `$enrollment_primary = ACTIVE` (ghi) và `$enrollment_read_upstream = STANDBY` (đọc). Khi `ACTIVE` chết và `STANDBY` được promote (chỉ còn 1 node sống) hoặc node cũ đang `SYNCING` (`/readyz = 503`), cả hai biến trỏ về node `ACTIVE` còn sống kết hợp `seats_cache` (`1s`, `proxy_cache_lock on`) cho `GET /api/v1/enrollments/seats`. Khi node cũ replay xong và quay lại ở vai trò `STANDBY`, Nginx giữ nguyên quyền ghi (không auto-failback) và tự động tách lại luồng đọc sang `STANDBY`.
@@ -135,3 +135,11 @@ flowchart LR
 | **Redis Pub/Sub** | `unieee:enrollment:revert` | `enrollment-writer` -> `sse-gateway` | Sự kiện hoàn tác cho luồng SSE cá nhân (`REVERTED`; `enrollment-engine` đã chuyển sang tiêu thụ Kafka `unieee.enrollment.outcomes`). |
 | **Redis Pub/Sub** | `unieee:gate:control` | `scripts/unieee.sh` -> `enrollment-engine`, `sse-gateway` | Chuyển trạng thái cổng (`OPEN`, `DRAINING`, `CLOSED`) và đổi đợt không cần restart kèm fencing `epoch`. |
 | **Redis Keys** | `unieee:cache:term:{termId}:sections`<br>`unieee:cache:section:{sectionId}:seats`<br>`unieee:cache:student:{studentId}:term:{termId}:timetable`<br>`unieee:cache:policy:{termId}:active`<br>`unieee:cache:policy:{termId}:snapshot`<br>`unieee:cache:catalog:{terms\|term:*\|courses\|course:*\|course:*:prerequisites\|sections:term:*\|section:*:detail}`<br>`unieee:event:status:{eventId}`<br>`unieee:revert:dedup:{eventId}` | `core-java` & `enrollment-writer` -> `core-java`, `ai_advisor`, `enrollment-engine`, client | Lớp Read-Through Cache fail-open (`core-java`: catalog, active policy, thời khóa biểu thích ứng), cache sĩ số `warm-cache` & đồng bộ sau commit cho `/api/v1/sections` & `ai_advisor`, cache policy snapshot, tra cứu trạng thái event và khóa chống trùng revert 24h dự phòng. |
+
+---
+
+## 7. Kiến trúc Giám sát Observability (`infra/compose.monitoring.yml`, Phase 12)
+
+- **Instrumentation:** `core-java` xuất Micrometer `/actuator/prometheus` (`UnieeeMetrics` cho Redis Read-Through Cache hit/miss/fallback, Seat Overlay, Policy Engine, Admin Override, Hot Delta Sync và AI Advisor); cả 3 dịch vụ Rust xuất `/metrics` chuẩn Prometheus qua `metrics-exporter-prometheus`.
+- **Thu thập Nội bộ & Cô lập Mạng:** **Prometheus** (`127.0.0.1:9090`, bật `--web.enable-remote-write-receiver` cho `k6`) scrape các target nội bộ qua mạng `app`/`data` (`core-java:8080`, `enrollment-engine-{active,standby}:8081`, `enrollment-writer:8082`, `sse-gateway:8083`, `nginx-exporter:9113` qua Nginx `:8089 /stub_status`, `postgres-exporter:9187`, `pgbouncer-exporter:9127`, multi-target `redis-exporter:9121` và `kafka-exporter:9308` khi chạy `hot-path`). **PostgreSQL, PgBouncer, Redis, Kafka và toàn bộ exporter tuyệt đối không mở port ra host.**
+- **Dashboards:** **Grafana** (`127.0.0.1:3000`) tự động nạp datasource Prometheus cùng hai dashboard sẵn có (`unieee-production-overview` và `unieee-k6-benchmark`).

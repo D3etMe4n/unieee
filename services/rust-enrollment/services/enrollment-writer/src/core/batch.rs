@@ -172,6 +172,35 @@ pub fn has_intra_batch_student_course_conflict(commands: &[EnrollmentCommandEven
     false
 }
 
+/// Splits commands chronologically into contiguous chunks where every chunk has distinct
+/// `(term_id, student_id, course_id)` keys so PostgreSQL `UNNEST` fast-batch can execute safely
+/// without intra-statement row conflicts while preserving strict arrival order across chunks.
+#[must_use]
+pub fn split_into_conflict_free_chunks(
+    commands: &[EnrollmentCommandEvent],
+) -> Vec<Vec<EnrollmentCommandEvent>> {
+    if commands.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks: Vec<Vec<EnrollmentCommandEvent>> = Vec::new();
+    let mut current: Vec<EnrollmentCommandEvent> = Vec::with_capacity(commands.len());
+    let mut seen: HashSet<(TermId, StudentId, CourseId)> = HashSet::with_capacity(commands.len());
+
+    for cmd in commands {
+        let key = (cmd.term_id, cmd.student_id, cmd.course_id);
+        if !seen.insert(key) {
+            chunks.push(std::mem::take(&mut current));
+            seen.clear();
+            seen.insert(key);
+        }
+        current.push(cmd.clone());
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 /// Aggregates net seat deltas per `(section_id, term_id, course_id)` in deterministic key order.
 #[must_use]
 pub fn aggregate_section_deltas(

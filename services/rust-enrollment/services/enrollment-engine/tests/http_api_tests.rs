@@ -131,6 +131,33 @@ async fn http_api_covers_register_drop_status_idor_healthz_readyz_and_promote() 
         serde_json::from_slice(&h_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(h_body["status"], "UP");
 
+    let m_resp = app
+        .clone()
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(m_resp.status(), StatusCode::OK);
+    let m_ct = m_resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(m_ct.starts_with("text/plain"));
+    let m_body = String::from_utf8(
+        m_resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(m_body.contains("unieee_engine_ready"));
+    assert!(m_body.contains("unieee_engine_http_requests_total"));
+
     let r_unready = app
         .clone()
         .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())

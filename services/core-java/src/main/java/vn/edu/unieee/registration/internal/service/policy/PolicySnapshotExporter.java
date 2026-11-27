@@ -8,7 +8,7 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -17,6 +17,7 @@ import tools.jackson.databind.SerializationFeature;
 import tools.jackson.databind.json.JsonMapper;
 import vn.edu.unieee.catalog.CatalogFacade;
 import vn.edu.unieee.catalog.dto.AcademicTermResponse;
+import vn.edu.unieee.common.metrics.UnieeeMetrics;
 import vn.edu.unieee.common.security.SecurityContextHelper;
 import vn.edu.unieee.registration.dto.PolicySnapshotResponse;
 import vn.edu.unieee.registration.event.PolicySnapshotExportedEvent;
@@ -32,7 +33,6 @@ import vn.edu.unieee.registration.internal.repository.EnrollmentPolicySnapshotRe
 import vn.edu.unieee.registration.internal.repository.RegistrationWindowRepository;
 
 @Service
-@RequiredArgsConstructor
 public class PolicySnapshotExporter {
 
     private static final JsonMapper CANONICAL_MAPPER = JsonMapper.builder()
@@ -47,6 +47,49 @@ public class PolicySnapshotExporter {
     private final PolicySnapshotCache snapshotCache;
     private final RegistrationMapper mapper;
     private final ApplicationEventPublisher eventPublisher;
+    private final UnieeeMetrics metrics;
+
+    public PolicySnapshotExporter(
+        EnrollmentPolicyRepository policyRepository,
+        EnrollmentPolicySnapshotRepository snapshotRepository,
+        RegistrationWindowRepository windowRepository,
+        CatalogFacade catalogFacade,
+        PolicySnapshotCache snapshotCache,
+        RegistrationMapper mapper,
+        ApplicationEventPublisher eventPublisher
+    ) {
+        this(
+            policyRepository,
+            snapshotRepository,
+            windowRepository,
+            catalogFacade,
+            snapshotCache,
+            mapper,
+            eventPublisher,
+            UnieeeMetrics.noop()
+        );
+    }
+
+    @Autowired
+    public PolicySnapshotExporter(
+        EnrollmentPolicyRepository policyRepository,
+        EnrollmentPolicySnapshotRepository snapshotRepository,
+        RegistrationWindowRepository windowRepository,
+        CatalogFacade catalogFacade,
+        PolicySnapshotCache snapshotCache,
+        RegistrationMapper mapper,
+        ApplicationEventPublisher eventPublisher,
+        UnieeeMetrics metrics
+    ) {
+        this.policyRepository = policyRepository;
+        this.snapshotRepository = snapshotRepository;
+        this.windowRepository = windowRepository;
+        this.catalogFacade = catalogFacade;
+        this.snapshotCache = snapshotCache;
+        this.mapper = mapper;
+        this.eventPublisher = eventPublisher;
+        this.metrics = metrics == null ? UnieeeMetrics.noop() : metrics;
+    }
 
     @Transactional
     public PolicySnapshotResponse exportActiveSnapshot(UUID termId) {
@@ -88,6 +131,7 @@ public class PolicySnapshotExporter {
         );
 
         snapshotCache.putSnapshot(termId, canonicalJson);
+        metrics.recordPolicySnapshotExport();
         eventPublisher.publishEvent(new PolicySnapshotExportedEvent(
             saved.getId(),
             saved.getTermId(),

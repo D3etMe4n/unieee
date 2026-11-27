@@ -413,6 +413,25 @@ async fn http_rfc9457_contract_covers_all_validation_auth_readiness_and_routing_
         .unwrap();
     assert_eq!(rz_unready.status(), StatusCode::SERVICE_UNAVAILABLE);
 
+    let m_resp = app
+        .clone()
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(m_resp.status(), StatusCode::OK);
+    let m_body = String::from_utf8(
+        m_resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(m_body.contains("unieee_sse_ready"));
+    assert!(m_body.contains("unieee_sse_active_connections"));
+
     let tok_student = keypair.sign_jwt(
         "s1",
         "https://idp.test",

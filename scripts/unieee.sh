@@ -21,8 +21,9 @@ Usage:
   ./scripts/unieee.sh [--runtime podman|docker] <command> [options]
 
 Commands:
-  up [options]                          Start core stack (optionally with hot-path & TLS mode)
+  up [options]                          Start core stack (optionally with hot-path, monitoring & TLS mode)
      --hot-path                         Include Kafka & Hot Path registration cluster
+     --monitoring                       Include Prometheus, Grafana & internal metrics exporters
      --build                            Rebuild service images before starting containers
      --tls-mode <mode>                  Edge/TLS mode: custom (default) | letsencrypt | cloudflared
      --domain <domain>                  Domain name (for letsencrypt or named cloudflared tunnel)
@@ -31,7 +32,8 @@ Commands:
      --cert <path> --key <path>         Load custom PEM certificate & private key (for --tls-mode custom)
      --cf-token <token>                 Cloudflare Tunnel token for custom domain (omit for Quick Tunnel)
 
-  down [--hot-path-only] [--volumes]    Stop stack (or only hot-path containers)
+  down [--hot-path-only] [--monitoring-only] [--volumes]
+                                        Stop stack (or only hot-path / monitoring containers)
   tls-renew                             Renew Let's Encrypt certificate & reload Reverse Proxy
   health                                Check health of all active services & edge TLS mode
   logs [service] [--tail N] [-f]        View service logs (including certbot / cloudflared)
@@ -89,6 +91,7 @@ detect_runtime "$RUNTIME_ARG"
 cmd_up() {
     local profile="core"
     local build_flag=false
+    local monitoring_flag=false
     local tls_mode="${UNIEEE_TLS_MODE:-custom}"
     local domain="${UNIEEE_DOMAIN:-localhost}"
     local le_email="${UNIEEE_LETSENCRYPT_EMAIL:-}"
@@ -101,6 +104,10 @@ cmd_up() {
         case "$1" in
             --hot-path)
                 profile="hot-path"
+                shift
+                ;;
+            --monitoring)
+                monitoring_flag=true
                 shift
                 ;;
             --build)
@@ -179,7 +186,13 @@ cmd_up() {
     prepare_tls_certs "$tls_mode" "$domain" "$cert_file" "$key_file"
     cleanup_conflicting_edge_containers "$tls_mode" "$cf_submode"
 
-    log_info "Starting unieee stack (runtime=$CTR_RUNTIME, profile=$profile, tls_mode=$tls_mode)..."
+    if [ "$monitoring_flag" = true ]; then
+        export UNIEEE_MONITORING_ENABLED="true"
+    elif container_running "unieee-prometheus"; then
+        export UNIEEE_MONITORING_ENABLED="true"
+    fi
+
+    log_info "Starting unieee stack (runtime=$CTR_RUNTIME, profile=$profile, monitoring=${UNIEEE_MONITORING_ENABLED:-false}, tls_mode=$tls_mode)..."
     local -a compose_up_args=(up -d --wait --remove-orphans)
     if [ "$build_flag" = true ]; then
         compose_up_args+=(--build)
@@ -192,17 +205,26 @@ cmd_up() {
         log_info "To inspect your temporary Quick Tunnel URL, run: ./scripts/unieee.sh logs cloudflared-quick"
     fi
 
-    log_ok "unieee stack (profile=$profile, tls_mode=$tls_mode) is up and healthy."
+    if [ "${UNIEEE_MONITORING_ENABLED:-false}" = "true" ]; then
+        log_info "Monitoring endpoints (loopback only): Prometheus http://127.0.0.1:${UNIEEE_PROMETHEUS_PORT:-9090}, Grafana http://127.0.0.1:${UNIEEE_GRAFANA_PORT:-3000}"
+    fi
+
+    log_ok "unieee stack (profile=$profile, monitoring=${UNIEEE_MONITORING_ENABLED:-false}, tls_mode=$tls_mode) is up and healthy."
 }
 
 cmd_down() {
     local hot_path_only=false
+    local monitoring_only=false
     local remove_volumes=false
 
     while [ $# -gt 0 ]; do
         case "$1" in
             --hot-path-only)
                 hot_path_only=true
+                shift
+                ;;
+            --monitoring-only)
+                monitoring_only=true
                 shift
                 ;;
             --volumes|-v)
@@ -219,7 +241,19 @@ cmd_down() {
     if [ "$hot_path_only" = true ]; then
         log_info "Stopping hot-path containers while keeping core stack running..."
         local c
-        for c in unieee-sse-gateway unieee-enrollment-writer unieee-enrollment-engine-standby unieee-enrollment-engine-active unieee-kafka-init unieee-kafka; do
+        for c in unieee-kafka-exporter unieee-sse-gateway unieee-enrollment-writer unieee-enrollment-engine-standby unieee-enrollment-engine-active unieee-kafka-init unieee-kafka; do
+            if "$CTR_CLI" ps -a --format "{{.Names}}" | grep -qx "$c"; then
+                "$CTR_CLI" rm -f "$c" >/dev/null
+                log_ok "Stopped and removed $c"
+            fi
+        done
+        return 0
+    fi
+
+    if [ "$monitoring_only" = true ]; then
+        log_info "Stopping monitoring containers while keeping application stack running..."
+        local c
+        for c in unieee-grafana unieee-prometheus unieee-kafka-exporter unieee-redis-exporter unieee-pgbouncer-exporter unieee-postgres-exporter unieee-nginx-exporter; do
             if "$CTR_CLI" ps -a --format "{{.Names}}" | grep -qx "$c"; then
                 "$CTR_CLI" rm -f "$c" >/dev/null
                 log_ok "Stopped and removed $c"

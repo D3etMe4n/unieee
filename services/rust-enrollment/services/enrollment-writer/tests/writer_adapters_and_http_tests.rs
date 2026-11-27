@@ -248,6 +248,26 @@ async fn http_healthz_readyz_and_rfc9457_fallbacks() {
         .unwrap();
     assert_eq!(rz_ready.status(), StatusCode::OK);
 
+    let m_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(m_resp.status(), StatusCode::OK);
+    let m_body = String::from_utf8(
+        axum::body::to_bytes(m_resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(m_body.contains("unieee_writer_ready 1"));
+
     let not_found = app
         .clone()
         .oneshot(

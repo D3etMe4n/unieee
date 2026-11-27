@@ -37,7 +37,7 @@ jobs:
 
       - name: Validate shell script syntax
         run: |
-          bash -n scripts/unieee.sh scripts/lib/*.sh
+          bash -n scripts/unieee.sh scripts/lib/*.sh tests/e2e/run-e2e.sh tests/load/run-benchmarks.sh
           sh -n infra/pgbouncer/entrypoint.sh infra/redis/entrypoint-sentinel.sh infra/letsencrypt/entrypoint.sh infra/reverse-proxy/10-detect-resolver.envsh infra/reverse-proxy/20-enrollment-healthcheck.sh
 
       - name: Validate Keycloak realm & Nginx hardening configuration
@@ -56,6 +56,13 @@ jobs:
           auths = [ex["authenticator"] for ex in flows["unieee-first-broker-login-link-only"].get("authenticationExecutions", [])]
           assert "idp-detect-existing-broker-user" in auths and "idp-auto-link" in auths
           assert "idp-create-user-if-unique" not in auths, "Self-registration authenticator must NOT exist in link-only flow"
+          up_providers = realm.get("components", {}).get("org.keycloak.userprofile.UserProfileProvider", [])
+          assert up_providers, "Keycloak 26 UserProfileProvider config must declare student_id and lecturer_id"
+          up_cfg = json.loads(up_providers[0]["config"]["kc.user.profile.config"][0])
+          up_attrs = {a["name"]: a for a in up_cfg.get("attributes", [])}
+          for req_attr in ("student_id", "lecturer_id"):
+              assert req_attr in up_attrs, f"Missing User Profile attribute {req_attr}"
+              assert up_attrs[req_attr].get("permissions", {}).get("edit") == ["admin"], f"{req_attr} must only be admin-editable"
 
           with open("infra/reverse-proxy/nginx.conf", "r", encoding="utf-8") as f:
               nginx_conf = f.read()
@@ -74,13 +81,24 @@ jobs:
           with open("infra/compose.hotpath.yml", "r", encoding="utf-8") as f:
               hp_compose = f.read()
           assert "unieee.enrollment.outcomes" in hp_compose
-          print("Keycloak realm & Nginx hardening validation OK")
+          with open("infra/reverse-proxy/conf.d/default.conf.template", "r", encoding="utf-8") as f:
+              proxy_tpl = f.read()
+          assert "8089" in proxy_tpl and "stub_status" in proxy_tpl
+          import glob
+          dashboards = glob.glob("infra/monitoring/grafana/dashboards/*.json")
+          assert len(dashboards) >= 2, "Expected production & k6 Grafana dashboards"
+          for dash_path in dashboards:
+              with open(dash_path, "r", encoding="utf-8") as df:
+                  json.load(df)
+          print("Keycloak realm, Nginx hardening & monitoring configuration validation OK")
           EOF
 
       - name: Validate Compose configurations
         run: |
           docker compose --env-file .env.example -f infra/compose.base.yml config --quiet
           docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.hotpath.yml config --quiet
+          docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.monitoring.yml config --quiet
+          docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.hotpath.yml -f infra/compose.monitoring.yml --profile hot-path config --quiet
           docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.letsencrypt.yml config --quiet
           docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.cloudflared.yml --profile cf-quick config --quiet
           docker compose --env-file .env.example -f infra/compose.base.yml -f infra/compose.cloudflared.yml --profile cf-named config --quiet

@@ -22,7 +22,7 @@ use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -589,6 +589,11 @@ impl EnrollmentEngine {
                 Ok(batch) => {
                     let resume_offsets = batch.high_watermarks.clone();
                     let count = self.apply_kafka_replay_batch(batch);
+                    metrics::counter!(
+                        "unieee_engine_kafka_replay_events_total",
+                        "source" => "disk_kafka"
+                    )
+                    .increment(count as u64);
                     self.set_readiness(EngineReadiness::Ready);
                     return Ok(BootstrapReport {
                         source: BootstrapSourceKind::DiskSnapshotKafkaReplay,
@@ -616,6 +621,11 @@ impl EnrollmentEngine {
                             opts.replay_throttle,
                         )
                         .await?;
+                    metrics::counter!(
+                        "unieee_engine_kafka_replay_events_total",
+                        "source" => "disk_pg"
+                    )
+                    .increment(count as u64);
                     self.set_readiness(EngineReadiness::Ready);
                     return Ok(BootstrapReport {
                         source: BootstrapSourceKind::DiskSnapshotFallbackPgReplay,
@@ -647,6 +657,11 @@ impl EnrollmentEngine {
         if let Ok(tail) = kafka_replay.replay_since(term_id, kafka_from_ms).await {
             resume_offsets = tail.high_watermarks.clone();
             replayed = self.apply_kafka_replay_batch(tail);
+            metrics::counter!(
+                "unieee_engine_kafka_replay_events_total",
+                "source" => "fresh_pg"
+            )
+            .increment(replayed as u64);
         }
         self.set_readiness(EngineReadiness::Ready);
 
@@ -805,6 +820,17 @@ impl EnrollmentEngine {
             }
         }
         if slot.available_seats() <= 0 {
+            metrics::counter!(
+                "unieee_engine_seat_cas_total",
+                "action" => "register",
+                "outcome" => "full"
+            )
+            .increment(1);
+            metrics::counter!(
+                "unieee_engine_rule_rejections_total",
+                "code" => RuleErrorCode::SectionFull.as_str()
+            )
+            .increment(1);
             return Err(EngineError::RuleViolation {
                 code: RuleErrorCode::SectionFull,
                 detail: format!(
@@ -885,8 +911,29 @@ impl EnrollmentEngine {
         };
 
         let reservation = match reservation_res {
-            Ok(r) => r,
+            Ok(r) => {
+                metrics::counter!(
+                    "unieee_engine_seat_cas_total",
+                    "action" => "register",
+                    "outcome" => "ok"
+                )
+                .increment(1);
+                r
+            }
             Err(violation) => {
+                if violation.code == RuleErrorCode::SectionFull {
+                    metrics::counter!(
+                        "unieee_engine_seat_cas_total",
+                        "action" => "register",
+                        "outcome" => "full"
+                    )
+                    .increment(1);
+                }
+                metrics::counter!(
+                    "unieee_engine_rule_rejections_total",
+                    "code" => violation.code.as_str()
+                )
+                .increment(1);
                 return Err(EngineError::RuleViolation {
                     code: violation.code,
                     detail: violation.detail,
@@ -921,9 +968,31 @@ impl EnrollmentEngine {
             now,
         );
 
+        let publish_started = Instant::now();
         match self.command_publisher.publish_command(&cmd).await {
-            Ok(()) => {}
+            Ok(()) => {
+                metrics::counter!(
+                    "unieee_engine_kafka_command_publish_total",
+                    "outcome" => "ok"
+                )
+                .increment(1);
+                metrics::histogram!("unieee_engine_kafka_command_publish_duration_seconds")
+                    .record(publish_started.elapsed().as_secs_f64());
+            }
             Err(PublishError::Definite(err)) => {
+                metrics::counter!(
+                    "unieee_engine_kafka_command_publish_total",
+                    "outcome" => "definite_err"
+                )
+                .increment(1);
+                metrics::histogram!("unieee_engine_kafka_command_publish_duration_seconds")
+                    .record(publish_started.elapsed().as_secs_f64());
+                metrics::counter!(
+                    "unieee_engine_seat_cas_total",
+                    "action" => "rollback",
+                    "outcome" => "ok"
+                )
+                .increment(1);
                 warn!(
                     event_id = %event_id,
                     section_id = %section_id,
@@ -938,6 +1007,13 @@ impl EnrollmentEngine {
                 });
             }
             Err(PublishError::Indeterminate(err)) => {
+                metrics::counter!(
+                    "unieee_engine_kafka_command_publish_total",
+                    "outcome" => "indeterminate_err"
+                )
+                .increment(1);
+                metrics::histogram!("unieee_engine_kafka_command_publish_duration_seconds")
+                    .record(publish_started.elapsed().as_secs_f64());
                 warn!(
                     event_id = %event_id,
                     section_id = %section_id,
@@ -1094,6 +1170,11 @@ impl EnrollmentEngine {
         let (entry_epoch, prev_state, prev_event_id) = match drop_res {
             Ok(v) => v,
             Err(violation) => {
+                metrics::counter!(
+                    "unieee_engine_rule_rejections_total",
+                    "code" => violation.code.as_str()
+                )
+                .increment(1);
                 return Err(EngineError::RuleViolation {
                     code: violation.code,
                     detail: violation.detail,
@@ -1128,9 +1209,25 @@ impl EnrollmentEngine {
             now,
         );
 
+        let publish_started = Instant::now();
         match self.command_publisher.publish_command(&cmd).await {
-            Ok(()) => {}
+            Ok(()) => {
+                metrics::counter!(
+                    "unieee_engine_kafka_command_publish_total",
+                    "outcome" => "ok"
+                )
+                .increment(1);
+                metrics::histogram!("unieee_engine_kafka_command_publish_duration_seconds")
+                    .record(publish_started.elapsed().as_secs_f64());
+            }
             Err(PublishError::Definite(err)) => {
+                metrics::counter!(
+                    "unieee_engine_kafka_command_publish_total",
+                    "outcome" => "definite_err"
+                )
+                .increment(1);
+                metrics::histogram!("unieee_engine_kafka_command_publish_duration_seconds")
+                    .record(publish_started.elapsed().as_secs_f64());
                 warn!(
                     event_id = %event_id,
                     section_id = %section_id,
@@ -1153,6 +1250,13 @@ impl EnrollmentEngine {
                 });
             }
             Err(PublishError::Indeterminate(err)) => {
+                metrics::counter!(
+                    "unieee_engine_kafka_command_publish_total",
+                    "outcome" => "indeterminate_err"
+                )
+                .increment(1);
+                metrics::histogram!("unieee_engine_kafka_command_publish_duration_seconds")
+                    .record(publish_started.elapsed().as_secs_f64());
                 warn!(
                     event_id = %event_id,
                     section_id = %section_id,
@@ -1182,9 +1286,21 @@ impl EnrollmentEngine {
             }) {
                 match slot.try_release() {
                     Ok(rel) => {
+                        metrics::counter!(
+                            "unieee_engine_seat_cas_total",
+                            "action" => "drop",
+                            "outcome" => "ok"
+                        )
+                        .increment(1);
                         tentative_release = Some(rel);
                     }
                     Err(err) => {
+                        metrics::counter!(
+                            "unieee_engine_seat_cas_total",
+                            "action" => "drop",
+                            "outcome" => "error"
+                        )
+                        .increment(1);
                         warn!(
                             section_id = %section_id,
                             error = %err,
@@ -1601,14 +1717,27 @@ impl EnrollmentEngine {
         if ev.term_id != self.term_id() {
             return None;
         }
+        let lag_secs = (Utc::now() - ev.processed_at).num_milliseconds().max(0) as f64 / 1000.0;
+        metrics::histogram!("unieee_engine_kafka_outcome_lag_seconds").record(lag_secs);
         match ev.status {
             EnrollmentOutcomeStatus::Confirmed => {
+                metrics::counter!(
+                    "unieee_engine_kafka_outcomes_consumed_total",
+                    "status" => "confirmed"
+                )
+                .increment(1);
                 self.apply_confirmed_outcome_in_ram(ev);
                 None
             }
-            EnrollmentOutcomeStatus::Reverted => ev
-                .to_revert_event()
-                .map(|revert| self.apply_revert_in_ram(&revert)),
+            EnrollmentOutcomeStatus::Reverted => {
+                metrics::counter!(
+                    "unieee_engine_kafka_outcomes_consumed_total",
+                    "status" => "reverted"
+                )
+                .increment(1);
+                ev.to_revert_event()
+                    .map(|revert| self.apply_revert_in_ram(&revert))
+            }
         }
     }
 
@@ -1785,6 +1914,12 @@ impl EnrollmentEngine {
         });
 
         if outcome == RevertOutcome::Applied {
+            metrics::counter!(
+                "unieee_engine_seat_cas_total",
+                "action" => "revert",
+                "outcome" => "ok"
+            )
+            .increment(1);
             self.event_index.insert(
                 revert.event_id,
                 EventStatusRecord {
@@ -1810,30 +1945,49 @@ impl EnrollmentEngine {
     }
 
     pub fn apply_delta_event(&self, delta: &EnrollmentDeltaEvent) -> DeltaOutcome {
-        match delta {
+        let (delta_type, outcome) = match delta {
             EnrollmentDeltaEvent::StudentStandingUpdated(ev) => {
-                self.apply_student_standing_delta(ev)
+                ("student_standing", self.apply_student_standing_delta(ev))
             }
             EnrollmentDeltaEvent::SectionCapacityUpdated(ev) => {
-                self.apply_section_capacity_delta(ev)
+                ("section_capacity", self.apply_section_capacity_delta(ev))
             }
-            EnrollmentDeltaEvent::Revert(ev) => match self.apply_revert_in_ram(ev) {
-                RevertOutcome::Applied => DeltaOutcome::Applied,
-                RevertOutcome::DuplicateInRam => DeltaOutcome::DuplicateOrStale,
-                RevertOutcome::UnknownSectionOrStudent => {
-                    if ev.term_id != self.term_id() {
-                        DeltaOutcome::WrongTerm
-                    } else {
-                        DeltaOutcome::TargetNotFound
+            EnrollmentDeltaEvent::Revert(ev) => (
+                "revert",
+                match self.apply_revert_in_ram(ev) {
+                    RevertOutcome::Applied => DeltaOutcome::Applied,
+                    RevertOutcome::DuplicateInRam => DeltaOutcome::DuplicateOrStale,
+                    RevertOutcome::UnknownSectionOrStudent => {
+                        if ev.term_id != self.term_id() {
+                            DeltaOutcome::WrongTerm
+                        } else {
+                            DeltaOutcome::TargetNotFound
+                        }
                     }
-                }
-            },
-            EnrollmentDeltaEvent::GateControl(ev) => match self.apply_gate_control(ev) {
-                Ok(()) => DeltaOutcome::Applied,
-                Err(RuleErrorCode::StaleEpoch) => DeltaOutcome::DuplicateOrStale,
-                Err(_) => DeltaOutcome::WrongTerm,
-            },
-        }
+                },
+            ),
+            EnrollmentDeltaEvent::GateControl(ev) => (
+                "gate_control",
+                match self.apply_gate_control(ev) {
+                    Ok(()) => DeltaOutcome::Applied,
+                    Err(RuleErrorCode::StaleEpoch) => DeltaOutcome::DuplicateOrStale,
+                    Err(_) => DeltaOutcome::WrongTerm,
+                },
+            ),
+        };
+        let outcome_label = match outcome {
+            DeltaOutcome::Applied => "applied",
+            DeltaOutcome::DuplicateOrStale => "duplicate_or_stale",
+            DeltaOutcome::WrongTerm => "wrong_term",
+            DeltaOutcome::TargetNotFound => "not_found",
+        };
+        metrics::counter!(
+            "unieee_engine_kafka_deltas_consumed_total",
+            "delta_type" => delta_type,
+            "outcome" => outcome_label
+        )
+        .increment(1);
+        outcome
     }
 
     fn advance_epoch_if_higher(&self, catalog: &TermCatalog, target_epoch: u64) {
