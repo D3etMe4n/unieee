@@ -60,12 +60,33 @@ check_health() {
         log_info "edge-tls-mode: custom / local self-signed"
     fi
 
-    # 3. Keycloak (OIDC Discovery via Reverse Proxy)
+    # 3. Keycloak (OIDC Discovery via Reverse Proxy) & Edge Security Isolation
     local oidc_url="https://127.0.0.1:${https_port}/auth/realms/unieee/.well-known/openid-configuration"
     if curl -skf "$oidc_url" 2>/dev/null | grep -q '"issuer"'; then
         log_ok "keycloak: OIDC discovery ready (/auth/realms/unieee)"
     else
         log_err "keycloak: OIDC discovery FAILED ($oidc_url)"
+        failures=$((failures + 1))
+    fi
+
+    local blocked_path blocked_code blocked_failed=0
+    for blocked_path in \
+        "/auth/admin/master/console/" \
+        "/auth/admin/realms/unieee" \
+        "/auth/realms/master/.well-known/openid-configuration" \
+        "/actuator/prometheus" \
+        "/metrics" \
+        "/internal/promote"
+    do
+        blocked_code=$(curl -sk -o /dev/null -w "%{http_code}" "https://127.0.0.1:${https_port}${blocked_path}" 2>/dev/null || true)
+        if [ "$blocked_code" != "404" ]; then
+            log_err "edge-security: expected HTTP 404 for ${blocked_path}, got '${blocked_code}'"
+            blocked_failed=$((blocked_failed + 1))
+        fi
+    done
+    if [ "$blocked_failed" -eq 0 ]; then
+        log_ok "edge-security: Keycloak admin/master, Actuator, Metrics & Internal APIs blocked on edge (404)"
+    else
         failures=$((failures + 1))
     fi
 

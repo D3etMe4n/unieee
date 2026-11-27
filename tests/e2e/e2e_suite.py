@@ -406,6 +406,7 @@ def exec_psql(ctr_cli: str, env: dict[str, str], sql: str) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run unieee 7-scenario E2E & Regression Suite")
     parser.add_argument("--base-url", default=None)
+    parser.add_argument("--keycloak-admin-url", default=None)
     parser.add_argument("--runtime", choices=("podman", "docker"), default=None)
     parser.add_argument("--report-path", default=str(ROOT_DIR / "tests/e2e/results/latest-e2e-report.json"))
     parser.add_argument("--check-metrics", action=argparse.BooleanOptionalAction, default=True)
@@ -413,10 +414,13 @@ def main() -> int:
 
     env = load_env_defaults()
     https_port = env.get("UNIEEE_HTTPS_PORT", "8443")
+    kc_admin_port = env.get("UNIEEE_KEYCLOAK_ADMIN_PORT", "8180")
     base_url = args.base_url or f"https://127.0.0.1:{https_port}"
+    kc_admin_url = (args.keycloak_admin_url or f"http://127.0.0.1:{kc_admin_port}").rstrip("/")
     ctr_cli = detect_container_cli(args.runtime)
 
     client = HttpClient(base_url)
+    kc_admin_client = HttpClient(kc_admin_url)
     suffix = f"{int(time.time()) % 1000000:06d}"
     term_code = f"E2E-{suffix}"
     prev_term_code = f"E2E-PREV-{suffix}"
@@ -437,11 +441,25 @@ def main() -> int:
         report["scenarios"].append({"scenario": num, "name": name, "status": "PASS", "details": details})
 
     try:
+        # Verify sensitive Keycloak Admin/Master, Actuator, Metrics & Internal APIs are blocked (404) at the edge
+        for blocked_path in (
+            "/auth/admin/master/console/",
+            "/auth/admin/realms/unieee",
+            "/auth/realms/master/.well-known/openid-configuration",
+            "/actuator/prometheus",
+            "/metrics",
+            "/internal/promote",
+        ):
+            blocked_status, _, _, _ = client.request("GET", blocked_path)
+            assert blocked_status == 404, (
+                f"Expected edge proxy to block '{blocked_path}' with HTTP 404, got {blocked_status}"
+            )
+
         admin_user = env.get("UNIEEE_OPS_ADMIN_USER", "admin01")
         admin_pass = env.get("UNIEEE_OPS_ADMIN_PASSWORD", "Admin@123")
         admin_cli_secret = env.get("KEYCLOAK_ADMIN_CLIENT_SECRET", "unieee-admin-cli-dev-secret")
         admin_token = acquire_password_token(client, admin_user, admin_pass)
-        kc_admin_token = acquire_admin_cli_token(client, admin_cli_secret)
+        kc_admin_token = acquire_admin_cli_token(kc_admin_client, admin_cli_secret)
 
         # ------------------------------------------------------------------
         # Scenario 1: Academic Setup & Wish Survey (Non-Seat-Reserving)
@@ -562,7 +580,7 @@ def main() -> int:
                 "initialPassword": lecturer_pass,
             },
         )
-        finalize_keycloak_password(client, kc_admin_token, lecturer["keycloakSub"], lecturer_pass)
+        finalize_keycloak_password(kc_admin_client, kc_admin_token, lecturer["keycloakSub"], lecturer_pass)
         lec_token = acquire_password_token(client, f"lec{suffix}", lecturer_pass)
 
         def create_student(tag: str, cohort: str, debt: str = "0.00") -> tuple[dict[str, Any], str]:
@@ -583,7 +601,7 @@ def main() -> int:
                     "initialPassword": student_pass,
                 },
             )
-            finalize_keycloak_password(client, kc_admin_token, stu["keycloakSub"], student_pass)
+            finalize_keycloak_password(kc_admin_client, kc_admin_token, stu["keycloakSub"], student_pass)
             tok = acquire_password_token(client, code, student_pass)
             return stu, tok
 
