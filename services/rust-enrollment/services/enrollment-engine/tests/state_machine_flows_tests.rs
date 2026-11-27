@@ -14,8 +14,8 @@ use unieee_domain::{
     SectionId, SectionStatus, StudentId, TermId, WindowId, WindowStatus,
 };
 use unieee_events::{
-    EnrollmentDeltaEvent, GateControlEvent, RevertEvent, SeatConfirmedEvent,
-    SectionCapacityUpdatedEvent, StudentStandingUpdatedEvent,
+    EnrollmentDeltaEvent, GateControlEvent, RevertEvent, SectionCapacityUpdatedEvent,
+    StudentStandingUpdatedEvent,
 };
 
 #[tokio::test]
@@ -387,16 +387,18 @@ async fn kafka_publish_failure_rolls_back_ram_seat_and_bitmask_on_register_and_d
         .unwrap();
     assert_eq!(accepted.available_seats, 1);
 
-    engine.apply_seat_confirmed(&SeatConfirmedEvent::new(
-        accepted.event_id,
-        term_id,
-        SectionId::new(10),
-        sid,
-        1,
-        2,
-        EnrollmentEventStatus::Confirmed,
-        now,
-    ));
+    engine
+        .apply_outcome_event(&unieee_events::EnrollmentOutcomeEvent::confirmed(
+            accepted.event_id,
+            term_id,
+            sid,
+            SectionId::new(10),
+            c1,
+            EnrollmentAction::Register,
+            1,
+            now,
+        ))
+        .await;
     assert_eq!(
         engine.get_event_status(accepted.event_id).unwrap().state,
         HotPathEnrollmentState::Confirmed
@@ -464,10 +466,11 @@ async fn ram_first_revert_idempotency_tolerates_duplicates_and_redis_failures() 
         1,
         now,
     );
+    let revert_outcome = unieee_events::EnrollmentOutcomeEvent::from_revert(&revert);
 
     assert_eq!(
-        engine.apply_revert_event(&revert).await,
-        RevertOutcome::Applied
+        engine.apply_outcome_event(&revert_outcome).await,
+        Some(RevertOutcome::Applied)
     );
     assert_eq!(
         engine
@@ -484,11 +487,11 @@ async fn ram_first_revert_idempotency_tolerates_duplicates_and_redis_failures() 
         HotPathEnrollmentState::Reverted
     );
 
-    // Duplicate RevertEvent -> caught in RAM immediately (no +2 seat overflow!)
+    // Duplicate Revert outcome -> caught in RAM immediately (no +2 seat overflow!)
     dedup_store.fail.store(false, Ordering::Release);
     assert_eq!(
-        engine.apply_revert_event(&revert).await,
-        RevertOutcome::DuplicateInRam
+        engine.apply_outcome_event(&revert_outcome).await,
+        Some(RevertOutcome::DuplicateInRam)
     );
     assert_eq!(
         engine
@@ -505,16 +508,18 @@ async fn ram_first_revert_idempotency_tolerates_duplicates_and_redis_failures() 
         .register(sid, SectionId::new(20), EnrollmentAction::Register, now)
         .await
         .unwrap();
-    engine.apply_seat_confirmed(&SeatConfirmedEvent::new(
-        acc2.event_id,
-        term_id,
-        SectionId::new(20),
-        sid,
-        4,
-        5,
-        EnrollmentEventStatus::Confirmed,
-        now,
-    ));
+    engine
+        .apply_outcome_event(&unieee_events::EnrollmentOutcomeEvent::confirmed(
+            acc2.event_id,
+            term_id,
+            sid,
+            SectionId::new(20),
+            c1,
+            EnrollmentAction::Register,
+            1,
+            now,
+        ))
+        .await;
     let drop_acc = engine
         .drop_section(sid, SectionId::new(20), now)
         .await
@@ -540,8 +545,12 @@ async fn ram_first_revert_idempotency_tolerates_duplicates_and_redis_failures() 
         now,
     );
     assert_eq!(
-        engine.apply_revert_event(&revert_drop).await,
-        RevertOutcome::Applied
+        engine
+            .apply_outcome_event(&unieee_events::EnrollmentOutcomeEvent::from_revert(
+                &revert_drop
+            ))
+            .await,
+        Some(RevertOutcome::Applied)
     );
     assert_eq!(
         engine
@@ -1129,16 +1138,17 @@ async fn covers_remaining_rule_error_branches_and_idempotent_replays() {
         eng2.get_event_status(drop_cmd_id).unwrap().state,
         HotPathEnrollmentState::DropPending
     );
-    eng2.apply_seat_confirmed(&SeatConfirmedEvent::new(
+    eng2.apply_outcome_event(&unieee_events::EnrollmentOutcomeEvent::confirmed(
         drop_cmd_id,
         term_id,
-        SectionId::new(88),
         sid2,
-        10,
-        10,
-        EnrollmentEventStatus::Confirmed,
+        SectionId::new(88),
+        c_target,
+        EnrollmentAction::Drop,
+        2,
         now,
-    ));
+    ))
+    .await;
     assert_eq!(
         eng2.get_event_status(drop_cmd_id).unwrap().state,
         HotPathEnrollmentState::Dropped
@@ -1339,7 +1349,7 @@ async fn covers_remaining_rule_error_branches_and_idempotent_replays() {
     }
 
     assert_eq!(
-        eng3.apply_revert_event(&RevertEvent::new(
+        eng3.apply_outcome_event(&unieee_events::EnrollmentOutcomeEvent::reverted(
             EventId::new_v7(),
             TermId::new_v4(),
             sid_nosub,
@@ -1352,10 +1362,10 @@ async fn covers_remaining_rule_error_branches_and_idempotent_replays() {
             now
         ))
         .await,
-        RevertOutcome::UnknownSectionOrStudent
+        None
     );
     assert_eq!(
-        eng3.apply_revert_event(&RevertEvent::new(
+        eng3.apply_outcome_event(&unieee_events::EnrollmentOutcomeEvent::reverted(
             EventId::new_v7(),
             term_id,
             StudentId::new_v4(),
@@ -1368,7 +1378,7 @@ async fn covers_remaining_rule_error_branches_and_idempotent_replays() {
             now
         ))
         .await,
-        RevertOutcome::UnknownSectionOrStudent
+        Some(RevertOutcome::UnknownSectionOrStudent)
     );
 
     assert_eq!(
@@ -1504,8 +1514,12 @@ async fn late_revert_after_reregister_and_drop_while_reserved_preserves_new_stat
         now,
     );
     assert_eq!(
-        engine.apply_revert_event(&late_rev1).await,
-        RevertOutcome::Applied
+        engine
+            .apply_outcome_event(&unieee_events::EnrollmentOutcomeEvent::from_revert(
+                &late_rev1
+            ))
+            .await,
+        Some(RevertOutcome::Applied)
     );
     assert_eq!(
         engine
@@ -1522,18 +1536,20 @@ async fn late_revert_after_reregister_and_drop_while_reserved_preserves_new_stat
         HotPathEnrollmentState::Reverted
     );
 
-    // Case B: Register ev3 after reverting ev2 -> late RevertEvent for prior ev1 does NOT remove ev3
+    // Case B: Register ev3 after reverting ev2 -> late Revert outcome for prior ev1 does NOT remove ev3
     let ev2_id = st.active_enrollments[0].last_event_id;
-    engine.apply_seat_confirmed(&SeatConfirmedEvent::new(
-        ev2_id,
-        term_id,
-        SectionId::new(91),
-        sid,
-        5,
-        5,
-        EnrollmentEventStatus::Confirmed,
-        now,
-    ));
+    engine
+        .apply_outcome_event(&unieee_events::EnrollmentOutcomeEvent::confirmed(
+            ev2_id,
+            term_id,
+            sid,
+            SectionId::new(91),
+            c1,
+            EnrollmentAction::Register,
+            1,
+            now,
+        ))
+        .await;
     let ev3 = engine
         .register(sid, SectionId::new(91), EnrollmentAction::Register, now)
         .await
@@ -1552,8 +1568,12 @@ async fn late_revert_after_reregister_and_drop_while_reserved_preserves_new_stat
         now,
     );
     assert_eq!(
-        engine.apply_revert_event(&late_rev_old).await,
-        RevertOutcome::Applied
+        engine
+            .apply_outcome_event(&unieee_events::EnrollmentOutcomeEvent::from_revert(
+                &late_rev_old
+            ))
+            .await,
+        Some(RevertOutcome::Applied)
     );
     assert_eq!(
         engine
@@ -1587,16 +1607,18 @@ async fn drop_defers_seat_release_until_kafka_ack_and_handles_indeterminate_and_
         .register(sid, SectionId::new(92), EnrollmentAction::Register, now)
         .await
         .unwrap();
-    engine.apply_seat_confirmed(&SeatConfirmedEvent::new(
-        reg.event_id,
-        term_id,
-        SectionId::new(92),
-        sid,
-        1,
-        2,
-        EnrollmentEventStatus::Confirmed,
-        now,
-    ));
+    engine
+        .apply_outcome_event(&unieee_events::EnrollmentOutcomeEvent::confirmed(
+            reg.event_id,
+            term_id,
+            sid,
+            SectionId::new(92),
+            c1,
+            EnrollmentAction::Register,
+            1,
+            now,
+        ))
+        .await;
 
     // Pause drop_section inside Kafka publish: seat & credits & schedule MUST remain held until ACK!
     pub_mock.pause_next.store(true, Ordering::Release);
@@ -1675,17 +1697,19 @@ async fn drop_defers_seat_release_until_kafka_ack_and_handles_indeterminate_and_
         1
     );
 
-    // When SeatConfirmedEvent arrives after Indeterminate Drop, apply_seat_confirmed releases the seat & drops entry!
-    engine.apply_seat_confirmed(&SeatConfirmedEvent::new(
-        pending_ev_id,
-        term_id,
-        SectionId::new(92),
-        sid,
-        2,
-        2,
-        EnrollmentEventStatus::Confirmed,
-        now,
-    ));
+    // When confirmed outcome arrives after Indeterminate Drop, apply_outcome_event releases the seat & drops entry!
+    engine
+        .apply_outcome_event(&unieee_events::EnrollmentOutcomeEvent::confirmed(
+            pending_ev_id,
+            term_id,
+            sid,
+            SectionId::new(92),
+            c1,
+            EnrollmentAction::Drop,
+            engine.epoch(),
+            now,
+        ))
+        .await;
     assert_eq!(
         engine
             .seat_snapshot(SectionId::new(92))
@@ -1699,7 +1723,7 @@ async fn drop_defers_seat_release_until_kafka_ack_and_handles_indeterminate_and_
         .active_enrollments
         .is_empty());
 
-    // Indeterminate Register retains Reserved & held seat until RevertEvent frees it
+    // Indeterminate Register retains Reserved & held seat until Reverted outcome frees it
     let indet_reg = engine
         .register(sid, SectionId::new(92), EnrollmentAction::Register, now)
         .await
@@ -1721,7 +1745,7 @@ async fn drop_defers_seat_release_until_kafka_ack_and_handles_indeterminate_and_
     let kept_ev = engine.student_snapshot(sid).unwrap().active_enrollments[0].last_event_id;
     assert_eq!(
         engine
-            .apply_revert_event(&RevertEvent::new(
+            .apply_outcome_event(&unieee_events::EnrollmentOutcomeEvent::reverted(
                 kept_ev,
                 term_id,
                 sid,
@@ -1734,7 +1758,7 @@ async fn drop_defers_seat_release_until_kafka_ack_and_handles_indeterminate_and_
                 now,
             ))
             .await,
-        RevertOutcome::Applied
+        Some(RevertOutcome::Applied)
     );
     assert_eq!(
         engine
@@ -1924,16 +1948,18 @@ async fn event_index_ttl_sweeper_and_safe_24h_uuidv7_dedup_pruning() {
         .register(sid2, SectionId::new(95), EnrollmentAction::Register, now)
         .await
         .unwrap();
-    engine.apply_seat_confirmed(&SeatConfirmedEvent::new(
-        acc2.event_id,
-        term_id,
-        SectionId::new(95),
-        sid2,
-        9,
-        10,
-        EnrollmentEventStatus::Confirmed,
-        now,
-    ));
+    engine
+        .apply_outcome_event(&unieee_events::EnrollmentOutcomeEvent::confirmed(
+            acc2.event_id,
+            term_id,
+            sid2,
+            SectionId::new(95),
+            acc2.course_id,
+            EnrollmentAction::Register,
+            1,
+            now,
+        ))
+        .await;
 
     // At now + 20m: neither settled nor unsettled evicted; >24h old_v7_unpinned pruned,
     // while 23h20m borderline_v7 MUST be retained even though runtime dedup_retention was 60s!
@@ -1969,4 +1995,230 @@ async fn event_index_ttl_sweeper_and_safe_24h_uuidv7_dedup_pruning() {
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
     let _ = sd_tx.send(true);
     let _ = sweeper.await;
+}
+
+#[tokio::test]
+async fn out_of_order_kafka_outcomes_on_standby_are_idempotent_with_zero_double_count() {
+    let now = Utc::now();
+    let term_id = TermId::new_v4();
+    let c1 = CourseId::new_v4();
+    let c2 = CourseId::new_v4();
+    let sid = StudentId::new_v4();
+
+    let sec1 = make_section(term_id, 201, c1, "CS201", 3, 5, 0, 1, 1, 2);
+    let sec2 = make_section(term_id, 202, c2, "CS202", 4, 5, 0, 3, 1, 2);
+    let ds = make_dataset(
+        term_id,
+        vec![sec1, sec2],
+        Vec::new(),
+        vec![make_student(sid, "S_OOO", Some("sub-ooo"), "K24", "CSE")],
+        now,
+    );
+    let (standby, _, _) = make_ready_engine(ds, NodeRole::Standby);
+
+    // 1) Confirmed Register outcome arrives BEFORE its EnrollmentCommandEvent on Standby
+    let reg1_ev = EventId::new_v7();
+    standby
+        .apply_outcome_event(&unieee_events::EnrollmentOutcomeEvent::confirmed(
+            reg1_ev,
+            term_id,
+            sid,
+            SectionId::new(201),
+            c1,
+            EnrollmentAction::Register,
+            2,
+            now,
+        ))
+        .await;
+    assert_eq!(
+        standby
+            .seat_snapshot(SectionId::new(201))
+            .unwrap()
+            .available_seats,
+        4
+    );
+    assert_eq!(standby.student_snapshot(sid).unwrap().current_credits, 3);
+    assert_eq!(
+        standby.get_event_status(reg1_ev).unwrap().state,
+        HotPathEnrollmentState::Confirmed
+    );
+
+    // Duplicate Confirmed outcome AND late EnrollmentCommandEvent must both be no-ops (no double reserve)
+    standby
+        .apply_outcome_event(&unieee_events::EnrollmentOutcomeEvent::confirmed(
+            reg1_ev,
+            term_id,
+            sid,
+            SectionId::new(201),
+            c1,
+            EnrollmentAction::Register,
+            2,
+            now,
+        ))
+        .await;
+    standby.apply_replayed_command(&unieee_events::EnrollmentCommandEvent::new(
+        reg1_ev,
+        term_id,
+        sid,
+        SectionId::new(201),
+        c1,
+        EnrollmentAction::Register,
+        2,
+        now,
+    ));
+    assert_eq!(
+        standby
+            .seat_snapshot(SectionId::new(201))
+            .unwrap()
+            .available_seats,
+        4
+    );
+    assert_eq!(standby.student_snapshot(sid).unwrap().current_credits, 3);
+
+    // 2) Confirmed Drop outcome arrives BEFORE its Drop command on Standby
+    let drop1_ev = EventId::new_v7();
+    standby
+        .apply_outcome_event(&unieee_events::EnrollmentOutcomeEvent::confirmed(
+            drop1_ev,
+            term_id,
+            sid,
+            SectionId::new(201),
+            c1,
+            EnrollmentAction::Drop,
+            2,
+            now,
+        ))
+        .await;
+    standby.apply_replayed_command(&unieee_events::EnrollmentCommandEvent::new(
+        drop1_ev,
+        term_id,
+        sid,
+        SectionId::new(201),
+        c1,
+        EnrollmentAction::Drop,
+        2,
+        now,
+    ));
+    assert_eq!(
+        standby
+            .seat_snapshot(SectionId::new(201))
+            .unwrap()
+            .available_seats,
+        5
+    );
+    assert_eq!(standby.student_snapshot(sid).unwrap().current_credits, 0);
+    assert_eq!(
+        standby.get_event_status(drop1_ev).unwrap().state,
+        HotPathEnrollmentState::Dropped
+    );
+
+    // 3) Reverted Register outcome arrives BEFORE its Command on Standby -> late Command must be skipped
+    let rev2_ev = EventId::new_v7();
+    assert_eq!(
+        standby
+            .apply_outcome_event(&unieee_events::EnrollmentOutcomeEvent::reverted(
+                rev2_ev,
+                term_id,
+                sid,
+                SectionId::new(202),
+                c2,
+                EnrollmentAction::Register,
+                RuleErrorCode::SectionFull,
+                "PG full",
+                2,
+                now,
+            ))
+            .await,
+        Some(RevertOutcome::Applied)
+    );
+    standby.apply_replayed_command(&unieee_events::EnrollmentCommandEvent::new(
+        rev2_ev,
+        term_id,
+        sid,
+        SectionId::new(202),
+        c2,
+        EnrollmentAction::Register,
+        2,
+        now,
+    ));
+    assert_eq!(
+        standby
+            .seat_snapshot(SectionId::new(202))
+            .unwrap()
+            .available_seats,
+        5
+    );
+    assert!(standby
+        .student_snapshot(sid)
+        .unwrap()
+        .active_enrollments
+        .is_empty());
+    assert_eq!(
+        standby.get_event_status(rev2_ev).unwrap().state,
+        HotPathEnrollmentState::Reverted
+    );
+}
+
+#[tokio::test]
+async fn ram_read_views_list_term_seats_and_student_enrollments_work_on_active_and_standby() {
+    let now = Utc::now();
+    let term_id = TermId::new_v4();
+    let c1 = CourseId::new_v4();
+    let sid = StudentId::new_v4();
+
+    let sec1 = make_section(term_id, 301, c1, "CS301", 3, 10, 2, 1, 1, 2);
+    let mut sec2 = make_section(term_id, 302, CourseId::new_v4(), "CS302", 2, 5, 5, 3, 1, 2);
+    sec2.status = SectionStatus::Cancelled;
+    let ds = make_dataset(
+        term_id,
+        vec![sec1, sec2],
+        Vec::new(),
+        vec![make_student(sid, "S_VIEW", Some("sub-view"), "K24", "CSE")],
+        now,
+    );
+    let (active, _, _) = make_ready_engine(ds.clone(), NodeRole::Active);
+    let (standby, _, _) = make_ready_engine(ds, NodeRole::Standby);
+
+    let reg = active
+        .register(sid, SectionId::new(301), EnrollmentAction::Register, now)
+        .await
+        .unwrap();
+
+    let seats = active.list_term_seats(term_id).unwrap();
+    assert_eq!(seats.len(), 2);
+    assert_eq!(seats[0].section_id, SectionId::new(301));
+    assert_eq!(seats[0].available_seats, 7);
+    assert_eq!(seats[0].max_capacity, 10);
+    assert_eq!(seats[0].status, SectionStatus::Open);
+    assert_eq!(seats[1].section_id, SectionId::new(302));
+    assert_eq!(seats[1].status, SectionStatus::Cancelled);
+
+    let me = active.get_student_enrollments(term_id, sid).unwrap();
+    assert_eq!(me.term_id, term_id);
+    assert_eq!(me.student_id, sid);
+    assert_eq!(me.current_credits, 3);
+    assert_eq!(me.items.len(), 1);
+    assert_eq!(me.items[0].last_event_id, reg.event_id);
+
+    // Standby supports both read views when READY, and unknown student returns empty list
+    assert_eq!(standby.list_term_seats(term_id).unwrap().len(), 2);
+    let unknown_me = standby
+        .get_student_enrollments(term_id, StudentId::new_v4())
+        .unwrap();
+    assert_eq!(unknown_me.current_credits, 0);
+    assert!(unknown_me.items.is_empty());
+
+    assert!(matches!(
+        standby.list_term_seats(TermId::new_v4()),
+        Err(EngineError::TermNotFound(_))
+    ));
+    standby.set_readiness(EngineReadiness::Syncing);
+    assert!(matches!(
+        standby.list_term_seats(term_id),
+        Err(EngineError::NotReady(EngineReadiness::Syncing))
+    ));
+    assert!(matches!(
+        standby.get_student_enrollments(term_id, sid),
+        Err(EngineError::NotReady(EngineReadiness::Syncing))
+    ));
 }

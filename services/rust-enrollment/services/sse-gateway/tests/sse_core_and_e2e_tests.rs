@@ -12,9 +12,9 @@ use enrollment_engine::core::{
     TentativeSeatSink,
 };
 use enrollment_writer::core::{
-    DlqPublisher, FastBatchCommitResult, FastPathBatchError, OutboxRevertRow, RedisBatchUpdate,
-    RedisWriterSink, SingleEventOutcome, WriterProcessor, WriterProcessorConfig, WriterReadiness,
-    WriterRepository,
+    DlqPublisher, FastBatchCommitResult, FastPathBatchError, OutcomePublisher, RedisBatchUpdate,
+    RedisWriterSink, SingleEventOutcome, StaleRejectionOutcome, WriterProcessor,
+    WriterProcessorConfig, WriterReadiness, WriterRepository,
 };
 use rust_decimal::Decimal;
 use sse_gateway::core::{JitterPolicy, SseHub, SseHubConfig, SseReadiness};
@@ -32,8 +32,8 @@ use unieee_domain::{
     SectionId, SectionStatus, StudentId, TermId, TuitionHoldPolicy, WindowId, WindowStatus,
 };
 use unieee_events::{
-    DeadLetterEvent, EnrollmentCommandEvent, GateControlEvent, HotPathPubSubMessage, RevertEvent,
-    SeatConfirmedEvent, SeatTentativeEvent,
+    DeadLetterEvent, EnrollmentCommandEvent, EnrollmentOutcomeEvent, GateControlEvent,
+    HotPathPubSubMessage, RevertEvent, SeatConfirmedEvent, SeatTentativeEvent,
 };
 
 // ---------------------------------------------------------------------------
@@ -79,14 +79,12 @@ impl RevertDedupStore for NoopDedup {
 
 struct WriterToSseBridge {
     hub: Arc<SseHub>,
-    engine: Arc<EnrollmentEngine>,
 }
 
 #[async_trait]
 impl RedisWriterSink for WriterToSseBridge {
     async fn apply_confirmed_batch(&self, update: &RedisBatchUpdate) -> Result<(), String> {
         for ev in &update.confirmed_events {
-            self.engine.apply_seat_confirmed(ev);
             self.hub
                 .handle_pubsub_message(HotPathPubSubMessage::SeatConfirmed(ev.clone()));
         }
@@ -95,15 +93,26 @@ impl RedisWriterSink for WriterToSseBridge {
 
     async fn publish_revert_events(&self, events: &[RevertEvent]) -> Result<(), String> {
         for ev in events {
-            let outcome = self.engine.apply_revert_event(ev).await;
-            assert_eq!(outcome, RevertOutcome::Applied);
             self.hub
                 .handle_pubsub_message(HotPathPubSubMessage::Revert(ev.clone()));
         }
         Ok(())
     }
+}
 
-    async fn publish_raw_revert_payloads(&self, _payloads: &[String]) -> Result<(), String> {
+struct WriterToEngineOutcomeBridge {
+    engine: Arc<EnrollmentEngine>,
+}
+
+#[async_trait]
+impl OutcomePublisher for WriterToEngineOutcomeBridge {
+    async fn publish_outcomes(&self, events: &[EnrollmentOutcomeEvent]) -> Result<(), String> {
+        for ev in events {
+            let outcome = self.engine.apply_outcome_event(ev).await;
+            if let Some(rev) = outcome {
+                assert_eq!(rev, RevertOutcome::Applied);
+            }
+        }
         Ok(())
     }
 }
@@ -224,6 +233,7 @@ impl WriterRepository for E2ePgRepo {
         Ok(FastBatchCommitResult {
             committed_events: events.to_vec(),
             duplicate_skipped: 0,
+            replayed_duplicate_outcomes: Vec::new(),
             updated_sections,
         })
     }
@@ -260,22 +270,22 @@ impl WriterRepository for E2ePgRepo {
 
     async fn record_stale_epoch_rejection(
         &self,
-        _event: &EnrollmentCommandEvent,
+        event: &EnrollmentCommandEvent,
         _current_epoch: u64,
-        _now: DateTime<Utc>,
-    ) -> Result<Option<RevertEvent>, String> {
-        Ok(None)
-    }
-
-    async fn fetch_unpublished_revert_outbox(
-        &self,
-        _limit: i64,
-    ) -> Result<Vec<OutboxRevertRow>, String> {
-        Ok(Vec::new())
-    }
-
-    async fn mark_revert_outbox_published(&self, _event_ids: &[EventId]) -> Result<u64, String> {
-        Ok(0)
+        now: DateTime<Utc>,
+    ) -> Result<StaleRejectionOutcome, String> {
+        Ok(StaleRejectionOutcome::Rejected(RevertEvent::new(
+            event.event_id,
+            event.term_id,
+            event.student_id,
+            event.section_id,
+            event.course_id,
+            event.action,
+            unieee_domain::RuleErrorCode::StaleEpoch,
+            "stale",
+            event.engine_epoch,
+            now,
+        )))
     }
 }
 
@@ -445,9 +455,11 @@ async fn end_to_end_register_confirm_drop_and_revert_reach_sse_clients() {
         pg_repo,
         Arc::new(WriterToSseBridge {
             hub: Arc::clone(&hub),
-            engine: Arc::clone(&engine),
         }),
         Arc::new(NoopDlq),
+        Arc::new(WriterToEngineOutcomeBridge {
+            engine: Arc::clone(&engine),
+        }),
         WriterProcessorConfig::default(),
     );
     writer.set_readiness(WriterReadiness::Ready);

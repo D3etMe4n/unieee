@@ -15,6 +15,7 @@ import vn.edu.unieee.registration.dto.EvaluatePolicyRequest;
 import vn.edu.unieee.registration.dto.PolicyEvaluationResponse;
 import vn.edu.unieee.registration.dto.PolicySnapshotResponse;
 import vn.edu.unieee.registration.dto.ReconciliationReportResponse;
+import vn.edu.unieee.registration.dto.RegistrationCacheWarmupResponse;
 import vn.edu.unieee.registration.dto.RegistrationWindowResponse;
 import vn.edu.unieee.registration.dto.SectionRosterEntryResponse;
 import vn.edu.unieee.registration.dto.StudentWishSurveyResponse;
@@ -41,6 +42,8 @@ public interface RegistrationFacade {
     List<EnrollmentEventResponse> listStudentEnrollmentEvents(UUID studentId);
 
     ReconciliationReportResponse reconcileTerm(UUID termId);
+
+    RegistrationCacheWarmupResponse warmRegistrationCache(UUID termId);
 
     WishSurveyCampaignResponse createWishSurveyCampaign(CreateWishSurveyCampaignRequest request);
 

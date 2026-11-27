@@ -1,0 +1,80 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: core-java
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["core-java:8080"]
+        labels:
+          service: core-java
+
+  - job_name: enrollment-engine
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["enrollment-engine-active:8081"]
+        labels:
+          service: enrollment-engine
+          node: active
+      - targets: ["enrollment-engine-standby:8081"]
+        labels:
+          service: enrollment-engine
+          node: standby
+
+  - job_name: enrollment-writer
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["enrollment-writer:8082"]
+        labels:
+          service: enrollment-writer
+
+  - job_name: sse-gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["sse-gateway:8083"]
+        labels:
+          service: sse-gateway
+
+  - job_name: nginx
+    static_configs:
+      - targets: ["nginx-exporter:9113"]
+        labels:
+          service: reverse-proxy
+
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+        labels:
+          service: postgres
+
+  - job_name: pgbouncer
+    static_configs:
+      - targets: ["pgbouncer-exporter:9127"]
+        labels:
+          service: pgbouncer
+
+  - job_name: redis
+    metrics_path: /scrape
+    static_configs:
+      - targets:
+          - redis://redis-master:6379
+          - redis://redis-replica-1:6379
+          - redis://redis-replica-2:6379
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: redis-exporter:9121
+
+  - job_name: kafka
+    static_configs:
+      - targets: ["kafka-exporter:9308"]
+        labels:
+          service: kafka

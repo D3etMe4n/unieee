@@ -234,6 +234,25 @@ pub struct EnrollmentAccepted {
     pub accepted_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreloadSummarySnapshot {
+    pub ready: bool,
+    pub state: &'static str,
+    pub role: &'static str,
+    pub gate_state: GateState,
+    pub term_id: TermId,
+    pub term_code: String,
+    pub epoch: u64,
+    pub checkpoint_seq: i64,
+    pub section_count: usize,
+    pub student_count: usize,
+    pub total_max_capacity: i64,
+    pub total_enrolled_seats: i64,
+    pub total_available_seats: i64,
+    pub seat_checksum_sha256: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevertOutcome {
     Applied,
@@ -316,12 +335,42 @@ pub struct SweepReport {
     pub pruned_dedup_ids: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SectionSeatView {
+    pub section_id: SectionId,
+    pub available_seats: i32,
+    pub max_capacity: i32,
+    pub status: SectionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudentEnrollmentItemView {
+    pub section_id: SectionId,
+    pub course_id: CourseId,
+    pub action: EnrollmentAction,
+    pub status: HotPathEnrollmentState,
+    pub last_event_id: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudentEnrollmentsView {
+    pub term_id: TermId,
+    pub student_id: StudentId,
+    pub current_credits: i32,
+    pub items: Vec<StudentEnrollmentItemView>,
+}
+
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error("enrollment engine is not ready (state={0:?})")]
     NotReady(EngineReadiness),
     #[error("standby node rejects mutating enrollment requests")]
     NodeStandby,
+    #[error("term {0} is not loaded in enrollment engine")]
+    TermNotFound(TermId),
     #[error("rule violation {code:?}: {detail}")]
     RuleViolation { code: RuleErrorCode, detail: String },
     #[error("cannot export snapshot while gate={gate_state:?} and in_flight={in_flight}")]

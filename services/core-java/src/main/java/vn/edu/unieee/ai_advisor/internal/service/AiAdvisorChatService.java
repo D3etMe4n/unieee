@@ -1,6 +1,7 @@
 package vn.edu.unieee.ai_advisor.internal.service;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -14,12 +15,12 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.core.context.SecurityContext;
 import org.springframework.security.core.context.SecurityContextHolder;
@@ -52,13 +53,13 @@ import vn.edu.unieee.catalog.dto.CoursePrerequisiteResponse;
 import vn.edu.unieee.catalog.dto.CourseSectionDetailResponse;
 import vn.edu.unieee.catalog.dto.CourseSectionSummaryResponse;
 import vn.edu.unieee.common.exception.UnieeeBusinessException;
+import vn.edu.unieee.common.metrics.UnieeeMetrics;
 import vn.edu.unieee.registration.RegistrationFacade;
 import vn.edu.unieee.registration.dto.EnrollmentPolicyResponse;
 import vn.edu.unieee.registration.dto.EnrollmentResponse;
 
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class AiAdvisorChatService {
 
     private static final JsonMapper JSON_MAPPER = JsonMapper.builder().build();
@@ -99,12 +100,90 @@ public class AiAdvisorChatService {
     private final AiAdvisorProperties properties;
     private final Clock clock;
     private final AiAdvisorVirtualThreadRunner virtualThreadRunner;
+    private final UnieeeMetrics metrics;
+
+    public AiAdvisorChatService(
+        ObjectProvider<ChatModel> chatModelProvider,
+        ToolCallback[] validatedAdvisorToolCallbacks,
+        AccountFacade accountFacade,
+        CatalogFacade catalogFacade,
+        RegistrationFacade registrationFacade,
+        BitmaskConflictChecker bitmaskConflictChecker,
+        SectionSeatCacheReader sectionSeatCacheReader,
+        PromptInjectionGuardrail promptInjectionGuardrail,
+        AdvisorRateLimiter rateLimiter,
+        AdvisorCircuitBreaker circuitBreaker,
+        ScheduleSuggestionPostValidator postValidator,
+        AiAdvisorProperties properties,
+        Clock clock,
+        AiAdvisorVirtualThreadRunner virtualThreadRunner
+    ) {
+        this(
+            chatModelProvider,
+            validatedAdvisorToolCallbacks,
+            accountFacade,
+            catalogFacade,
+            registrationFacade,
+            bitmaskConflictChecker,
+            sectionSeatCacheReader,
+            promptInjectionGuardrail,
+            rateLimiter,
+            circuitBreaker,
+            postValidator,
+            properties,
+            clock,
+            virtualThreadRunner,
+            UnieeeMetrics.noop()
+        );
+    }
+
+    @Autowired
+    @SuppressWarnings("java:S107")
+    public AiAdvisorChatService(
+        ObjectProvider<ChatModel> chatModelProvider,
+        ToolCallback[] validatedAdvisorToolCallbacks,
+        AccountFacade accountFacade,
+        CatalogFacade catalogFacade,
+        RegistrationFacade registrationFacade,
+        BitmaskConflictChecker bitmaskConflictChecker,
+        SectionSeatCacheReader sectionSeatCacheReader,
+        PromptInjectionGuardrail promptInjectionGuardrail,
+        AdvisorRateLimiter rateLimiter,
+        AdvisorCircuitBreaker circuitBreaker,
+        ScheduleSuggestionPostValidator postValidator,
+        AiAdvisorProperties properties,
+        Clock clock,
+        AiAdvisorVirtualThreadRunner virtualThreadRunner,
+        UnieeeMetrics metrics
+    ) {
+        this.chatModelProvider = chatModelProvider;
+        this.validatedAdvisorToolCallbacks = validatedAdvisorToolCallbacks;
+        this.accountFacade = accountFacade;
+        this.catalogFacade = catalogFacade;
+        this.registrationFacade = registrationFacade;
+        this.bitmaskConflictChecker = bitmaskConflictChecker;
+        this.sectionSeatCacheReader = sectionSeatCacheReader;
+        this.promptInjectionGuardrail = promptInjectionGuardrail;
+        this.rateLimiter = rateLimiter;
+        this.circuitBreaker = circuitBreaker;
+        this.postValidator = postValidator;
+        this.properties = properties;
+        this.clock = clock;
+        this.virtualThreadRunner = virtualThreadRunner;
+        this.metrics = metrics == null ? UnieeeMetrics.noop() : metrics;
+    }
 
     public AiAdvisorScheduleSuggestionResponse advise(AiAdvisorChatRequest request) {
+        long startNanos = System.nanoTime();
         StudentProfileResponse student = accountFacade.getMyStudentProfile();
         AcademicTermResponse term = catalogFacade.getTermById(request.termId());
 
-        rateLimiter.checkAndConsume(student.id());
+        try {
+            rateLimiter.checkAndConsume(student.id());
+        } catch (RuntimeException ex) {
+            metrics.recordAiAdvisorRequest("fallback", "rate_limited", 0, Duration.ofNanos(System.nanoTime() - startNanos));
+            throw ex;
+        }
 
         PromptInspectionResult inspection = promptInjectionGuardrail.inspect(
             request.message(),
@@ -114,39 +193,54 @@ public class AiAdvisorChatService {
         AdvisorContextSnapshot contextSnapshot = loadAuthoritativeSnapshot(student.id(), term.id());
 
         if (!properties.isEnabled()) {
-            return buildFallbackResponse(
-                term.id(),
-                request,
-                student,
-                contextSnapshot,
-                inspection.warnings(),
-                "AI_ADVISOR_DISABLED: Trợ lý AI tạm tắt; hệ thống trả phương án dự phòng không trùng lịch.",
-                "Trợ lý AI hiện đang tạm tắt để ưu tiên tài nguyên cổng đăng ký. Vui lòng sử dụng bộ lọc thời khóa biểu chuẩn hoặc tham khảo gợi ý dự phòng bên dưới."
+            return recordAdvisorOutcome(
+                "fallback",
+                "disabled",
+                startNanos,
+                buildFallbackResponse(
+                    term.id(),
+                    request,
+                    student,
+                    contextSnapshot,
+                    inspection.warnings(),
+                    "AI_ADVISOR_DISABLED: Trợ lý AI tạm tắt; hệ thống trả phương án dự phòng không trùng lịch.",
+                    "Trợ lý AI hiện đang tạm tắt để ưu tiên tài nguyên cổng đăng ký. Vui lòng sử dụng bộ lọc thời khóa biểu chuẩn hoặc tham khảo gợi ý dự phòng bên dưới."
+                )
             );
         }
 
         ChatModel chatModel = chatModelProvider.getIfAvailable();
         if (chatModel == null) {
-            return buildFallbackResponse(
-                term.id(),
-                request,
-                student,
-                contextSnapshot,
-                inspection.warnings(),
-                "LLM_PROVIDER_UNAVAILABLE: Chưa cấu hình LLM Provider; đã kích hoạt gợi ý dự phòng an toàn.",
-                "Hiện chưa kết nối tới mô hình AI. Bạn vẫn có thể đăng ký trực tiếp bằng bộ lọc thời khóa biểu chuẩn hoặc tham khảo phương án dự phòng đã kiểm tra không trùng lịch."
+            return recordAdvisorOutcome(
+                "fallback",
+                "no_provider",
+                startNanos,
+                buildFallbackResponse(
+                    term.id(),
+                    request,
+                    student,
+                    contextSnapshot,
+                    inspection.warnings(),
+                    "LLM_PROVIDER_UNAVAILABLE: Chưa cấu hình LLM Provider; đã kích hoạt gợi ý dự phòng an toàn.",
+                    "Hiện chưa kết nối tới mô hình AI. Bạn vẫn có thể đăng ký trực tiếp bằng bộ lọc thời khóa biểu chuẩn hoặc tham khảo phương án dự phòng đã kiểm tra không trùng lịch."
+                )
             );
         }
 
         if (!circuitBreaker.allowRequest()) {
-            return buildFallbackResponse(
-                term.id(),
-                request,
-                student,
-                contextSnapshot,
-                inspection.warnings(),
-                "LLM_CIRCUIT_OPEN: Mô hình AI đang quá tải, tạm chuyển sang chế độ dự phòng.",
-                "Trợ lý AI đang quá tải tạm thời. Để không gián đoạn kỳ đăng ký, hệ thống trả về gợi ý dự phòng đã kiểm tra không trùng lịch; bạn hãy dùng bộ lọc thời khóa biểu chuẩn khi cần."
+            return recordAdvisorOutcome(
+                "fallback",
+                "circuit_open",
+                startNanos,
+                buildFallbackResponse(
+                    term.id(),
+                    request,
+                    student,
+                    contextSnapshot,
+                    inspection.warnings(),
+                    "LLM_CIRCUIT_OPEN: Mô hình AI đang quá tải, tạm chuyển sang chế độ dự phòng.",
+                    "Trợ lý AI đang quá tải tạm thời. Để không gián đoạn kỳ đăng ký, hệ thống trả về gợi ý dự phòng đã kiểm tra không trùng lịch; bạn hãy dùng bộ lọc thời khóa biểu chuẩn khi cần."
+                )
             );
         }
 
@@ -164,52 +258,72 @@ public class AiAdvisorChatService {
         } catch (TimeoutException ex) {
             circuitBreaker.recordFailure();
             log.warn("AI advisor LLM call timed out after {} ms for term={}", properties.getTimeout().toMillis(), term.id());
-            return buildFallbackResponse(
-                term.id(),
-                request,
-                student,
-                contextSnapshot,
-                inspection.warnings(),
-                "LLM_TIMEOUT_FALLBACK_USED: Trợ lý AI phản hồi quá thời gian cho phép, đã chuyển sang phương án dự phòng.",
-                "Trợ lý AI đang xử lý chậm trong giờ cao điểm. Vui lòng sử dụng bộ lọc thời khóa biểu chuẩn hoặc tham khảo gợi ý dự phòng không trùng lịch bên dưới."
+            return recordAdvisorOutcome(
+                "fallback",
+                "timeout",
+                startNanos,
+                buildFallbackResponse(
+                    term.id(),
+                    request,
+                    student,
+                    contextSnapshot,
+                    inspection.warnings(),
+                    "LLM_TIMEOUT_FALLBACK_USED: Trợ lý AI phản hồi quá thời gian cho phép, đã chuyển sang phương án dự phòng.",
+                    "Trợ lý AI đang xử lý chậm trong giờ cao điểm. Vui lòng sử dụng bộ lọc thời khóa biểu chuẩn hoặc tham khảo gợi ý dự phòng không trùng lịch bên dưới."
+                )
             );
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
             circuitBreaker.recordFailure();
-            return buildFallbackResponse(
-                term.id(),
-                request,
-                student,
-                contextSnapshot,
-                inspection.warnings(),
-                "LLM_INTERRUPTED_FALLBACK_USED: Phiên xử lý AI bị gián đoạn, đã chuyển sang phương án dự phòng.",
-                "Không thể hoàn tất truy vấn AI lúc này. Vui lòng sử dụng bộ lọc thời khóa biểu chuẩn."
+            return recordAdvisorOutcome(
+                "fallback",
+                "interrupted",
+                startNanos,
+                buildFallbackResponse(
+                    term.id(),
+                    request,
+                    student,
+                    contextSnapshot,
+                    inspection.warnings(),
+                    "LLM_INTERRUPTED_FALLBACK_USED: Phiên xử lý AI bị gián đoạn, đã chuyển sang phương án dự phòng.",
+                    "Không thể hoàn tất truy vấn AI lúc này. Vui lòng sử dụng bộ lọc thời khóa biểu chuẩn."
+                )
             );
         } catch (ExecutionException | RuntimeException ex) {
             circuitBreaker.recordFailure();
             log.warn("AI advisor LLM call failed for term={}", term.id(), ex);
-            return buildFallbackResponse(
-                term.id(),
-                request,
-                student,
-                contextSnapshot,
-                inspection.warnings(),
-                "LLM_CALL_FAILED_FALLBACK_USED: Không thể kết nối mô hình AI, đã chuyển sang chế độ dự phòng.",
-                "Trợ lý AI tạm thời gián đoạn. Vui lòng sử dụng bộ lọc thời khóa biểu chuẩn hoặc xem gợi ý dự phòng bên dưới."
+            return recordAdvisorOutcome(
+                "fallback",
+                "error",
+                startNanos,
+                buildFallbackResponse(
+                    term.id(),
+                    request,
+                    student,
+                    contextSnapshot,
+                    inspection.warnings(),
+                    "LLM_CALL_FAILED_FALLBACK_USED: Không thể kết nối mô hình AI, đã chuyển sang chế độ dự phòng.",
+                    "Trợ lý AI tạm thời gián đoạn. Vui lòng sử dụng bộ lọc thời khóa biểu chuẩn hoặc xem gợi ý dự phòng bên dưới."
+                )
             );
         }
 
         LlmAdvisorDraft draft = parseDraft(rawResponse);
         if (draft == null) {
             circuitBreaker.recordFailure();
-            return buildFallbackResponse(
-                term.id(),
-                request,
-                student,
-                contextSnapshot,
-                inspection.warnings(),
-                "LLM_MALFORMED_OUTPUT_FALLBACK_USED: Phản hồi AI không đúng định dạng cấu trúc, đã chuyển sang phương án dự phòng.",
-                "Không thể chuẩn hóa phản hồi từ mô hình AI. Vui lòng dùng bộ lọc thời khóa biểu chuẩn hoặc tham khảo gợi ý dự phòng bên dưới."
+            return recordAdvisorOutcome(
+                "fallback",
+                "malformed",
+                startNanos,
+                buildFallbackResponse(
+                    term.id(),
+                    request,
+                    student,
+                    contextSnapshot,
+                    inspection.warnings(),
+                    "LLM_MALFORMED_OUTPUT_FALLBACK_USED: Phản hồi AI không đúng định dạng cấu trúc, đã chuyển sang phương án dự phòng.",
+                    "Không thể chuẩn hóa phản hồi từ mô hình AI. Vui lòng dùng bộ lọc thời khóa biểu chuẩn hoặc tham khảo gợi ý dự phòng bên dưới."
+                )
             );
         }
 
@@ -243,17 +357,37 @@ public class AiAdvisorChatService {
             ? "Đã tổng hợp các phương án xếp lịch đã được kiểm chứng không trùng lịch."
             : draft.summary().trim();
 
-        return new AiAdvisorScheduleSuggestionResponse(
-            term.id(),
-            summary,
-            recommendedCourses,
-            validated.validOptions(),
-            validated.filteredOutCount(),
-            false,
-            List.copyOf(combinedWarnings),
-            ScheduleSuggestionPostValidator.SEAT_AVAILABILITY_DISCLAIMER,
-            clock.instant()
+        return recordAdvisorOutcome(
+            "llm",
+            "ok",
+            startNanos,
+            new AiAdvisorScheduleSuggestionResponse(
+                term.id(),
+                summary,
+                recommendedCourses,
+                validated.validOptions(),
+                validated.filteredOutCount(),
+                false,
+                List.copyOf(combinedWarnings),
+                ScheduleSuggestionPostValidator.SEAT_AVAILABILITY_DISCLAIMER,
+                clock.instant()
+            )
         );
+    }
+
+    private AiAdvisorScheduleSuggestionResponse recordAdvisorOutcome(
+        String mode,
+        String reason,
+        long startNanos,
+        AiAdvisorScheduleSuggestionResponse response
+    ) {
+        metrics.recordAiAdvisorRequest(
+            mode,
+            reason,
+            response.filteredOutOptionCount(),
+            Duration.ofNanos(System.nanoTime() - startNanos)
+        );
+        return response;
     }
 
     private String invokeLlmWithTimeout(

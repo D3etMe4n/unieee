@@ -15,8 +15,8 @@ use tracing::warn;
 use unieee_domain::EventId;
 use unieee_events::{
     decode_json, encode_json, event_status_cache_key, revert_dedup_key, EventStatusCachePayload,
-    HotPathPubSubMessage, SeatTentativeEvent, REDIS_CHANNEL_ENROLLMENT_REVERT,
-    REDIS_CHANNEL_GATE_CONTROL, REDIS_CHANNEL_SEAT_CONFIRMED, REDIS_CHANNEL_SEAT_TENTATIVE,
+    HotPathPubSubMessage, SeatTentativeEvent, REDIS_CHANNEL_GATE_CONTROL,
+    REDIS_CHANNEL_SEAT_TENTATIVE,
 };
 
 #[derive(Clone)]
@@ -136,12 +136,6 @@ pub fn serialize_tentative_batch(events: &[SeatTentativeEvent]) -> Result<Vec<St
 
 pub async fn dispatch_pubsub_payload(engine: &EnrollmentEngine, channel: &str, payload: &str) {
     match HotPathPubSubMessage::decode_channel_message(channel, payload) {
-        Ok(HotPathPubSubMessage::SeatConfirmed(ev)) => {
-            engine.apply_seat_confirmed(&ev);
-        }
-        Ok(HotPathPubSubMessage::Revert(ev)) => {
-            let _ = engine.apply_revert_event(&ev).await;
-        }
         Ok(HotPathPubSubMessage::GateControl(ev)) => {
             let drained = engine
                 .apply_gate_control_and_drain(&ev, engine.drain_timeout())
@@ -156,7 +150,11 @@ pub async fn dispatch_pubsub_payload(engine: &EnrollmentEngine, channel: &str, p
                 Ok(true) => {}
             }
         }
-        Ok(HotPathPubSubMessage::SeatTentative(_)) => {}
+        Ok(
+            HotPathPubSubMessage::SeatConfirmed(_)
+            | HotPathPubSubMessage::Revert(_)
+            | HotPathPubSubMessage::SeatTentative(_),
+        ) => {}
         Err(err) => {
             warn!(channel, error = %err, "ignored invalid Redis Pub/Sub payload");
         }
@@ -279,14 +277,7 @@ pub fn spawn_pubsub_listener(
             }
             match backend.get_pubsub().await {
                 Ok(mut pubsub) => {
-                    if let Err(err) = pubsub
-                        .subscribe(&[
-                            REDIS_CHANNEL_ENROLLMENT_REVERT,
-                            REDIS_CHANNEL_GATE_CONTROL,
-                            REDIS_CHANNEL_SEAT_CONFIRMED,
-                        ])
-                        .await
-                    {
+                    if let Err(err) = pubsub.subscribe(&[REDIS_CHANNEL_GATE_CONTROL]).await {
                         warn!(error = %err, "Redis SUBSCRIBE failed; retrying");
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         continue;

@@ -1,0 +1,242 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "title": "Edge, Service Health & Throughput",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "options": { "0": { "color": "red", "text": "DOWN" }, "1": { "color": "green", "text": "UP" } }, "type": "value" }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 8, "x": 0, "y": 1 },
+      "id": 1,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "value_and_name" },
+      "targets": [
+        { "expr": "up{job=~\"core-java|enrollment-engine|enrollment-writer|sse-gateway|nginx|postgres|pgbouncer|redis|kafka\"}", "legendFormat": "{{job}} {{node}} {{instance}}", "refId": "A" }
+      ],
+      "title": "Scrape Targets Status",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 8, "x": 8, "y": 1 },
+      "id": 2,
+      "targets": [
+        { "expr": "rate(nginx_http_requests_total[15s])", "legendFormat": "Nginx RPS", "refId": "A" },
+        { "expr": "sum(rate(http_server_requests_seconds_count{job=\"core-java\",uri!~\"/actuator.*\"}[15s]))", "legendFormat": "Core Java RPS", "refId": "B" },
+        { "expr": "sum(rate(unieee_engine_http_requests_total[15s])) by (node)", "legendFormat": "Engine ({{node}}) RPS", "refId": "C" }
+      ],
+      "title": "Service HTTP Request Rate (RPS)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 8, "x": 16, "y": 1 },
+      "id": 3,
+      "targets": [
+        { "expr": "nginx_connections_active", "legendFormat": "Active", "refId": "A" },
+        { "expr": "nginx_connections_reading", "legendFormat": "Reading", "refId": "B" },
+        { "expr": "nginx_connections_writing", "legendFormat": "Writing", "refId": "C" },
+        { "expr": "nginx_connections_waiting", "legendFormat": "Waiting", "refId": "D" }
+      ],
+      "title": "Nginx Reverse Proxy Connections",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "id": 101,
+      "title": "Rust Hot Path — Enrollment Engine",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 7 },
+      "id": 4,
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(unieee_engine_http_request_duration_seconds_bucket[15s])) by (le))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum(rate(unieee_engine_http_request_duration_seconds_bucket[15s])) by (le))", "legendFormat": "p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum(rate(unieee_engine_http_request_duration_seconds_bucket[15s])) by (le))", "legendFormat": "p99", "refId": "C" }
+      ],
+      "title": "Enrollment Engine HTTP Latency (p50 / p95 / p99)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 7 },
+      "id": 5,
+      "targets": [
+        { "expr": "unieee_engine_seats_max_capacity{node=\"active\"}", "legendFormat": "Max Capacity (active)", "refId": "A" },
+        { "expr": "unieee_engine_seats_enrolled{node=\"active\"}", "legendFormat": "Enrolled (active)", "refId": "B" },
+        { "expr": "unieee_engine_seats_available{node=\"active\"}", "legendFormat": "Available (active)", "refId": "C" },
+        { "expr": "unieee_engine_seats_available{node=\"standby\"}", "legendFormat": "Available (standby)", "refId": "D" }
+      ],
+      "title": "In-Memory RAM Seat Capacity & Usage",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 7 },
+      "id": 6,
+      "targets": [
+        { "expr": "sum(rate(unieee_engine_seat_cas_total{node=\"active\"}[15s])) by (action, outcome)", "legendFormat": "CAS {{action}}={{outcome}}", "refId": "A" },
+        { "expr": "sum(rate(unieee_engine_rule_rejections_total{node=\"active\"}[15s])) by (code)", "legendFormat": "Rule {{code}}", "refId": "B" }
+      ],
+      "title": "Seat CAS Operations & Rule Rejections/s",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 14 },
+      "id": 7,
+      "targets": [
+        { "expr": "sum(rate(unieee_engine_kafka_command_publish_total[15s])) by (node, outcome)", "legendFormat": "cmd publish {{node}}={{outcome}}", "refId": "A" },
+        { "expr": "sum(rate(unieee_engine_kafka_outcomes_consumed_total[15s])) by (node, status)", "legendFormat": "outcome {{node}}={{status}}", "refId": "B" },
+        { "expr": "sum(rate(unieee_engine_kafka_deltas_consumed_total[15s])) by (node, delta_type, outcome)", "legendFormat": "delta {{node}} {{delta_type}}={{outcome}}", "refId": "C" }
+      ],
+      "title": "Engine Kafka Commands, Outcomes & Hot Delta Sync",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 14 },
+      "id": 8,
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(unieee_engine_kafka_outcome_lag_seconds_bucket[15s])) by (le, node))", "legendFormat": "Outcome lag p95 ({{node}})", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum(rate(unieee_engine_kafka_command_publish_duration_seconds_bucket[15s])) by (le))", "legendFormat": "Cmd publish p95", "refId": "B" }
+      ],
+      "title": "Engine Kafka Publish & Outcome End-to-End Lag",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 20 },
+      "id": 102,
+      "title": "Enrollment Writer, Kafka Lag & SSE Gateway",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 21 },
+      "id": 9,
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(unieee_writer_pg_commit_duration_seconds_bucket[15s])) by (le, path))", "legendFormat": "PG p50 ({{path}})", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum(rate(unieee_writer_pg_commit_duration_seconds_bucket[15s])) by (le, path))", "legendFormat": "PG p95 ({{path}})", "refId": "B" },
+        { "expr": "histogram_quantile(0.95, sum(rate(unieee_writer_outcomes_publish_duration_seconds_bucket[15s])) by (le))", "legendFormat": "Outcomes publish p95", "refId": "C" }
+      ],
+      "title": "Enrollment Writer PG Commit & Outcome Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 21 },
+      "id": 10,
+      "targets": [
+        { "expr": "rate(unieee_writer_events_confirmed_total[15s])", "legendFormat": "Confirmed/s", "refId": "A" },
+        { "expr": "rate(unieee_writer_events_reverted_total[15s])", "legendFormat": "Reverted/s", "refId": "B" },
+        { "expr": "sum(kafka_consumergroup_lag{consumergroup=~\"unieee-.*\"}) by (consumergroup, topic)", "legendFormat": "Lag {{consumergroup}} ({{topic}})", "refId": "C" }
+      ],
+      "title": "Writer Confirmed/Reverted Rate & Kafka Consumer Lag",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 21 },
+      "id": 11,
+      "targets": [
+        { "expr": "unieee_sse_active_connections", "legendFormat": "Active SSE Connections", "refId": "A" },
+        { "expr": "rate(unieee_sse_seat_updates_broadcast_total[15s])", "legendFormat": "Seat Broadcasts/s", "refId": "B" },
+        { "expr": "rate(unieee_sse_personal_events_broadcast_total[15s])", "legendFormat": "Personal Broadcasts/s", "refId": "C" },
+        { "expr": "rate(unieee_sse_slow_consumer_lagged_events_total[15s])", "legendFormat": "Slow Consumer Drops/s", "refId": "D" }
+      ],
+      "title": "SSE Gateway Active Streams & Fan-out",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 28 },
+      "id": 103,
+      "title": "Core Java (Cache, Policy, Override, Delta, AI Advisor) & Data Layer",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "max": 1, "min": 0, "unit": "percentunit" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 29 },
+      "id": 12,
+      "targets": [
+        { "expr": "sum(rate(unieee_read_cache_requests_total{outcome=\"hit\"}[1m])) / clamp_min(sum(rate(unieee_read_cache_requests_total[1m])), 0.0001)", "legendFormat": "Overall Read-Through Hit Ratio", "refId": "A" },
+        { "expr": "sum(rate(unieee_read_cache_requests_total{outcome=\"hit\"}[1m])) by (cache) / clamp_min(sum(rate(unieee_read_cache_requests_total[1m])) by (cache), 0.0001)", "legendFormat": "Hit Ratio ({{cache}})", "refId": "B" }
+      ],
+      "title": "Core Java Redis Read-Through Cache Hit Ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 29 },
+      "id": 13,
+      "targets": [
+        { "expr": "sum(rate(unieee_policy_evaluations_total[1m])) by (outcome)", "legendFormat": "Policy {{outcome}}/s", "refId": "A" },
+        { "expr": "sum(rate(unieee_admin_overrides_total[1m])) by (action, outcome)", "legendFormat": "Override {{action}}={{outcome}}/s", "refId": "B" },
+        { "expr": "sum(rate(unieee_hot_delta_published_total[1m])) by (delta_type, outcome)", "legendFormat": "HotDelta {{delta_type}}={{outcome}}/s", "refId": "C" },
+        { "expr": "sum(rate(unieee_ai_advisor_requests_total[1m])) by (mode, reason)", "legendFormat": "AI {{mode}} ({{reason}})/s", "refId": "D" }
+      ],
+      "title": "Policy, Admin Override, Hot Delta & AI Advisor Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 29 },
+      "id": 14,
+      "targets": [
+        { "expr": "sum(pg_stat_database_numbackends{datname=\"unieee\"})", "legendFormat": "PG Active Backends (unieee)", "refId": "A" },
+        { "expr": "sum(pgbouncer_pools_client_active_connections)", "legendFormat": "PgBouncer Client Active", "refId": "B" },
+        { "expr": "sum(pgbouncer_pools_client_waiting_connections)", "legendFormat": "PgBouncer Client Waiting", "refId": "C" },
+        { "expr": "sum(rate(redis_commands_processed_total[15s])) by (instance)", "legendFormat": "Redis Cmd/s ({{instance}})", "refId": "D" }
+      ],
+      "title": "PostgreSQL, PgBouncer & Redis HA Activity",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["unieee", "production", "monitoring"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "unieee — Production Overview",
+  "uid": "unieee-production-overview",
+  "version": 1
+}

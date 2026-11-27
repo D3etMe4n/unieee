@@ -5,15 +5,15 @@ pub mod processor;
 
 pub use batch::{
     aggregate_section_deltas, classify_pg_sqlstate, compute_commit_offsets, decode_kafka_records,
-    deduplicate_commands_in_batch, has_intra_batch_student_course_conflict, BatchAccumulator,
+    deduplicate_commands_in_batch, has_intra_batch_student_course_conflict,
+    split_into_conflict_free_chunks, BatchAccumulator,
 };
 pub use models::{
     BatchExecutionReport, DecodedBatch, FastBatchCommitResult, FastPathBatchError,
-    IncomingKafkaRecord, OutboxRevertRow, PartitionOffset, PgErrorClass, RedisBatchUpdate,
+    IncomingKafkaRecord, PartitionOffset, PersistedEventOutcome, PgErrorClass, RedisBatchUpdate,
     RedisSectionSeatsPayload, RedisTermSectionSummaryPayload, SectionSeatSnapshot,
-    SingleEventOutcome, WriterError, WriterMetrics, WriterMetricsSnapshot, WriterReadiness,
+    SingleEventOutcome, StaleRejectionOutcome, WriterError, WriterMetrics, WriterMetricsSnapshot,
+    WriterReadiness,
 };
-pub use ports::{
-    DeltaRevertPublisher, DlqPublisher, NoopDeltaRevertPublisher, RedisWriterSink, WriterRepository,
-};
+pub use ports::{DlqPublisher, OutcomePublisher, RedisWriterSink, WriterRepository};
 pub use processor::{EpochTracker, WriterProcessor, WriterProcessorConfig};

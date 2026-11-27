@@ -27,6 +27,9 @@ public interface CourseSectionRepository extends JpaRepository<CourseSection, Lo
     @EntityGraph(attributePaths = {"course", "schedules"})
     List<CourseSection> findWithDetailsByIdIn(Collection<Long> ids);
 
+    @Query("SELECT cs.termId FROM CourseSection cs WHERE cs.id = :sectionId")
+    Optional<UUID> findTermIdById(@Param("sectionId") Long sectionId);
+
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("""
         UPDATE CourseSection cs

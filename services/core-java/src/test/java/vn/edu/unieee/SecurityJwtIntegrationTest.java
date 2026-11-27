@@ -22,6 +22,8 @@ import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
+import vn.edu.unieee.catalog.CatalogFacade;
+import vn.edu.unieee.catalog.internal.controller.PublicCatalogController;
 import vn.edu.unieee.common.exception.AccessDeniedBusinessException;
 import vn.edu.unieee.common.exception.GlobalExceptionHandler;
 import vn.edu.unieee.common.security.AuthMeController;
@@ -30,7 +32,7 @@ import vn.edu.unieee.common.security.KeycloakJwtAuthenticationConverter;
 import vn.edu.unieee.common.security.SecurityConfig;
 import vn.edu.unieee.common.security.SecurityContextHelper;
 
-@WebMvcTest(controllers = AuthMeController.class)
+@WebMvcTest(controllers = {AuthMeController.class, PublicCatalogController.class})
 @Import({SecurityConfig.class, KeycloakJwtAuthenticationConverter.class, GlobalExceptionHandler.class})
 @ActiveProfiles("test")
 class SecurityJwtIntegrationTest {
@@ -44,6 +46,9 @@ class SecurityJwtIntegrationTest {
     @MockitoBean
     private JwtDecoder jwtDecoder;
 
+    @MockitoBean
+    private CatalogFacade catalogFacade;
+
     @AfterEach
     void clearSecurityContext() {
         SecurityContextHolder.clearContext();
@@ -55,6 +60,23 @@ class SecurityJwtIntegrationTest {
             .andExpect(status().isUnauthorized())
             .andExpect(jsonPath("$.errorCode").value("UNAUTHORIZED"))
             .andExpect(jsonPath("$.status").value(401));
+    }
+
+    @Test
+    void publicCatalogEndpointsAreAccessibleWithoutJwt() throws Exception {
+        mockMvc.perform(get("/api/v1/public/courses"))
+            .andExpect(status().isOk());
+    }
+
+    @Test
+    void prometheusActuatorPathIsNotBlockedBySecurityFilter() throws Exception {
+        // Under @WebMvcTest without full Actuator PrometheusEndpoint auto-config, SecurityConfig permits /actuator/prometheus
+        // instead of returning 401 UNAUTHORIZED (Spring MVC returns 404 when endpoint bean is not loaded in slice).
+        int status = mockMvc.perform(get("/actuator/prometheus"))
+            .andReturn()
+            .getResponse()
+            .getStatus();
+        assertThat(status).isNotIn(401, 403);
     }
 
     @Test

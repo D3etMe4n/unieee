@@ -3,7 +3,8 @@ package vn.edu.unieee.registration.internal.service.override;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
-import lombok.RequiredArgsConstructor;
+import java.util.function.Supplier;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -14,6 +15,7 @@ import vn.edu.unieee.catalog.dto.AcademicTermResponse;
 import vn.edu.unieee.catalog.dto.CourseSectionDetailResponse;
 import vn.edu.unieee.catalog.dto.CourseSectionSummaryResponse;
 import vn.edu.unieee.catalog.dto.UpdateCourseSectionRequest;
+import vn.edu.unieee.common.metrics.UnieeeMetrics;
 import vn.edu.unieee.common.security.SecurityContextHelper;
 import vn.edu.unieee.registration.dto.AdminEnrollmentAddRequest;
 import vn.edu.unieee.registration.dto.AdminEnrollmentDropRequest;
@@ -35,7 +37,6 @@ import vn.edu.unieee.registration.internal.repository.EnrollmentEventRepository;
 import vn.edu.unieee.registration.internal.repository.EnrollmentRepository;
 
 @Service
-@RequiredArgsConstructor
 public class AdminEnrollmentOverrideService {
 
     private static final String REGISTRATION_OPEN_STATUS = "REGISTRATION_OPEN";
@@ -46,9 +47,52 @@ public class AdminEnrollmentOverrideService {
     private final AccountFacade accountFacade;
     private final RegistrationMapper mapper;
     private final ApplicationEventPublisher eventPublisher;
+    private final UnieeeMetrics metrics;
+
+    public AdminEnrollmentOverrideService(
+        EnrollmentRepository enrollmentRepository,
+        EnrollmentEventRepository eventRepository,
+        CatalogFacade catalogFacade,
+        AccountFacade accountFacade,
+        RegistrationMapper mapper,
+        ApplicationEventPublisher eventPublisher
+    ) {
+        this(
+            enrollmentRepository,
+            eventRepository,
+            catalogFacade,
+            accountFacade,
+            mapper,
+            eventPublisher,
+            UnieeeMetrics.noop()
+        );
+    }
+
+    @Autowired
+    public AdminEnrollmentOverrideService(
+        EnrollmentRepository enrollmentRepository,
+        EnrollmentEventRepository eventRepository,
+        CatalogFacade catalogFacade,
+        AccountFacade accountFacade,
+        RegistrationMapper mapper,
+        ApplicationEventPublisher eventPublisher,
+        UnieeeMetrics metrics
+    ) {
+        this.enrollmentRepository = enrollmentRepository;
+        this.eventRepository = eventRepository;
+        this.catalogFacade = catalogFacade;
+        this.accountFacade = accountFacade;
+        this.mapper = mapper;
+        this.eventPublisher = eventPublisher;
+        this.metrics = metrics == null ? UnieeeMetrics.noop() : metrics;
+    }
 
     @Transactional
     public EnrollmentResponse adminAdd(AdminEnrollmentAddRequest request) {
+        return executeOverride("add", () -> performAdminAdd(request));
+    }
+
+    private EnrollmentResponse performAdminAdd(AdminEnrollmentAddRequest request) {
         CourseSectionDetailResponse section = catalogFacade.getSectionById(request.sectionId());
         ensureRegistrationGateClosed(section.termId());
         if ("CANCELLED".equals(section.status())) {
@@ -120,6 +164,10 @@ public class AdminEnrollmentOverrideService {
 
     @Transactional
     public EnrollmentResponse adminDrop(AdminEnrollmentDropRequest request) {
+        return executeOverride("drop", () -> performAdminDrop(request));
+    }
+
+    private EnrollmentResponse performAdminDrop(AdminEnrollmentDropRequest request) {
         CourseSectionDetailResponse section = catalogFacade.getSectionById(request.sectionId());
         ensureRegistrationGateClosed(section.termId());
         StudentProfileResponse student = accountFacade.getStudent(request.studentId());
@@ -164,6 +212,10 @@ public class AdminEnrollmentOverrideService {
 
     @Transactional
     public EnrollmentResponse adminTransfer(AdminEnrollmentTransferRequest request) {
+        return executeOverride("transfer", () -> performAdminTransfer(request));
+    }
+
+    private EnrollmentResponse performAdminTransfer(AdminEnrollmentTransferRequest request) {
         if (request.fromSectionId().equals(request.toSectionId())) {
             throw new RegistrationConflictException("SAME_SECTION_TRANSFER", "Source and target sections must differ");
         }
@@ -307,6 +359,23 @@ public class AdminEnrollmentOverrideService {
             detail.availableSeats(),
             detail.status()
         );
+    }
+
+    private EnrollmentResponse executeOverride(String action, Supplier<EnrollmentResponse> work) {
+        try {
+            EnrollmentResponse response = work.get();
+            metrics.recordAdminOverride(action, "success");
+            return response;
+        } catch (RegistrationGateOpenException ex) {
+            metrics.recordAdminOverride(action, "gate_open");
+            throw ex;
+        } catch (RegistrationConflictException | RegistrationScheduleConflictException ex) {
+            metrics.recordAdminOverride(action, "conflict");
+            throw ex;
+        } catch (RuntimeException ex) {
+            metrics.recordAdminOverride(action, "error");
+            throw ex;
+        }
     }
 
     private static String currentActor() {

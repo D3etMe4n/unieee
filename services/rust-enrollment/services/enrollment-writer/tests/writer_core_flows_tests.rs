@@ -7,9 +7,9 @@ use enrollment_engine::core::{
 };
 use enrollment_writer::core::{
     BatchAccumulator, DlqPublisher, EpochTracker, FastBatchCommitResult, FastPathBatchError,
-    IncomingKafkaRecord, OutboxRevertRow, RedisBatchUpdate, RedisWriterSink, SectionSeatSnapshot,
-    SingleEventOutcome, WriterError, WriterProcessor, WriterProcessorConfig, WriterReadiness,
-    WriterRepository,
+    IncomingKafkaRecord, OutcomePublisher, PersistedEventOutcome, RedisBatchUpdate,
+    RedisWriterSink, SectionSeatSnapshot, SingleEventOutcome, StaleRejectionOutcome, WriterError,
+    WriterProcessor, WriterProcessorConfig, WriterReadiness, WriterRepository,
 };
 use rust_decimal::Decimal;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -18,14 +18,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use unieee_domain::{
-    CourseId, CreditLimitPolicy, EnrollmentAction, EventId, GateState, GradeRank,
-    HotPathEnrollmentState, PolicyId, PolicySnapshotPayload, PrerequisitePolicy,
+    CourseId, CreditLimitPolicy, EnrollmentAction, EnrollmentEventStatus, EventId, GateState,
+    GradeRank, HotPathEnrollmentState, PolicyId, PolicySnapshotPayload, PrerequisitePolicy,
     RegistrationWindowSnapshot, RetakeImprovePolicy, RuleErrorCode, ScheduleBitmask,
     ScheduleConflictPolicy, SectionId, SectionStatus, StudentId, TermId, TuitionHoldPolicy,
     WindowId, WindowStatus,
 };
 use unieee_events::{
-    encode_json, DeadLetterEvent, EnrollmentCommandEvent, GateControlEvent, RevertEvent,
+    encode_json, DeadLetterEvent, EnrollmentCommandEvent, EnrollmentOutcomeEvent,
+    EnrollmentOutcomeStatus, GateControlEvent, RevertEvent,
 };
 
 struct PgSectionRow {
@@ -37,22 +38,39 @@ struct PgSectionRow {
     status: String,
 }
 
+type SimEventRow = (String, Option<String>, Option<String>, u64, DateTime<Utc>);
+
 #[derive(Default)]
 struct PgSimState {
     sections: HashMap<SectionId, PgSectionRow>,
     // (term_id, student_id, course_id) -> section_id for active CONFIRMED enrollments
     active_enrollments: HashMap<(TermId, StudentId, CourseId), SectionId>,
-    // event_id -> (status, Option<reason_code>, engine_epoch)
-    events: HashMap<EventId, (String, Option<String>, u64)>,
-    outbox: HashMap<EventId, (String, Option<DateTime<Utc>>)>,
+    // event_id -> (status, Option<reason_code>, Option<audit_note>, engine_epoch, created_at)
+    events: HashMap<EventId, SimEventRow>,
     fail_fast_transient_remaining: usize,
     fail_isolated_transient_remaining: usize,
-    fail_mark_outbox_remaining: usize,
 }
 
 #[derive(Default)]
 struct FakePgWriterRepository {
     state: Mutex<PgSimState>,
+}
+
+fn sim_row_to_persisted(event_id: EventId, row: &SimEventRow) -> PersistedEventOutcome {
+    let status = match row.0.as_str() {
+        "CONFIRMED" => EnrollmentEventStatus::Confirmed,
+        "REVERTED" => EnrollmentEventStatus::Reverted,
+        _ => EnrollmentEventStatus::Rejected,
+    };
+    let reason_code = row.1.as_deref().and_then(RuleErrorCode::from_code);
+    PersistedEventOutcome {
+        event_id,
+        status,
+        reason_code,
+        reason_detail: row.2.clone(),
+        engine_epoch: row.3,
+        created_at: row.4,
+    }
 }
 
 impl FakePgWriterRepository {
@@ -108,7 +126,7 @@ impl WriterRepository for FakePgWriterRepository {
             let max_ep = guard
                 .events
                 .values()
-                .map(|(_, _, ep)| *ep)
+                .map(|(_, _, _, ep, _)| *ep)
                 .max()
                 .unwrap_or(0);
             map.insert(first_term, max_ep);
@@ -119,7 +137,7 @@ impl WriterRepository for FakePgWriterRepository {
     async fn commit_fast_batch(
         &self,
         events: &[EnrollmentCommandEvent],
-        _now: DateTime<Utc>,
+        now: DateTime<Utc>,
     ) -> Result<FastBatchCommitResult, FastPathBatchError> {
         let mut guard = self.state.lock().await;
         if guard.fail_fast_transient_remaining > 0 {
@@ -131,9 +149,12 @@ impl WriterRepository for FakePgWriterRepository {
 
         let mut active_events = Vec::new();
         let mut duplicate_skipped = 0usize;
+        let mut replayed_duplicate_outcomes = Vec::new();
         for ev in events {
-            if guard.events.contains_key(&ev.event_id) {
+            if let Some(existing) = guard.events.get(&ev.event_id) {
                 duplicate_skipped += 1;
+                replayed_duplicate_outcomes
+                    .push((ev.clone(), sim_row_to_persisted(ev.event_id, existing)));
             } else {
                 active_events.push(ev.clone());
             }
@@ -143,6 +164,7 @@ impl WriterRepository for FakePgWriterRepository {
             return Ok(FastBatchCommitResult {
                 committed_events: Vec::new(),
                 duplicate_skipped,
+                replayed_duplicate_outcomes,
                 updated_sections: HashMap::new(),
             });
         }
@@ -205,9 +227,10 @@ impl WriterRepository for FakePgWriterRepository {
         guard.active_enrollments = provisional_enrollments;
         let mut updated_sections = HashMap::new();
         for ev in &active_events {
-            guard
-                .events
-                .insert(ev.event_id, ("CONFIRMED".to_owned(), None, ev.engine_epoch));
+            guard.events.insert(
+                ev.event_id,
+                ("CONFIRMED".to_owned(), None, None, ev.engine_epoch, now),
+            );
             let sec = &guard.sections[&ev.section_id];
             updated_sections.insert(
                 ev.section_id,
@@ -226,6 +249,7 @@ impl WriterRepository for FakePgWriterRepository {
         Ok(FastBatchCommitResult {
             committed_events: active_events,
             duplicate_skipped,
+            replayed_duplicate_outcomes,
             updated_sections,
         })
     }
@@ -241,8 +265,11 @@ impl WriterRepository for FakePgWriterRepository {
             return Err("simulated transient SQL error".to_owned());
         }
 
-        if guard.events.contains_key(&event.event_id) {
-            return Ok(SingleEventOutcome::DuplicateSkipped);
+        if let Some(existing) = guard.events.get(&event.event_id) {
+            return Ok(SingleEventOutcome::AlreadyPersisted(sim_row_to_persisted(
+                event.event_id,
+                existing,
+            )));
         }
 
         let mut reject = None;
@@ -304,7 +331,9 @@ impl WriterRepository for FakePgWriterRepository {
                 (
                     "REJECTED".to_owned(),
                     Some(code.as_str().to_owned()),
+                    Some(detail.clone()),
                     event.engine_epoch,
+                    now,
                 ),
             );
             let revert = RevertEvent::new(
@@ -319,8 +348,6 @@ impl WriterRepository for FakePgWriterRepository {
                 event.engine_epoch,
                 now,
             );
-            let payload = encode_json(&revert).map_err(|e| e.to_string())?;
-            guard.outbox.insert(event.event_id, (payload, None));
             return Ok(SingleEventOutcome::Rejected(revert));
         }
 
@@ -337,7 +364,7 @@ impl WriterRepository for FakePgWriterRepository {
         };
         guard.events.insert(
             event.event_id,
-            ("CONFIRMED".to_owned(), None, event.engine_epoch),
+            ("CONFIRMED".to_owned(), None, None, event.engine_epoch, now),
         );
         Ok(SingleEventOutcome::Committed(snap))
     }
@@ -347,17 +374,22 @@ impl WriterRepository for FakePgWriterRepository {
         event: &EnrollmentCommandEvent,
         current_epoch: u64,
         now: DateTime<Utc>,
-    ) -> Result<Option<RevertEvent>, String> {
+    ) -> Result<StaleRejectionOutcome, String> {
         let mut guard = self.state.lock().await;
-        if guard.events.contains_key(&event.event_id) {
-            return Ok(None);
+        if let Some(existing) = guard.events.get(&event.event_id) {
+            return Ok(StaleRejectionOutcome::AlreadyPersisted(
+                sim_row_to_persisted(event.event_id, existing),
+            ));
         }
+        let detail = format!("epoch {} < {}", event.engine_epoch, current_epoch);
         guard.events.insert(
             event.event_id,
             (
                 "REJECTED".to_owned(),
                 Some("STALE_EPOCH".to_owned()),
+                Some(detail.clone()),
                 event.engine_epoch,
+                now,
             ),
         );
         let revert = RevertEvent::new(
@@ -368,49 +400,11 @@ impl WriterRepository for FakePgWriterRepository {
             event.course_id,
             event.action,
             RuleErrorCode::StaleEpoch,
-            format!("epoch {} < {}", event.engine_epoch, current_epoch),
+            detail,
             event.engine_epoch,
             now,
         );
-        let payload = encode_json(&revert).map_err(|e| e.to_string())?;
-        guard.outbox.insert(event.event_id, (payload, None));
-        Ok(Some(revert))
-    }
-
-    async fn fetch_unpublished_revert_outbox(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<OutboxRevertRow>, String> {
-        let guard = self.state.lock().await;
-        let rows = guard
-            .outbox
-            .iter()
-            .filter(|(_, (_, pub_at))| pub_at.is_none())
-            .take(limit.max(1) as usize)
-            .map(|(id, (payload, _))| OutboxRevertRow {
-                event_id: *id,
-                payload_json: payload.clone(),
-            })
-            .collect();
-        Ok(rows)
-    }
-
-    async fn mark_revert_outbox_published(&self, event_ids: &[EventId]) -> Result<u64, String> {
-        let mut guard = self.state.lock().await;
-        if guard.fail_mark_outbox_remaining > 0 {
-            guard.fail_mark_outbox_remaining -= 1;
-            return Err("simulated mark outbox error".to_owned());
-        }
-        let mut count = 0u64;
-        for id in event_ids {
-            if let Some((_, pub_at)) = guard.outbox.get_mut(id) {
-                if pub_at.is_none() {
-                    *pub_at = Some(Utc::now());
-                    count += 1;
-                }
-            }
-        }
-        Ok(count)
+        Ok(StaleRejectionOutcome::Rejected(revert))
     }
 }
 
@@ -420,7 +414,6 @@ struct MockRedisWriterSink {
     fail_revert: AtomicBool,
     confirmed_batches: Mutex<Vec<RedisBatchUpdate>>,
     reverts: Mutex<Vec<RevertEvent>>,
-    raw_reverts: Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -440,12 +433,21 @@ impl RedisWriterSink for MockRedisWriterSink {
         self.reverts.lock().await.extend_from_slice(events);
         Ok(())
     }
+}
 
-    async fn publish_raw_revert_payloads(&self, payloads: &[String]) -> Result<(), String> {
-        if self.fail_revert.load(Ordering::Acquire) {
-            return Err("simulated Redis raw revert failure".to_owned());
+#[derive(Default)]
+struct MockOutcomePublisher {
+    fail: AtomicBool,
+    events: Mutex<Vec<EnrollmentOutcomeEvent>>,
+}
+
+#[async_trait]
+impl OutcomePublisher for MockOutcomePublisher {
+    async fn publish_outcomes(&self, events: &[EnrollmentOutcomeEvent]) -> Result<(), String> {
+        if self.fail.load(Ordering::Acquire) {
+            return Err("simulated Kafka outcomes publish error".to_owned());
         }
-        self.raw_reverts.lock().await.extend_from_slice(payloads);
+        self.events.lock().await.extend_from_slice(events);
         Ok(())
     }
 }
@@ -492,10 +494,20 @@ fn make_processor(
     redis: Arc<MockRedisWriterSink>,
     dlq: Arc<MockDlqPublisher>,
 ) -> WriterProcessor {
+    make_processor_with_outcomes(repo, redis, dlq, Arc::new(MockOutcomePublisher::default()))
+}
+
+fn make_processor_with_outcomes(
+    repo: Arc<FakePgWriterRepository>,
+    redis: Arc<MockRedisWriterSink>,
+    dlq: Arc<MockDlqPublisher>,
+    outcome_pub: Arc<MockOutcomePublisher>,
+) -> WriterProcessor {
     WriterProcessor::new(
         repo,
         redis,
         dlq,
+        outcome_pub,
         WriterProcessorConfig {
             max_db_retries: 2,
             db_retry_backoff: Duration::from_millis(1),
@@ -604,7 +616,7 @@ async fn partial_batch_failure_isolates_invalid_records_writes_outbox_and_emits_
     assert!(report.used_isolation_fallback);
     assert_eq!(report.confirmed_count, 1);
     assert_eq!(report.rejected_count, 5);
-    assert_eq!(report.outbox_marked_published, 5);
+    assert_eq!(report.outcomes_published_count, 6);
 
     let reasons: HashSet<RuleErrorCode> = report
         .reverted_events
@@ -663,41 +675,153 @@ async fn intra_batch_same_student_same_course_sequences_causally_in_order() {
 }
 
 #[tokio::test]
-async fn idempotency_prevents_double_count_on_in_batch_and_kafka_redelivery() {
+async fn idempotency_prevents_double_count_and_reemits_outcomes_on_crash_recovery() {
     let repo = Arc::new(FakePgWriterRepository::default());
     let redis = Arc::new(MockRedisWriterSink::default());
     let dlq = Arc::new(MockDlqPublisher::default());
-    let proc = make_processor(Arc::clone(&repo), Arc::clone(&redis), Arc::clone(&dlq));
+    let outcome_pub = Arc::new(MockOutcomePublisher::default());
+    let proc = make_processor_with_outcomes(
+        Arc::clone(&repo),
+        Arc::clone(&redis),
+        Arc::clone(&dlq),
+        Arc::clone(&outcome_pub),
+    );
 
     let term = TermId::new_v4();
     let course = CourseId::new_v4();
-    let student = StudentId::new_v4();
-    repo.insert_section(SectionId::new(301), term, course, "SEC-301", 10, 0, "OPEN")
+    let student_ok = StudentId::new_v4();
+    let student_full = StudentId::new_v4();
+    let student_stale = StudentId::new_v4();
+    repo.insert_section(SectionId::new(301), term, course, "SEC-301", 1, 0, "OPEN")
         .await;
+    proc.observe_gate_control(&GateControlEvent::new(
+        term,
+        GateState::Open,
+        None,
+        2,
+        Utc::now(),
+    ));
 
-    let cmd = make_cmd(term, student, 301, course, EnrollmentAction::Register, 1);
+    let cmd_ok = make_cmd(term, student_ok, 301, course, EnrollmentAction::Register, 2);
     let r1 = proc
-        .process_commands(&[cmd.clone(), cmd.clone()], Utc::now())
+        .process_commands(&[cmd_ok.clone(), cmd_ok.clone()], Utc::now())
         .await
         .unwrap();
     assert_eq!(r1.confirmed_count, 1);
     assert_eq!(r1.duplicate_skipped_count, 1);
+    assert_eq!(r1.outcomes_published_count, 1);
+    assert_eq!(outcome_pub.events.lock().await.len(), 1);
 
-    // Re-deliver same event_id from Kafka (simulating crash between PG commit & offset commit)
-    let r2 = proc.process_commands(&[cmd], Utc::now()).await.unwrap();
+    // Simulate crash between DB commit and Kafka outcome produce on a mixed batch (CONFIRMED + REJECTED + STALE_EPOCH).
+    let cmd_confirm = make_cmd(
+        term,
+        StudentId::new_v4(),
+        302,
+        CourseId::new_v4(),
+        EnrollmentAction::Register,
+        2,
+    );
+    repo.insert_section(
+        SectionId::new(302),
+        term,
+        cmd_confirm.course_id,
+        "SEC-302",
+        5,
+        0,
+        "OPEN",
+    )
+    .await;
+    let cmd_reject = make_cmd(
+        term,
+        student_full,
+        301,
+        course,
+        EnrollmentAction::Register,
+        2,
+    );
+    let cmd_stale = make_cmd(
+        term,
+        student_stale,
+        302,
+        cmd_confirm.course_id,
+        EnrollmentAction::Register,
+        1,
+    );
+
+    outcome_pub.fail.store(true, Ordering::Release);
+    let crash_err = proc
+        .process_commands(
+            &[cmd_confirm.clone(), cmd_reject.clone(), cmd_stale.clone()],
+            Utc::now(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(crash_err, WriterError::OutcomePublishFailed(_)));
+    // Outcome publisher failed -> consumer offset is NOT committed! Still only 1 outcome emitted so far.
+    assert_eq!(outcome_pub.events.lock().await.len(), 1);
+
+    // Recover and re-deliver the exact same batch (plus cmd_ok redelivery on fast path).
+    outcome_pub.fail.store(false, Ordering::Release);
+    let r2 = proc
+        .process_commands(std::slice::from_ref(&cmd_ok), Utc::now())
+        .await
+        .unwrap();
     assert_eq!(r2.confirmed_count, 0);
     assert_eq!(r2.duplicate_skipped_count, 1);
+    assert_eq!(r2.duplicate_reemitted_count, 1);
+    assert_eq!(r2.outcomes_published_count, 1);
+    assert_eq!(r2.outcomes[0].status, EnrollmentOutcomeStatus::Confirmed);
 
+    let r3 = proc
+        .process_commands(
+            &[cmd_confirm, cmd_reject.clone(), cmd_stale.clone()],
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r3.duplicate_skipped_count, 3);
+    assert_eq!(r3.duplicate_reemitted_count, 3);
+    assert_eq!(r3.outcomes_published_count, 3);
+
+    let by_id: HashMap<EventId, &EnrollmentOutcomeEvent> =
+        r3.outcomes.iter().map(|ev| (ev.event_id, ev)).collect();
+    assert_eq!(by_id.len(), 3);
+    assert_eq!(
+        by_id[&cmd_reject.event_id].status,
+        EnrollmentOutcomeStatus::Reverted
+    );
+    assert_eq!(
+        by_id[&cmd_reject.event_id].reason_code,
+        Some(RuleErrorCode::SectionFull)
+    );
+    assert_eq!(
+        by_id[&cmd_stale.event_id].status,
+        EnrollmentOutcomeStatus::Reverted
+    );
+    assert_eq!(
+        by_id[&cmd_stale.event_id].reason_code,
+        Some(RuleErrorCode::StaleEpoch)
+    );
+
+    // Verify DB enrolled counts were NOT double-counted across crash & replay.
     let guard = repo.state.lock().await;
     assert_eq!(guard.sections[&SectionId::new(301)].enrolled_count, 1);
+    assert_eq!(guard.sections[&SectionId::new(302)].enrolled_count, 1);
+    assert_eq!(proc.metrics_snapshot().events_duplicate_reemitted, 4);
 }
 
 #[tokio::test]
-async fn epoch_fencing_and_outbox_sweeper_recover_revert_after_redis_outage() {
+async fn epoch_fencing_emits_stale_outcome_and_tolerates_redis_outage() {
     let repo = Arc::new(FakePgWriterRepository::default());
     let redis = Arc::new(MockRedisWriterSink::default());
     let dlq = Arc::new(MockDlqPublisher::default());
-    let proc = make_processor(Arc::clone(&repo), Arc::clone(&redis), Arc::clone(&dlq));
+    let outcome_pub = Arc::new(MockOutcomePublisher::default());
+    let proc = make_processor_with_outcomes(
+        Arc::clone(&repo),
+        Arc::clone(&redis),
+        Arc::clone(&dlq),
+        Arc::clone(&outcome_pub),
+    );
 
     let term = TermId::new_v4();
     let course = CourseId::new_v4();
@@ -712,7 +836,7 @@ async fn epoch_fencing_and_outbox_sweeper_recover_revert_after_redis_outage() {
     proc.observe_gate_control(&gate);
     assert_eq!(proc.current_epoch(term), 3);
 
-    // Simulate Redis failure during immediate RevertEvent dispatch
+    // Simulate Redis outage: Kafka outcomes still succeed and batch commits cleanly!
     redis.fail_revert.store(true, Ordering::Release);
     redis.fail_confirmed.store(true, Ordering::Release);
 
@@ -723,24 +847,13 @@ async fn epoch_fencing_and_outbox_sweeper_recover_revert_after_redis_outage() {
     let report = proc.process_commands(&cmds, Utc::now()).await.unwrap();
     assert_eq!(report.confirmed_count, 1);
     assert_eq!(report.rejected_count, 1);
+    assert_eq!(report.outcomes_published_count, 2);
     assert_eq!(
         report.reverted_events[0].reason_code,
         RuleErrorCode::StaleEpoch
     );
-    assert_eq!(report.outbox_marked_published, 0);
+    assert_eq!(outcome_pub.events.lock().await.len(), 2);
 
-    // Outbox sweep while Redis is still down must fail cleanly without marking published
-    assert!(proc.sweep_outbox_once(50).await.is_err());
-
-    // Redis recovers -> sweeper publishes pending RevertEvent and marks outbox published!
-    redis.fail_revert.store(false, Ordering::Release);
-    let swept = proc.sweep_outbox_once(50).await.unwrap();
-    assert_eq!(swept, 1);
-    assert_eq!(proc.sweep_outbox_once(50).await.unwrap(), 0);
-    assert_eq!(redis.raw_reverts.lock().await.len(), 1);
-    assert_eq!(proc.metrics_snapshot().outbox_swept, 1);
-
-    // Exercise mark_revert_outbox_published warning path and Tracker direct APIs
     let tracker = EpochTracker::default();
     let mut seed = HashMap::new();
     seed.insert(term, 4);
@@ -852,12 +965,11 @@ async fn dlq_routing_transient_db_retry_and_batch_accumulator_behave_safely() {
         .unwrap_err();
     assert!(matches!(err, WriterError::TransientDb(_)));
 
-    // Cover isolated transient retry (1 fail -> ok), duplicate in isolation, and mark outbox warn!
+    // Cover isolated transient retry (1 fail -> ok) and duplicate re-emission in isolation!
     {
         let mut guard = repo.state.lock().await;
         guard.fail_fast_transient_remaining = 0;
         guard.fail_isolated_transient_remaining = 1;
-        guard.fail_mark_outbox_remaining = 1;
     }
     let bad_cmd = make_cmd(
         term,
@@ -872,7 +984,9 @@ async fn dlq_routing_transient_db_retry_and_batch_accumulator_behave_safely() {
     let iso_rep = proc.process_commands(&mixed, Utc::now()).await.unwrap();
     assert!(iso_rep.used_isolation_fallback);
     assert_eq!(iso_rep.duplicate_skipped_count, 1);
+    assert_eq!(iso_rep.duplicate_reemitted_count, 1);
     assert_eq!(iso_rep.rejected_count, 1);
+    assert_eq!(iso_rep.outcomes_published_count, 3);
 
     // Trigger exhaustion in isolated retry loop
     {
@@ -1079,19 +1193,31 @@ async fn end_to_end_engine_to_writer_revert_and_confirm_loop_preserves_zero_over
     assert_eq!(report.confirmed_count, 1);
     assert_eq!(report.rejected_count, 1);
 
-    // Apply SeatConfirmedEvent & RevertEvent back to EnrollmentEngine!
+    // Apply EnrollmentOutcomeEvents (Confirmed & Reverted) back to EnrollmentEngine!
     for confirmed in &report.confirmed_events {
-        engine.apply_seat_confirmed(confirmed);
+        engine
+            .apply_outcome_event(&EnrollmentOutcomeEvent::confirmed(
+                confirmed.event_id,
+                confirmed.term_id,
+                confirmed.student_id,
+                confirmed.section_id,
+                acc1.course_id,
+                EnrollmentAction::Register,
+                1,
+                confirmed.confirmed_at,
+            ))
+            .await;
     }
     for revert in &report.reverted_events {
+        let outcome = EnrollmentOutcomeEvent::from_revert(revert);
         assert_eq!(
-            engine.apply_revert_event(revert).await,
-            RevertOutcome::Applied
+            engine.apply_outcome_event(&outcome).await,
+            Some(RevertOutcome::Applied)
         );
-        // Replay duplicate RevertEvent -> MUST be idempotent!
+        // Replay duplicate Reverted outcome -> MUST be idempotent!
         assert_eq!(
-            engine.apply_revert_event(revert).await,
-            RevertOutcome::DuplicateInRam
+            engine.apply_outcome_event(&outcome).await,
+            Some(RevertOutcome::DuplicateInRam)
         );
     }
 
@@ -1110,40 +1236,37 @@ async fn end_to_end_engine_to_writer_revert_and_confirm_loop_preserves_zero_over
         .await
         .unwrap();
     assert_eq!(drop_report.confirmed_count, 1);
-    engine.apply_seat_confirmed(&drop_report.confirmed_events[0]);
+    let dc = &drop_report.confirmed_events[0];
+    engine
+        .apply_outcome_event(&EnrollmentOutcomeEvent::confirmed(
+            dc.event_id,
+            dc.term_id,
+            dc.student_id,
+            dc.section_id,
+            acc1.course_id,
+            EnrollmentAction::Drop,
+            1,
+            dc.confirmed_at,
+        ))
+        .await;
     assert_eq!(
         engine.get_event_status(drop1.event_id).unwrap().state,
         HotPathEnrollmentState::Dropped
     );
 }
 
-#[derive(Default)]
-struct MockDeltaRevertPublisher {
-    fail: AtomicBool,
-    published: Mutex<Vec<RevertEvent>>,
-}
-
-#[async_trait]
-impl enrollment_writer::core::DeltaRevertPublisher for MockDeltaRevertPublisher {
-    async fn publish_revert_deltas(&self, events: &[RevertEvent]) -> Result<(), String> {
-        if self.fail.load(Ordering::Acquire) {
-            return Err("simulated Kafka delta publish failure".to_owned());
-        }
-        self.published.lock().await.extend(events.iter().cloned());
-        Ok(())
-    }
-}
-
 #[tokio::test]
-async fn writer_publishes_revert_deltas_and_caches_event_statuses_on_confirm_and_reject() {
+async fn writer_publishes_kafka_outcomes_and_caches_event_statuses_on_confirm_and_reject() {
     let repo = Arc::new(FakePgWriterRepository::default());
     let redis = Arc::new(MockRedisWriterSink::default());
     let dlq = Arc::new(MockDlqPublisher::default());
-    let delta_pub = Arc::new(MockDeltaRevertPublisher::default());
-    let proc = make_processor(Arc::clone(&repo), Arc::clone(&redis), Arc::clone(&dlq))
-        .with_delta_publisher(
-            Arc::clone(&delta_pub) as Arc<dyn enrollment_writer::core::DeltaRevertPublisher>
-        );
+    let outcome_pub = Arc::new(MockOutcomePublisher::default());
+    let proc = make_processor_with_outcomes(
+        Arc::clone(&repo),
+        Arc::clone(&redis),
+        Arc::clone(&dlq),
+        Arc::clone(&outcome_pub),
+    );
 
     let term = TermId::new_v4();
     let c_ok = CourseId::new_v4();
@@ -1163,7 +1286,7 @@ async fn writer_publishes_revert_deltas_and_caches_event_statuses_on_confirm_and
         .unwrap();
     assert_eq!(report.confirmed_count, 1);
     assert_eq!(report.rejected_count, 1);
-    assert_eq!(report.outbox_marked_published, 1);
+    assert_eq!(report.outcomes_published_count, 2);
 
     // Confirmed event status cached with Status = Confirmed
     let batches = redis.confirmed_batches.lock().await;
@@ -1175,16 +1298,19 @@ async fn writer_publishes_revert_deltas_and_caches_event_statuses_on_confirm_and
         HotPathEnrollmentState::Confirmed
     );
     assert_eq!(batches[0].event_status_ttl_secs, 3600);
-
-    // Rejected event published BOTH to Redis Pub/Sub AND Kafka unieee.enrollment.deltas
-    let deltas = delta_pub.published.lock().await;
-    assert_eq!(deltas.len(), 1);
-    assert_eq!(deltas[0].event_id, c2.event_id);
-    drop(deltas);
     drop(batches);
 
-    // Simulate Kafka delta failure during immediate reject -> outbox remains unpublished -> sweep retries BOTH Redis & Kafka!
-    delta_pub.fail.store(true, Ordering::Release);
+    // Both Confirmed & Reverted outcomes published to Kafka unieee.enrollment.outcomes
+    let outcomes = outcome_pub.events.lock().await;
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(outcomes[0].event_id, c1.event_id);
+    assert_eq!(outcomes[0].status, EnrollmentOutcomeStatus::Confirmed);
+    assert_eq!(outcomes[1].event_id, c2.event_id);
+    assert_eq!(outcomes[1].status, EnrollmentOutcomeStatus::Reverted);
+    drop(outcomes);
+
+    // Simulate Kafka outcome publish outage -> returns OutcomePublishFailed (holds consumer offset!)
+    outcome_pub.fail.store(true, Ordering::Release);
     let c3 = make_cmd(
         term,
         StudentId::new_v4(),
@@ -1193,15 +1319,65 @@ async fn writer_publishes_revert_deltas_and_caches_event_statuses_on_confirm_and
         EnrollmentAction::Register,
         1,
     );
+    let err = proc
+        .process_commands(std::slice::from_ref(&c3), Utc::now())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WriterError::OutcomePublishFailed(_)));
+
+    // Retry succeeds via DB duplicate re-emission!
+    outcome_pub.fail.store(false, Ordering::Release);
     let rep2 = proc
         .process_commands(std::slice::from_ref(&c3), Utc::now())
         .await
         .unwrap();
-    assert_eq!(rep2.outbox_marked_published, 0);
-    assert!(proc.sweep_outbox_once(50).await.is_err());
+    assert_eq!(rep2.duplicate_reemitted_count, 1);
+    assert_eq!(rep2.outcomes_published_count, 1);
+    assert_eq!(outcome_pub.events.lock().await.len(), 3);
+}
 
-    delta_pub.fail.store(false, Ordering::Release);
-    let swept = proc.sweep_outbox_once(50).await.unwrap();
-    assert_eq!(swept, 1);
-    assert_eq!(delta_pub.published.lock().await.len(), 2);
+#[tokio::test]
+async fn conflict_free_chunking_preserves_causal_order_and_uses_fast_batch_across_mixed_churn() {
+    let repo = Arc::new(FakePgWriterRepository::default());
+    let redis = Arc::new(MockRedisWriterSink::default());
+    let dlq = Arc::new(MockDlqPublisher::default());
+    let proc = make_processor(Arc::clone(&repo), Arc::clone(&redis), Arc::clone(&dlq));
+
+    let term = TermId::new_v4();
+    let c1 = CourseId::new_v4();
+    let c2 = CourseId::new_v4();
+    let s1 = StudentId::new_v4();
+    let s2 = StudentId::new_v4();
+    let s3 = StudentId::new_v4();
+    let s4 = StudentId::new_v4();
+
+    repo.insert_section(SectionId::new(701), term, c1, "C701", 10, 0, "OPEN")
+        .await;
+    repo.insert_section(SectionId::new(702), term, c2, "C702", 10, 0, "OPEN")
+        .await;
+
+    let cmds = vec![
+        make_cmd(term, s1, 701, c1, EnrollmentAction::Register, 1),
+        make_cmd(term, s2, 702, c2, EnrollmentAction::Register, 1),
+        // Same (s1, c1) forces chunk split after the first two fast-batch commands.
+        make_cmd(term, s1, 701, c1, EnrollmentAction::Drop, 1),
+        make_cmd(term, s3, 701, c1, EnrollmentAction::Register, 1),
+        make_cmd(term, s4, 702, c2, EnrollmentAction::Register, 1),
+    ];
+
+    assert!(enrollment_writer::core::split_into_conflict_free_chunks(&[]).is_empty());
+    let chunks = enrollment_writer::core::split_into_conflict_free_chunks(&cmds);
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].len(), 2);
+    assert_eq!(chunks[1].len(), 3);
+
+    let report = proc.process_commands(&cmds, Utc::now()).await.unwrap();
+    assert!(!report.used_isolation_fallback);
+    assert_eq!(report.confirmed_count, 5);
+    assert_eq!(report.rejected_count, 0);
+
+    let guard = repo.state.lock().await;
+    // s1 registered (+1), dropped (-1), s3 registered (+1) -> section 701 net = 1
+    assert_eq!(guard.sections[&SectionId::new(701)].enrolled_count, 1);
+    assert_eq!(guard.sections[&SectionId::new(702)].enrolled_count, 2);
 }

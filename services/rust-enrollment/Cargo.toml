@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.1"
+version = "1.0.0"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -26,6 +26,8 @@ futures-util = "0.3"
 hex = "0.4"
 http-body-util = "0.1"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
 parking_lot = "0.12"
 proptest = "1"
 rdkafka = { version = "0.37", default-features = false, features = ["cmake-build", "tokio"] }

@@ -46,3 +46,10 @@ Thumbs.db
 # Agent rules and MCP tool folder
 graphify-out/
 .agents
+
+# E2E & Load benchmark ephemeral work/results
+__pycache__/
+*.py[cod]
+tests/e2e/results/
+tests/load/results/
+tests/load/.work/

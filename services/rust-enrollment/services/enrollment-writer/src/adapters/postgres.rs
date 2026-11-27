@@ -1,6 +1,7 @@
 use crate::core::{
     aggregate_section_deltas, classify_pg_sqlstate, FastBatchCommitResult, FastPathBatchError,
-    OutboxRevertRow, PgErrorClass, SectionSeatSnapshot, SingleEventOutcome, WriterRepository,
+    PersistedEventOutcome, PgErrorClass, SectionSeatSnapshot, SingleEventOutcome,
+    StaleRejectionOutcome, WriterRepository,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -9,7 +10,9 @@ use sqlx::{PgPool, Row};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::Duration;
-use unieee_domain::{CourseId, EnrollmentAction, EventId, RuleErrorCode, SectionId, TermId};
+use unieee_domain::{
+    CourseId, EnrollmentAction, EnrollmentEventStatus, EventId, RuleErrorCode, SectionId, TermId,
+};
 use unieee_events::{encode_json, EnrollmentCommandEvent, RevertEvent};
 use uuid::Uuid;
 
@@ -308,17 +311,105 @@ fn fast_path_err(err: &sqlx::Error) -> FastPathBatchError {
     }
 }
 
+pub fn parse_persisted_outcome_row(
+    event_id: Uuid,
+    status_raw: &str,
+    reason_code_raw: Option<String>,
+    audit_note: Option<String>,
+    engine_epoch: i64,
+    created_at: DateTime<Utc>,
+) -> Result<PersistedEventOutcome, String> {
+    let status = match status_raw.trim().to_ascii_uppercase().as_str() {
+        "CONFIRMED" => EnrollmentEventStatus::Confirmed,
+        "REJECTED" => EnrollmentEventStatus::Rejected,
+        "REVERTED" => EnrollmentEventStatus::Reverted,
+        other => return Err(format!("unknown enrollment_events.status: {other}")),
+    };
+    let reason_code = reason_code_raw
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|code| {
+            RuleErrorCode::from_code(code).unwrap_or(RuleErrorCode::DatabaseConstraintViolation)
+        });
+    Ok(PersistedEventOutcome {
+        event_id: EventId::from_uuid(event_id),
+        status,
+        reason_code,
+        reason_detail: audit_note,
+        engine_epoch: u64::try_from(engine_epoch.max(0)).unwrap_or(0),
+        created_at,
+    })
+}
+
 impl PgWriterRepository {
+    async fn fetch_existing_outcomes_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        event_ids: &[Uuid],
+    ) -> Result<HashMap<EventId, PersistedEventOutcome>, String> {
+        if event_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT event_id, status, reason_code, audit_note, engine_epoch, created_at
+            FROM registration.enrollment_events
+            WHERE event_id = ANY($1::uuid[])
+            "#,
+        )
+        .bind(event_ids)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|e| format!("failed querying existing enrollment_events outcomes: {e}"))?;
+
+        let mut out = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let id: Uuid = row.try_get("event_id").map_err(|e| e.to_string())?;
+            let status_raw: String = row.try_get("status").map_err(|e| e.to_string())?;
+            let reason_code_raw: Option<String> = row.try_get("reason_code").ok();
+            let audit_note: Option<String> = row.try_get("audit_note").ok();
+            let engine_epoch: i64 = row.try_get("engine_epoch").unwrap_or(0);
+            let created_at: DateTime<Utc> = row.try_get("created_at").map_err(|e| e.to_string())?;
+            let parsed = parse_persisted_outcome_row(
+                id,
+                &status_raw,
+                reason_code_raw,
+                audit_note,
+                engine_epoch,
+                created_at,
+            )?;
+            out.insert(parsed.event_id, parsed);
+        }
+        Ok(out)
+    }
+
+    async fn fetch_existing_outcome_or_err(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        event: &EnrollmentCommandEvent,
+    ) -> Result<PersistedEventOutcome, String> {
+        let mut map = self
+            .fetch_existing_outcomes_tx(tx, &[event.event_id.as_uuid()])
+            .await?;
+        map.remove(&event.event_id).ok_or_else(|| {
+            format!(
+                "duplicate event_id {} conflicted on insert but was not found in enrollment_events",
+                event.event_id
+            )
+        })
+    }
+
     async fn persist_rejection_tx(
         &self,
         event: &EnrollmentCommandEvent,
         code: RuleErrorCode,
         detail: &str,
         now: DateTime<Utc>,
-    ) -> Result<Option<RevertEvent>, String> {
+    ) -> Result<StaleRejectionOutcome, String> {
         let sec_id = event.section_id.to_pg_i64().map_err(|e| e.to_string())?;
         let epoch_i64 = i64::try_from(event.engine_epoch).unwrap_or(i64::MAX);
-        let (revert_ev, payload_json) =
+        let (revert_ev, _payload_json) =
             build_rejection_revert_event(event, code, detail.to_owned(), now)?;
 
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
@@ -348,26 +439,13 @@ impl PgWriterRepository {
         .map_err(|e| e.to_string())?;
 
         if inserted.is_none() {
+            let persisted = self.fetch_existing_outcome_or_err(&mut tx, event).await?;
             tx.commit().await.map_err(|e| e.to_string())?;
-            return Ok(None);
+            return Ok(StaleRejectionOutcome::AlreadyPersisted(persisted));
         }
 
-        sqlx::query(
-            r#"
-            INSERT INTO registration.writer_revert_outbox (event_id, payload, created_at)
-            VALUES ($1, ($2::text)::jsonb, $3)
-            ON CONFLICT (event_id) DO NOTHING
-            "#,
-        )
-        .bind(event.event_id.as_uuid())
-        .bind(&payload_json)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-
         tx.commit().await.map_err(|e| e.to_string())?;
-        Ok(Some(revert_ev))
+        Ok(StaleRejectionOutcome::Rejected(revert_ev))
     }
 }
 
@@ -439,12 +517,36 @@ impl WriterRepository for PgWriterRepository {
         .map_err(|e| fast_path_err(&e))?;
 
         let inserted_set: HashSet<Uuid> = inserted_ids.into_iter().collect();
-        let active_events: Vec<EnrollmentCommandEvent> = events
-            .iter()
-            .filter(|ev| inserted_set.contains(&ev.event_id.as_uuid()))
-            .cloned()
-            .collect();
-        let duplicate_skipped = events.len().saturating_sub(active_events.len());
+        let mut active_events = Vec::with_capacity(events.len());
+        let mut duplicate_commands = Vec::new();
+        for ev in events {
+            if inserted_set.contains(&ev.event_id.as_uuid()) {
+                active_events.push(ev.clone());
+            } else {
+                duplicate_commands.push(ev.clone());
+            }
+        }
+        let duplicate_skipped = duplicate_commands.len();
+
+        let replayed_duplicate_outcomes = if duplicate_commands.is_empty() {
+            Vec::new()
+        } else {
+            let dup_ids: Vec<Uuid> = duplicate_commands
+                .iter()
+                .map(|ev| ev.event_id.as_uuid())
+                .collect();
+            let existing_map = self
+                .fetch_existing_outcomes_tx(&mut tx, &dup_ids)
+                .await
+                .map_err(FastPathBatchError::Transient)?;
+            let mut pairs = Vec::with_capacity(duplicate_commands.len());
+            for cmd in duplicate_commands {
+                if let Some(persisted) = existing_map.get(&cmd.event_id) {
+                    pairs.push((cmd, persisted.clone()));
+                }
+            }
+            pairs
+        };
 
         if active_events.is_empty() {
             tx.commit()
@@ -453,6 +555,7 @@ impl WriterRepository for PgWriterRepository {
             return Ok(FastBatchCommitResult {
                 committed_events: Vec::new(),
                 duplicate_skipped,
+                replayed_duplicate_outcomes,
                 updated_sections: HashMap::new(),
             });
         }
@@ -586,6 +689,7 @@ impl WriterRepository for PgWriterRepository {
         Ok(FastBatchCommitResult {
             committed_events: active_events,
             duplicate_skipped,
+            replayed_duplicate_outcomes,
             updated_sections,
         })
     }
@@ -624,8 +728,9 @@ impl WriterRepository for PgWriterRepository {
         .map_err(|e| e.to_string())?;
 
         if inserted.is_none() {
+            let persisted = self.fetch_existing_outcome_or_err(&mut tx, event).await?;
             tx.commit().await.map_err(|e| e.to_string())?;
-            return Ok(SingleEventOutcome::DuplicateSkipped);
+            return Ok(SingleEventOutcome::AlreadyPersisted(persisted));
         }
 
         let locked_row = sqlx::query(
@@ -649,8 +754,10 @@ impl WriterRepository for PgWriterRepository {
         if let Err((code, detail)) = evaluate_locked_section_for_event(section.as_ref(), event) {
             let _ = tx.rollback().await;
             return match self.persist_rejection_tx(event, code, &detail, now).await? {
-                Some(rev) => Ok(SingleEventOutcome::Rejected(rev)),
-                None => Ok(SingleEventOutcome::DuplicateSkipped),
+                StaleRejectionOutcome::Rejected(rev) => Ok(SingleEventOutcome::Rejected(rev)),
+                StaleRejectionOutcome::AlreadyPersisted(p) => {
+                    Ok(SingleEventOutcome::AlreadyPersisted(p))
+                }
             };
         }
 
@@ -680,8 +787,12 @@ impl WriterRepository for PgWriterRepository {
                 return match classify_sqlx_error(&err) {
                     PgErrorClass::ConstraintViolation { code, detail } => {
                         match self.persist_rejection_tx(event, code, &detail, now).await? {
-                            Some(rev) => Ok(SingleEventOutcome::Rejected(rev)),
-                            None => Ok(SingleEventOutcome::DuplicateSkipped),
+                            StaleRejectionOutcome::Rejected(rev) => {
+                                Ok(SingleEventOutcome::Rejected(rev))
+                            }
+                            StaleRejectionOutcome::AlreadyPersisted(p) => {
+                                Ok(SingleEventOutcome::AlreadyPersisted(p))
+                            }
                         }
                     }
                     PgErrorClass::Transient(msg) => Err(msg),
@@ -716,8 +827,10 @@ impl WriterRepository for PgWriterRepository {
                     .persist_rejection_tx(event, RuleErrorCode::NotEnrolledInSection, &detail, now)
                     .await?
                 {
-                    Some(rev) => Ok(SingleEventOutcome::Rejected(rev)),
-                    None => Ok(SingleEventOutcome::DuplicateSkipped),
+                    StaleRejectionOutcome::Rejected(rev) => Ok(SingleEventOutcome::Rejected(rev)),
+                    StaleRejectionOutcome::AlreadyPersisted(p) => {
+                        Ok(SingleEventOutcome::AlreadyPersisted(p))
+                    }
                 };
             }
         }
@@ -755,8 +868,10 @@ impl WriterRepository for PgWriterRepository {
                     .persist_rejection_tx(event, RuleErrorCode::SectionFull, &detail, now)
                     .await?
                 {
-                    Some(rev) => Ok(SingleEventOutcome::Rejected(rev)),
-                    None => Ok(SingleEventOutcome::DuplicateSkipped),
+                    StaleRejectionOutcome::Rejected(rev) => Ok(SingleEventOutcome::Rejected(rev)),
+                    StaleRejectionOutcome::AlreadyPersisted(p) => {
+                        Ok(SingleEventOutcome::AlreadyPersisted(p))
+                    }
                 }
             }
             Err(err) => {
@@ -764,8 +879,12 @@ impl WriterRepository for PgWriterRepository {
                 match classify_sqlx_error(&err) {
                     PgErrorClass::ConstraintViolation { code, detail } => {
                         match self.persist_rejection_tx(event, code, &detail, now).await? {
-                            Some(rev) => Ok(SingleEventOutcome::Rejected(rev)),
-                            None => Ok(SingleEventOutcome::DuplicateSkipped),
+                            StaleRejectionOutcome::Rejected(rev) => {
+                                Ok(SingleEventOutcome::Rejected(rev))
+                            }
+                            StaleRejectionOutcome::AlreadyPersisted(p) => {
+                                Ok(SingleEventOutcome::AlreadyPersisted(p))
+                            }
                         }
                     }
                     PgErrorClass::Transient(msg) => Err(msg),
@@ -779,62 +898,12 @@ impl WriterRepository for PgWriterRepository {
         event: &EnrollmentCommandEvent,
         current_epoch: u64,
         now: DateTime<Utc>,
-    ) -> Result<Option<RevertEvent>, String> {
+    ) -> Result<StaleRejectionOutcome, String> {
         let detail = format!(
             "Command engineEpoch={} rejected because writer currentEpoch={}",
             event.engine_epoch, current_epoch
         );
         self.persist_rejection_tx(event, RuleErrorCode::StaleEpoch, &detail, now)
             .await
-    }
-
-    async fn fetch_unpublished_revert_outbox(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<OutboxRevertRow>, String> {
-        let rows = sqlx::query(
-            r#"
-            SELECT event_id, payload::text AS payload
-            FROM registration.writer_revert_outbox
-            WHERE published_at IS NULL
-            ORDER BY created_at ASC
-            LIMIT $1
-            "#,
-        )
-        .bind(limit.max(1))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("failed querying writer_revert_outbox: {e}"))?;
-
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let id: Uuid = row.try_get("event_id").map_err(|e| e.to_string())?;
-            let payload_json: String = row.try_get("payload").map_err(|e| e.to_string())?;
-            out.push(OutboxRevertRow {
-                event_id: EventId::from_uuid(id),
-                payload_json,
-            });
-        }
-        Ok(out)
-    }
-
-    async fn mark_revert_outbox_published(&self, event_ids: &[EventId]) -> Result<u64, String> {
-        if event_ids.is_empty() {
-            return Ok(0);
-        }
-        let uuids: Vec<Uuid> = event_ids.iter().map(EventId::as_uuid).collect();
-        let res = sqlx::query(
-            r#"
-            UPDATE registration.writer_revert_outbox
-            SET published_at = NOW()
-            WHERE event_id = ANY($1::uuid[])
-              AND published_at IS NULL
-            "#,
-        )
-        .bind(&uuids)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("failed marking writer_revert_outbox published: {e}"))?;
-        Ok(res.rows_affected())
     }
 }

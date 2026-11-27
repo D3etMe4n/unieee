@@ -2,8 +2,9 @@ use crate::core::coalescer::SeatTentativeCoalescerHandle;
 use crate::core::models::{
     ActiveEnrollment, BootstrapOptions, BootstrapReport, BootstrapSourceKind,
     CoursePrerequisiteEdge, DeltaOutcome, EngineError, EngineReadiness, EngineRuntimeOptions,
-    EnrollmentAccepted, EventStatusRecord, NodeRole, PreloadDataset, ReplayEventRecord,
-    RevertOutcome, SectionMeta, StudentState, SweepReport,
+    EnrollmentAccepted, EventStatusRecord, NodeRole, PreloadDataset, PreloadSummarySnapshot,
+    ReplayEventRecord, RevertOutcome, SectionMeta, SectionSeatView, StudentEnrollmentItemView,
+    StudentEnrollmentsView, StudentState, SweepReport,
 };
 use crate::core::ports::{
     CommandPublisher, EventStatusCacheReader, EventStatusFallbackStore, FallbackEventLogSource,
@@ -14,14 +15,14 @@ use crate::core::rules::{
     evaluate_schedule_conflict, evaluate_tuition_and_standing, evaluate_wave_eligibility,
     RuleViolation,
 };
-use crate::core::snapshot::SnapshotStore;
+use crate::core::snapshot::{sha256_hex, SnapshotStore};
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -32,8 +33,8 @@ use unieee_domain::{
     StudentId, TermId, WindowId, WindowStatus,
 };
 use unieee_events::{
-    EnrollmentCommandEvent, EnrollmentDeltaEvent, GateControlEvent, RevertEvent,
-    SeatConfirmedEvent, SeatTentativeEvent, SectionCapacityUpdatedEvent,
+    EnrollmentCommandEvent, EnrollmentDeltaEvent, EnrollmentOutcomeEvent, EnrollmentOutcomeStatus,
+    GateControlEvent, RevertEvent, SeatTentativeEvent, SectionCapacityUpdatedEvent,
     StudentStandingUpdatedEvent,
 };
 
@@ -426,6 +427,48 @@ impl EnrollmentEngine {
         self.students.get_cloned(&student_id)
     }
 
+    #[must_use]
+    pub fn preload_summary(&self) -> PreloadSummarySnapshot {
+        let readiness = self.readiness();
+        let catalog = self.catalog.load();
+        let mut snapshots = catalog.seat_table.snapshots();
+        snapshots.sort_by_key(|snap| snap.section_id.as_u64());
+
+        let mut total_max_capacity = 0i64;
+        let mut total_enrolled_seats = 0i64;
+        let mut total_available_seats = 0i64;
+        let mut canonical = String::with_capacity(snapshots.len() * 24);
+
+        for snap in &snapshots {
+            total_max_capacity += i64::from(snap.max_capacity);
+            total_enrolled_seats += i64::from(snap.enrolled_count);
+            total_available_seats += i64::from(snap.available_seats);
+            canonical.push_str(&format!(
+                "{}:{}:{}\n",
+                snap.section_id.as_u64(),
+                snap.max_capacity,
+                snap.enrolled_count
+            ));
+        }
+
+        PreloadSummarySnapshot {
+            ready: readiness == EngineReadiness::Ready,
+            state: readiness.as_str(),
+            role: self.role().as_str(),
+            gate_state: self.gate_state(),
+            term_id: catalog.term_id,
+            term_code: catalog.term_code.clone(),
+            epoch: self.epoch(),
+            checkpoint_seq: self.checkpoint_seq(),
+            section_count: snapshots.len(),
+            student_count: self.students.len(),
+            total_max_capacity,
+            total_enrolled_seats,
+            total_available_seats,
+            seat_checksum_sha256: sha256_hex(canonical.as_bytes()),
+        }
+    }
+
     pub fn hydrate_from_dataset(
         &self,
         dataset: PreloadDataset,
@@ -546,6 +589,11 @@ impl EnrollmentEngine {
                 Ok(batch) => {
                     let resume_offsets = batch.high_watermarks.clone();
                     let count = self.apply_kafka_replay_batch(batch);
+                    metrics::counter!(
+                        "unieee_engine_kafka_replay_events_total",
+                        "source" => "disk_kafka"
+                    )
+                    .increment(count as u64);
                     self.set_readiness(EngineReadiness::Ready);
                     return Ok(BootstrapReport {
                         source: BootstrapSourceKind::DiskSnapshotKafkaReplay,
@@ -573,6 +621,11 @@ impl EnrollmentEngine {
                             opts.replay_throttle,
                         )
                         .await?;
+                    metrics::counter!(
+                        "unieee_engine_kafka_replay_events_total",
+                        "source" => "disk_pg"
+                    )
+                    .increment(count as u64);
                     self.set_readiness(EngineReadiness::Ready);
                     return Ok(BootstrapReport {
                         source: BootstrapSourceKind::DiskSnapshotFallbackPgReplay,
@@ -604,6 +657,11 @@ impl EnrollmentEngine {
         if let Ok(tail) = kafka_replay.replay_since(term_id, kafka_from_ms).await {
             resume_offsets = tail.high_watermarks.clone();
             replayed = self.apply_kafka_replay_batch(tail);
+            metrics::counter!(
+                "unieee_engine_kafka_replay_events_total",
+                "source" => "fresh_pg"
+            )
+            .increment(replayed as u64);
         }
         self.set_readiness(EngineReadiness::Ready);
 
@@ -762,6 +820,17 @@ impl EnrollmentEngine {
             }
         }
         if slot.available_seats() <= 0 {
+            metrics::counter!(
+                "unieee_engine_seat_cas_total",
+                "action" => "register",
+                "outcome" => "full"
+            )
+            .increment(1);
+            metrics::counter!(
+                "unieee_engine_rule_rejections_total",
+                "code" => RuleErrorCode::SectionFull.as_str()
+            )
+            .increment(1);
             return Err(EngineError::RuleViolation {
                 code: RuleErrorCode::SectionFull,
                 detail: format!(
@@ -842,8 +911,29 @@ impl EnrollmentEngine {
         };
 
         let reservation = match reservation_res {
-            Ok(r) => r,
+            Ok(r) => {
+                metrics::counter!(
+                    "unieee_engine_seat_cas_total",
+                    "action" => "register",
+                    "outcome" => "ok"
+                )
+                .increment(1);
+                r
+            }
             Err(violation) => {
+                if violation.code == RuleErrorCode::SectionFull {
+                    metrics::counter!(
+                        "unieee_engine_seat_cas_total",
+                        "action" => "register",
+                        "outcome" => "full"
+                    )
+                    .increment(1);
+                }
+                metrics::counter!(
+                    "unieee_engine_rule_rejections_total",
+                    "code" => violation.code.as_str()
+                )
+                .increment(1);
                 return Err(EngineError::RuleViolation {
                     code: violation.code,
                     detail: violation.detail,
@@ -878,9 +968,31 @@ impl EnrollmentEngine {
             now,
         );
 
+        let publish_started = Instant::now();
         match self.command_publisher.publish_command(&cmd).await {
-            Ok(()) => {}
+            Ok(()) => {
+                metrics::counter!(
+                    "unieee_engine_kafka_command_publish_total",
+                    "outcome" => "ok"
+                )
+                .increment(1);
+                metrics::histogram!("unieee_engine_kafka_command_publish_duration_seconds")
+                    .record(publish_started.elapsed().as_secs_f64());
+            }
             Err(PublishError::Definite(err)) => {
+                metrics::counter!(
+                    "unieee_engine_kafka_command_publish_total",
+                    "outcome" => "definite_err"
+                )
+                .increment(1);
+                metrics::histogram!("unieee_engine_kafka_command_publish_duration_seconds")
+                    .record(publish_started.elapsed().as_secs_f64());
+                metrics::counter!(
+                    "unieee_engine_seat_cas_total",
+                    "action" => "rollback",
+                    "outcome" => "ok"
+                )
+                .increment(1);
                 warn!(
                     event_id = %event_id,
                     section_id = %section_id,
@@ -895,6 +1007,13 @@ impl EnrollmentEngine {
                 });
             }
             Err(PublishError::Indeterminate(err)) => {
+                metrics::counter!(
+                    "unieee_engine_kafka_command_publish_total",
+                    "outcome" => "indeterminate_err"
+                )
+                .increment(1);
+                metrics::histogram!("unieee_engine_kafka_command_publish_duration_seconds")
+                    .record(publish_started.elapsed().as_secs_f64());
                 warn!(
                     event_id = %event_id,
                     section_id = %section_id,
@@ -1051,6 +1170,11 @@ impl EnrollmentEngine {
         let (entry_epoch, prev_state, prev_event_id) = match drop_res {
             Ok(v) => v,
             Err(violation) => {
+                metrics::counter!(
+                    "unieee_engine_rule_rejections_total",
+                    "code" => violation.code.as_str()
+                )
+                .increment(1);
                 return Err(EngineError::RuleViolation {
                     code: violation.code,
                     detail: violation.detail,
@@ -1085,9 +1209,25 @@ impl EnrollmentEngine {
             now,
         );
 
+        let publish_started = Instant::now();
         match self.command_publisher.publish_command(&cmd).await {
-            Ok(()) => {}
+            Ok(()) => {
+                metrics::counter!(
+                    "unieee_engine_kafka_command_publish_total",
+                    "outcome" => "ok"
+                )
+                .increment(1);
+                metrics::histogram!("unieee_engine_kafka_command_publish_duration_seconds")
+                    .record(publish_started.elapsed().as_secs_f64());
+            }
             Err(PublishError::Definite(err)) => {
+                metrics::counter!(
+                    "unieee_engine_kafka_command_publish_total",
+                    "outcome" => "definite_err"
+                )
+                .increment(1);
+                metrics::histogram!("unieee_engine_kafka_command_publish_duration_seconds")
+                    .record(publish_started.elapsed().as_secs_f64());
                 warn!(
                     event_id = %event_id,
                     section_id = %section_id,
@@ -1110,6 +1250,13 @@ impl EnrollmentEngine {
                 });
             }
             Err(PublishError::Indeterminate(err)) => {
+                metrics::counter!(
+                    "unieee_engine_kafka_command_publish_total",
+                    "outcome" => "indeterminate_err"
+                )
+                .increment(1);
+                metrics::histogram!("unieee_engine_kafka_command_publish_duration_seconds")
+                    .record(publish_started.elapsed().as_secs_f64());
                 warn!(
                     event_id = %event_id,
                     section_id = %section_id,
@@ -1139,9 +1286,21 @@ impl EnrollmentEngine {
             }) {
                 match slot.try_release() {
                     Ok(rel) => {
+                        metrics::counter!(
+                            "unieee_engine_seat_cas_total",
+                            "action" => "drop",
+                            "outcome" => "ok"
+                        )
+                        .increment(1);
                         tentative_release = Some(rel);
                     }
                     Err(err) => {
+                        metrics::counter!(
+                            "unieee_engine_seat_cas_total",
+                            "action" => "drop",
+                            "outcome" => "error"
+                        )
+                        .increment(1);
                         warn!(
                             section_id = %section_id,
                             error = %err,
@@ -1385,16 +1544,19 @@ impl EnrollmentEngine {
         }
     }
 
-    pub fn apply_seat_confirmed(&self, ev: &SeatConfirmedEvent) {
+    pub(crate) fn apply_confirmed_outcome_in_ram(&self, ev: &EnrollmentOutcomeEvent) {
         if ev.term_id != self.term_id() {
             return;
         }
         let catalog = self.catalog.load();
+        self.advance_epoch_if_higher(&catalog, ev.engine_epoch);
         let mut tentative_to_emit: Option<SeatTentativeEvent> = None;
+
         self.students.with_write(&ev.student_id, |opt_student| {
             let Some(student) = opt_student else {
                 return;
             };
+
             if let Some(pos) = student
                 .active_enrollments
                 .iter()
@@ -1416,7 +1578,7 @@ impl EnrollmentEngine {
                                         rel.available_seats,
                                         rel.max_capacity,
                                         rel.epoch,
-                                        ev.confirmed_at,
+                                        ev.processed_at,
                                     ));
                                 }
                             }
@@ -1425,21 +1587,258 @@ impl EnrollmentEngine {
                     }
                     _ => {}
                 }
+                student.processed_event_ids.insert(ev.event_id);
+                return;
             }
+
+            // Out-of-order recovery on STANDBY or Kafka replay where `outcomes` arrived before `commands`
+            if student.processed_event_ids.contains(&ev.event_id)
+                || student.reverted_event_ids.contains(&ev.event_id)
+            {
+                return;
+            }
+
+            if ev.action == EnrollmentAction::Drop {
+                if let Some(pos) = student.active_enrollments.iter().position(|e| {
+                    e.section_id == ev.section_id
+                        && matches!(
+                            e.state,
+                            HotPathEnrollmentState::Reserved | HotPathEnrollmentState::Confirmed
+                        )
+                }) {
+                    student.active_enrollments.remove(pos);
+                    if let Some(slot) = catalog.seat_table.get(ev.section_id) {
+                        if let Ok(rel) = slot.try_release() {
+                            tentative_to_emit = Some(SeatTentativeEvent::new(
+                                ev.term_id,
+                                ev.section_id,
+                                rel.available_seats,
+                                rel.max_capacity,
+                                rel.epoch,
+                                ev.processed_at,
+                            ));
+                        }
+                    }
+                    student.recompute_schedule_and_credits(&catalog.sections_meta);
+                }
+                student.processed_event_ids.insert(ev.event_id);
+                return;
+            }
+
+            let Some(section_meta) = catalog.sections_meta.get(&ev.section_id) else {
+                return;
+            };
+            let Some(slot) = catalog.seat_table.get(ev.section_id) else {
+                return;
+            };
+            let policy_state = self.policy_state.load();
+            let already_holds = student.active_enrollments.iter().any(|e| {
+                e.section_id == ev.section_id
+                    && matches!(
+                        e.state,
+                        HotPathEnrollmentState::Reserved | HotPathEnrollmentState::Confirmed
+                    )
+            });
+            if !already_holds {
+                if let Ok(res) = slot.try_reserve() {
+                    tentative_to_emit = Some(SeatTentativeEvent::new(
+                        ev.term_id,
+                        ev.section_id,
+                        res.remaining_seats,
+                        res.max_capacity,
+                        res.epoch,
+                        ev.processed_at,
+                    ));
+                }
+                let credits_counted = policy_state
+                    .policy
+                    .credit_limit
+                    .counted_candidate_credits(ev.action, section_meta.credits);
+                student.active_enrollments.push(ActiveEnrollment {
+                    section_id: ev.section_id,
+                    course_id: ev.course_id,
+                    credits_counted,
+                    action: ev.action,
+                    state: HotPathEnrollmentState::Confirmed,
+                    last_event_id: ev.event_id,
+                    seat_released: false,
+                });
+                student.recompute_schedule_and_credits(&catalog.sections_meta);
+            }
+            student.processed_event_ids.insert(ev.event_id);
         });
-        if let Some(ev_tentative) = tentative_to_emit {
-            let _ = self.coalescer.enqueue_nonblocking(ev_tentative);
+
+        if self.role() == NodeRole::Active {
+            if let Some(ev_tentative) = tentative_to_emit {
+                let _ = self.coalescer.enqueue_nonblocking(ev_tentative);
+            }
         }
+
+        let target_state = if ev.action == EnrollmentAction::Drop {
+            HotPathEnrollmentState::Dropped
+        } else {
+            HotPathEnrollmentState::Confirmed
+        };
+        let mut updated_existing = false;
         self.event_index.with_write(&ev.event_id, |opt_rec| {
             if let Some(rec) = opt_rec {
-                if rec.state == HotPathEnrollmentState::DropPending {
-                    rec.state = HotPathEnrollmentState::Dropped;
-                } else if rec.state == HotPathEnrollmentState::Reserved {
-                    rec.state = HotPathEnrollmentState::Confirmed;
-                }
-                rec.updated_at = ev.confirmed_at;
+                rec.state = match rec.state {
+                    HotPathEnrollmentState::DropPending => HotPathEnrollmentState::Dropped,
+                    HotPathEnrollmentState::Reserved => HotPathEnrollmentState::Confirmed,
+                    other => other,
+                };
+                rec.updated_at = ev.processed_at;
+                updated_existing = true;
             }
         });
+        if !updated_existing {
+            self.event_index.insert(
+                ev.event_id,
+                EventStatusRecord {
+                    event_id: ev.event_id,
+                    term_id: ev.term_id,
+                    student_id: ev.student_id,
+                    section_id: ev.section_id,
+                    course_id: ev.course_id,
+                    action: ev.action,
+                    state: target_state,
+                    reason_code: None,
+                    engine_epoch: ev.engine_epoch,
+                    updated_at: ev.processed_at,
+                },
+            );
+        }
+    }
+
+    pub(crate) fn apply_outcome_in_ram(
+        &self,
+        ev: &EnrollmentOutcomeEvent,
+    ) -> Option<RevertOutcome> {
+        if ev.term_id != self.term_id() {
+            return None;
+        }
+        let lag_secs = (Utc::now() - ev.processed_at).num_milliseconds().max(0) as f64 / 1000.0;
+        metrics::histogram!("unieee_engine_kafka_outcome_lag_seconds").record(lag_secs);
+        match ev.status {
+            EnrollmentOutcomeStatus::Confirmed => {
+                metrics::counter!(
+                    "unieee_engine_kafka_outcomes_consumed_total",
+                    "status" => "confirmed"
+                )
+                .increment(1);
+                self.apply_confirmed_outcome_in_ram(ev);
+                None
+            }
+            EnrollmentOutcomeStatus::Reverted => {
+                metrics::counter!(
+                    "unieee_engine_kafka_outcomes_consumed_total",
+                    "status" => "reverted"
+                )
+                .increment(1);
+                ev.to_revert_event()
+                    .map(|revert| self.apply_revert_in_ram(&revert))
+            }
+        }
+    }
+
+    /// Consume a durable `EnrollmentOutcomeEvent` from Kafka (`unieee.enrollment.outcomes`).
+    /// Updates both ACTIVE and STANDBY RAM state and performs best-effort Redis revert dedup write.
+    pub async fn apply_outcome_event(&self, ev: &EnrollmentOutcomeEvent) -> Option<RevertOutcome> {
+        let outcome = self.apply_outcome_in_ram(ev);
+        if outcome == Some(RevertOutcome::Applied) {
+            if let Err(err) = self.revert_dedup.mark_reverted(ev.event_id, 86_400).await {
+                warn!(
+                    event_id = %ev.event_id,
+                    error = %err,
+                    "best-effort Redis revert dedup write failed after Kafka outcome revert succeeded"
+                );
+            }
+        }
+        outcome
+    }
+
+    pub fn list_term_seats(&self, term_id: TermId) -> Result<Vec<SectionSeatView>, EngineError> {
+        let readiness = self.readiness();
+        if readiness != EngineReadiness::Ready {
+            return Err(EngineError::NotReady(readiness));
+        }
+        let catalog = self.catalog.load();
+        if catalog.term_id != term_id {
+            return Err(EngineError::TermNotFound(term_id));
+        }
+
+        let mut seats = Vec::with_capacity(catalog.sections_meta.len());
+        for (sec_id, meta) in &catalog.sections_meta {
+            if let Some(slot) = catalog.seat_table.get(*sec_id) {
+                let snap = slot.snapshot();
+                let status = match snap.status {
+                    SectionSlotState::Open => SectionStatus::Open,
+                    SectionSlotState::Frozen => SectionStatus::Frozen,
+                    SectionSlotState::Closed => {
+                        if meta.status == SectionStatus::Cancelled {
+                            SectionStatus::Cancelled
+                        } else {
+                            SectionStatus::Closed
+                        }
+                    }
+                };
+                seats.push(SectionSeatView {
+                    section_id: *sec_id,
+                    available_seats: snap.available_seats,
+                    max_capacity: snap.max_capacity,
+                    status,
+                });
+            }
+        }
+        seats.sort_by_key(|s| s.section_id.as_u64());
+        Ok(seats)
+    }
+
+    pub fn get_student_enrollments(
+        &self,
+        term_id: TermId,
+        student_id: StudentId,
+    ) -> Result<StudentEnrollmentsView, EngineError> {
+        let readiness = self.readiness();
+        if readiness != EngineReadiness::Ready {
+            return Err(EngineError::NotReady(readiness));
+        }
+        let catalog = self.catalog.load();
+        if catalog.term_id != term_id {
+            return Err(EngineError::TermNotFound(term_id));
+        }
+
+        let view = self
+            .students
+            .with_read(&student_id, |opt_student| match opt_student {
+                Some(student) => {
+                    let mut items: Vec<StudentEnrollmentItemView> = student
+                        .active_enrollments
+                        .iter()
+                        .map(|entry| StudentEnrollmentItemView {
+                            section_id: entry.section_id,
+                            course_id: entry.course_id,
+                            action: entry.action,
+                            status: entry.state,
+                            last_event_id: entry.last_event_id,
+                        })
+                        .collect();
+                    items.sort_by_key(|i| i.section_id.as_u64());
+                    StudentEnrollmentsView {
+                        term_id,
+                        student_id,
+                        current_credits: student.current_credits,
+                        items,
+                    }
+                }
+                None => StudentEnrollmentsView {
+                    term_id,
+                    student_id,
+                    current_credits: 0,
+                    items: Vec::new(),
+                },
+            });
+        Ok(view)
     }
 
     pub(crate) fn apply_revert_in_ram(&self, revert: &RevertEvent) -> RevertOutcome {
@@ -1515,6 +1914,12 @@ impl EnrollmentEngine {
         });
 
         if outcome == RevertOutcome::Applied {
+            metrics::counter!(
+                "unieee_engine_seat_cas_total",
+                "action" => "revert",
+                "outcome" => "ok"
+            )
+            .increment(1);
             self.event_index.insert(
                 revert.event_id,
                 EventStatusRecord {
@@ -1539,51 +1944,50 @@ impl EnrollmentEngine {
         outcome
     }
 
-    /// Apply RevertEvent with RAM-first idempotency in student shard BEFORE best-effort Redis dedup write.
-    pub async fn apply_revert_event(&self, revert: &RevertEvent) -> RevertOutcome {
-        let outcome = self.apply_revert_in_ram(revert);
-        if outcome == RevertOutcome::Applied {
-            // Best-effort Redis dedup fallback key written strictly AFTER RAM-first idempotency update
-            if let Err(err) = self
-                .revert_dedup
-                .mark_reverted(revert.event_id, 86_400)
-                .await
-            {
-                warn!(
-                    event_id = %revert.event_id,
-                    error = %err,
-                    "best-effort Redis revert dedup write failed after RAM-first revert succeeded"
-                );
-            }
-        }
-        outcome
-    }
-
     pub fn apply_delta_event(&self, delta: &EnrollmentDeltaEvent) -> DeltaOutcome {
-        match delta {
+        let (delta_type, outcome) = match delta {
             EnrollmentDeltaEvent::StudentStandingUpdated(ev) => {
-                self.apply_student_standing_delta(ev)
+                ("student_standing", self.apply_student_standing_delta(ev))
             }
             EnrollmentDeltaEvent::SectionCapacityUpdated(ev) => {
-                self.apply_section_capacity_delta(ev)
+                ("section_capacity", self.apply_section_capacity_delta(ev))
             }
-            EnrollmentDeltaEvent::Revert(ev) => match self.apply_revert_in_ram(ev) {
-                RevertOutcome::Applied => DeltaOutcome::Applied,
-                RevertOutcome::DuplicateInRam => DeltaOutcome::DuplicateOrStale,
-                RevertOutcome::UnknownSectionOrStudent => {
-                    if ev.term_id != self.term_id() {
-                        DeltaOutcome::WrongTerm
-                    } else {
-                        DeltaOutcome::TargetNotFound
+            EnrollmentDeltaEvent::Revert(ev) => (
+                "revert",
+                match self.apply_revert_in_ram(ev) {
+                    RevertOutcome::Applied => DeltaOutcome::Applied,
+                    RevertOutcome::DuplicateInRam => DeltaOutcome::DuplicateOrStale,
+                    RevertOutcome::UnknownSectionOrStudent => {
+                        if ev.term_id != self.term_id() {
+                            DeltaOutcome::WrongTerm
+                        } else {
+                            DeltaOutcome::TargetNotFound
+                        }
                     }
-                }
-            },
-            EnrollmentDeltaEvent::GateControl(ev) => match self.apply_gate_control(ev) {
-                Ok(()) => DeltaOutcome::Applied,
-                Err(RuleErrorCode::StaleEpoch) => DeltaOutcome::DuplicateOrStale,
-                Err(_) => DeltaOutcome::WrongTerm,
-            },
-        }
+                },
+            ),
+            EnrollmentDeltaEvent::GateControl(ev) => (
+                "gate_control",
+                match self.apply_gate_control(ev) {
+                    Ok(()) => DeltaOutcome::Applied,
+                    Err(RuleErrorCode::StaleEpoch) => DeltaOutcome::DuplicateOrStale,
+                    Err(_) => DeltaOutcome::WrongTerm,
+                },
+            ),
+        };
+        let outcome_label = match outcome {
+            DeltaOutcome::Applied => "applied",
+            DeltaOutcome::DuplicateOrStale => "duplicate_or_stale",
+            DeltaOutcome::WrongTerm => "wrong_term",
+            DeltaOutcome::TargetNotFound => "not_found",
+        };
+        metrics::counter!(
+            "unieee_engine_kafka_deltas_consumed_total",
+            "delta_type" => delta_type,
+            "outcome" => outcome_label
+        )
+        .increment(1);
+        outcome
     }
 
     fn advance_epoch_if_higher(&self, catalog: &TermCatalog, target_epoch: u64) {
@@ -1984,23 +2388,29 @@ impl EnrollmentEngine {
         enum ReplayItem {
             Command(EnrollmentCommandEvent),
             Delta(EnrollmentDeltaEvent),
+            Outcome(EnrollmentOutcomeEvent),
         }
         impl ReplayItem {
             fn key(&self) -> (DateTime<Utc>, u8) {
                 match self {
                     Self::Delta(EnrollmentDeltaEvent::Revert(r)) => (r.reverted_at, 2),
+                    Self::Outcome(o) => (o.processed_at, 2),
                     Self::Delta(d) => (d.occurred_at(), 0),
                     Self::Command(c) => (c.occurred_at, 1),
                 }
             }
         }
 
-        let mut items = Vec::with_capacity(batch.commands.len() + batch.deltas.len());
+        let mut items =
+            Vec::with_capacity(batch.commands.len() + batch.deltas.len() + batch.outcomes.len());
         for d in batch.deltas {
             items.push(ReplayItem::Delta(d));
         }
         for c in batch.commands {
             items.push(ReplayItem::Command(c));
+        }
+        for o in batch.outcomes {
+            items.push(ReplayItem::Outcome(o));
         }
         items.sort_by_key(ReplayItem::key);
 
@@ -2012,6 +2422,9 @@ impl EnrollmentEngine {
                 }
                 ReplayItem::Command(c) => {
                     self.apply_replayed_command(&c);
+                }
+                ReplayItem::Outcome(o) => {
+                    let _ = self.apply_outcome_in_ram(&o);
                 }
             }
         }

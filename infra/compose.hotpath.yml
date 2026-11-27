@@ -48,6 +48,7 @@ services:
     command:
       - |
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic unieee.enrollment.commands --partitions 12 --replication-factor 1 --config retention.ms=604800000
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic unieee.enrollment.outcomes --partitions 12 --replication-factor 1 --config retention.ms=604800000
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic unieee.enrollment.deltas --partitions 6 --replication-factor 1 --config retention.ms=604800000
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic unieee.enrollment.dlq --partitions 3 --replication-factor 1 --config retention.ms=604800000
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
@@ -77,7 +78,9 @@ services:
       BIND_ADDR: 0.0.0.0:8081
       NODE_ROLE: ACTIVE
       REJOIN_AS_STANDBY_ON_RECOVERY: "true"
+      TERM_ID: ${TERM_ID:-}
       TERM_CODE: ${TERM_CODE:-}
+      INTERNAL_OPS_TOKEN: ${INTERNAL_OPS_TOKEN:-}
       DATABASE_URL: postgresql://${POSTGRES_USER:-unieee}:${POSTGRES_PASSWORD:-unieee_dev_password}@pgbouncer:6432/${POSTGRES_DB:-unieee}
       KAFKA_BROKERS: kafka:9092
       KAFKA_GROUP_ID: unieee-enrollment-engine-active
@@ -128,7 +131,9 @@ services:
       BIND_ADDR: 0.0.0.0:8081
       NODE_ROLE: STANDBY
       REJOIN_AS_STANDBY_ON_RECOVERY: "true"
+      TERM_ID: ${TERM_ID:-}
       TERM_CODE: ${TERM_CODE:-}
+      INTERNAL_OPS_TOKEN: ${INTERNAL_OPS_TOKEN:-}
       DATABASE_URL: postgresql://${POSTGRES_USER:-unieee}:${POSTGRES_PASSWORD:-unieee_dev_password}@pgbouncer:6432/${POSTGRES_DB:-unieee}
       KAFKA_BROKERS: kafka:9092
       KAFKA_GROUP_ID: unieee-enrollment-engine-standby
@@ -184,8 +189,6 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-unieee_redis_dev_password}
       BATCH_SIZE: ${WRITER_BATCH_SIZE:-250}
       BATCH_TIMEOUT_MS: ${WRITER_BATCH_TIMEOUT_MS:-30}
-      OUTBOX_SWEEP_INTERVAL_MS: ${WRITER_OUTBOX_SWEEP_INTERVAL_MS:-1000}
-      OUTBOX_SWEEP_BATCH_SIZE: ${WRITER_OUTBOX_SWEEP_BATCH_SIZE:-100}
       CACHE_TTL_SECS: ${WRITER_CACHE_TTL_SECS:-900}
     networks:
       - app

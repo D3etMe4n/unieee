@@ -53,6 +53,18 @@ spring:
       port: ${REDIS_PORT:6379}
       password: ${REDIS_PASSWORD:unieee_redis_dev_password}
 
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:kafka:9092}
+    admin:
+      auto-create: false
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+        max.block.ms: 3000
+
   ai:
     model:
       chat: ${SPRING_AI_CHAT_PROVIDER:none}
@@ -77,12 +89,18 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health,info,prometheus
   endpoint:
     health:
       probes:
         enabled: true
       show-details: when_authorized
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
 
 unieee:
   outbox:
@@ -104,6 +122,18 @@ unieee:
       redis:
         enabled: ${POLICY_CACHE_REDIS_ENABLED:true}
         ttl: ${POLICY_CACHE_REDIS_TTL:1h}
+  read-cache:
+    enabled: ${READ_CACHE_ENABLED:true}
+    timetable-open-ttl: ${READ_CACHE_TIMETABLE_OPEN_TTL:45s}
+    timetable-closed-ttl: ${READ_CACHE_TIMETABLE_CLOSED_TTL:20m}
+    policy-active-ttl: ${READ_CACHE_POLICY_ACTIVE_TTL:1h}
+    catalog-ttl: ${READ_CACHE_CATALOG_TTL:45m}
+    sections-static-ttl: ${READ_CACHE_SECTIONS_STATIC_TTL:30m}
+  hot-delta:
+    kafka:
+      enabled: ${UNIEEE_HOT_DELTA_KAFKA_ENABLED:true}
+      topic: ${UNIEEE_HOT_DELTA_KAFKA_TOPIC:unieee.enrollment.deltas}
+      send-timeout: ${UNIEEE_HOT_DELTA_KAFKA_SEND_TIMEOUT:3s}
   ai-advisor:
     enabled: ${AI_ADVISOR_ENABLED:true}
     timeout: ${AI_ADVISOR_TIMEOUT:15s}
