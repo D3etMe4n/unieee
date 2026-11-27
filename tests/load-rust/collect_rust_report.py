@@ -178,6 +178,49 @@ def parse_k6_summary(path: Path) -> dict[str, Any]:
     }
 
 
+def parse_oha_json(path: Path, allow_business_4xx: bool, allow_rate_limit: bool) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    summary = raw.get("summary") or {}
+    metrics = raw.get("metrics") or {}
+    lat_ms = metrics.get("latency_ms") or {}
+    lat_pcts = raw.get("latencyPercentiles") or {}
+    status_dist = {str(k): int(v) for k, v in (raw.get("statusCodeDistribution") or {}).items()}
+    err_dist = {str(k): int(v) for k, v in (raw.get("errorDistribution") or {}).items()}
+
+    ok_codes = {"200", "202"}
+    if allow_business_4xx:
+        ok_codes.update({"409", "422"})
+    if allow_rate_limit:
+        ok_codes.add("429")
+
+    status_total = sum(status_dist.values())
+    err_total = sum(err_dist.values())
+    total_reqs = status_total + err_total
+    unexpected = err_total + sum(cnt for code, cnt in status_dist.items() if code not in ok_codes)
+    unexpected_rate = (unexpected / total_reqs) if total_reqs > 0 else 0.0
+
+    p999_sec = lat_pcts.get("p99.9")
+    p999_ms = round(float(p999_sec) * 1000.0, 2) if p999_sec is not None else None
+
+    return {
+        "totalRequests": total_reqs,
+        "rps": float(metrics.get("requests_per_sec") or summary.get("requestsPerSec") or 0.0),
+        "latencyMs": {
+            "p50": lat_ms.get("p50"),
+            "avg": lat_ms.get("mean"),
+            "p95": lat_ms.get("p95"),
+            "p99": lat_ms.get("p99"),
+            "p999": p999_ms,
+            "max": lat_ms.get("max"),
+        },
+        "unexpectedErrorRate": unexpected_rate,
+        "statusCodeDistribution": status_dist,
+        "errorDistribution": err_dist,
+    }
+
+
 def parse_container_stats(path: Path) -> list[dict[str, str]]:
     if not path.is_file():
         return []
@@ -215,6 +258,15 @@ def main() -> int:
         p = res_dir / f"{args.run_id}-{tag}.json"
         if p.is_file():
             sse_runs[tag] = json.loads(p.read_text(encoding="utf-8"))
+
+    allow_rl = args.rate_limit.lower() == "on"
+    oha_runs: dict[str, Any] = {}
+    for slug, allow_4xx in (("05a-oha-read", False), ("05b-oha-write", True)):
+        parsed_oha = parse_oha_json(res_dir / f"{args.run_id}-{slug}.json", allow_4xx, allow_rl)
+        if parsed_oha is not None:
+            oha_runs[slug] = parsed_oha
+    oha_ver_path = res_dir / f"{args.run_id}-oha-version.txt"
+    oha_version = oha_ver_path.read_text(encoding="utf-8").strip() if oha_ver_path.is_file() else None
 
     inv_path = res_dir / f"{args.run_id}-invariants.json"
     invariants = json.loads(inv_path.read_text(encoding="utf-8")) if inv_path.is_file() else {}
@@ -272,6 +324,10 @@ def main() -> int:
         "profile": args.profile,
         "rateLimit": args.rate_limit,
         "scenarios": scenarios,
+        "ohaHostBench": {
+            "ohaVersion": oha_version,
+            "runs": oha_runs,
+        } if oha_runs else None,
         "sseConcurrency": sse_runs,
         "rustServiceMetrics": rust_metrics,
         "invariants": invariants,
@@ -307,10 +363,30 @@ def main() -> int:
                     f"| ↳ `{tname}` | — | — | `{fmt_ms(tvals.get('p50'))}` | `{fmt_ms(tvals.get('p95'))}` | `{fmt_ms(tvals.get('p99'))}` | — |"
                 )
 
+    section_idx = 2
+    if oha_runs:
+        ver_suffix = f" (`{oha_version}`)" if oha_version else ""
+        lines.extend([
+            "",
+            f"## {section_idx}. Host-Native Rust CLI Benchmark (`oha` direct on host{ver_suffix}, no Docker)",
+            "",
+            "| Run | Requests | RPS | HTTP p50 | HTTP p95 | HTTP p99 | HTTP p99.9 | Unexpected Err | Status Distribution |",
+            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |",
+        ])
+        for slug, odata in oha_runs.items():
+            lat = odata.get("latencyMs") or {}
+            dist_str = ", ".join(f"{k}:{v}" for k, v in sorted((odata.get("statusCodeDistribution") or {}).items()))
+            lines.append(
+                f"| `{slug}` | `{odata.get('totalRequests', 0)}` | `{odata.get('rps', 0.0):.1f}/s` | "
+                f"`{fmt_ms(lat.get('p50'))}` | `{fmt_ms(lat.get('p95'))}` | `{fmt_ms(lat.get('p99'))}` | "
+                f"`{fmt_ms(lat.get('p999'))}` | `{fmt_pct(odata.get('unexpectedErrorRate', 0.0))}` | `{dist_str}` |"
+            )
+        section_idx += 1
+
     if sse_runs:
         lines.extend([
             "",
-            "## 2. Concurrent SSE Connections & Live Fan-Out (`sse-gateway` direct)",
+            f"## {section_idx}. Concurrent SSE Connections & Live Fan-Out (`sse-gateway` direct)",
             "",
             "| Run | Peak Concurrent | Established / Req | Ramp Rate | Handshake p95 | Events Delivered | Fan-out Rate | Seat Lag p95 | Personal Lag p95 | Slow Drops |",
             "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -327,13 +403,14 @@ def main() -> int:
                 f"`{fmt_ms(seat_l.get('p95'))}` | `{fmt_ms(per_l.get('p95'))}` | "
                 f"`{s.get('unexpectedDisconnects', 0)}/{s.get('connectionErrors', 0)}` |"
             )
+        section_idx += 1
 
     eng_m = rust_metrics["engine"]
     wrt_m = rust_metrics["writer"]
     sse_m = rust_metrics["sse"]
     lines.extend([
         "",
-        "## 3. Rust Internal Service Telemetry (`/metrics`)",
+        f"## {section_idx}. Rust Internal Service Telemetry (`/metrics`)",
         "",
         "| Service | Key Metrics |",
         "| :--- | :--- |",
@@ -341,7 +418,7 @@ def main() -> int:
         f"| `enrollment-writer` | batches=`{wrt_m['batchesCommitted']}` (avg size `{wrt_m['avgBatchSize']}`), confirmed=`{wrt_m['eventsConfirmedTotal']}`, reverted=`{wrt_m['eventsRevertedTotal']}`, dupSkip=`{wrt_m['eventsDuplicateSkippedTotal']}`, dlq=`{wrt_m['eventsDlqTotal']}`, PG commit `p50/p95/p99`=`{fmt_ms(wrt_m['pgCommitP50Ms'])} / {fmt_ms(wrt_m['pgCommitP95Ms'])} / {fmt_ms(wrt_m['pgCommitP99Ms'])}` |",
         f"| `sse-gateway` | totalAccepted=`{sse_m['totalConnectionsAccepted']}`, peakActiveGauge=`{sse_m['peakActiveConnectionsMetric']}`, pubsubIn=`{sse_m['pubsubEventsReceived']}`, coalesced=`{sse_m['seatUpdatesCoalesced']}`, seatBroadcast=`{sse_m['seatUpdatesBroadcast']}`, personalBroadcast=`{sse_m['personalEventsBroadcast']}`, slowDrops=`{sse_m['slowConsumerLaggedEvents']}` |",
         "",
-        "## 4. Correctness & Invariant Verification",
+        f"## {section_idx + 1}. Correctness & Invariant Verification",
         "",
         "| Invariant | Measured Value | Target | Status |",
         "| :--- | :--- | :--- | :--- |",
@@ -358,7 +435,7 @@ def main() -> int:
     if stats_to_show:
         lines.extend([
             "",
-            f"## 5. Container Resource Snapshot ({'Peak Load' if peak_stats else 'Post-Run'})",
+            f"## {section_idx + 2}. Container Resource Snapshot ({'Peak Load' if peak_stats else 'Post-Run'})",
             "",
             "| Container | CPU % | Memory Usage | Mem % |",
             "| :--- | ---: | ---: | ---: |",

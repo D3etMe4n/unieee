@@ -150,6 +150,8 @@ services:
         BIN_NAME: enrollment-engine
     container_name: unieee-rust-bench-engine
     restart: "no"
+    ports:
+      - "127.0.0.1:${BENCH_ENGINE_HOST_PORT:-18081}:8081"
     depends_on:
       pgbouncer:
         condition: service_healthy

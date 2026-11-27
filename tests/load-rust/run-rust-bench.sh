@@ -10,12 +10,14 @@ RESULTS_DIR="$SCRIPT_DIR/results"
 PROFILE="${BENCH_PROFILE:-laptop}"
 SCENARIO="all"
 SSE_CONNECTIONS_OVERRIDE=""
+OHA_CONCURRENCY_OVERRIDE=""
 RATE_LIMIT="off"
 RUNTIME_ARG=""
 KEEP_STACK=false
 NO_BUILD=false
 K6_IMAGE="${K6_IMAGE:-docker.io/grafana/k6:latest}"
 PYTHON_IMAGE="${PYTHON_IMAGE:-docker.io/library/python:3.12-alpine}"
+ENGINE_HOST_PORT="${BENCH_ENGINE_HOST_PORT:-18081}"
 
 if [ -t 1 ]; then
     _C_RED='\033[0;31m'
@@ -45,12 +47,14 @@ Isolated full-stack Rust Hot Path benchmark (NO Keycloak, NO Core-Java, NO Nginx
 
 Options:
   --profile smoke|laptop|workstation|stress   Preset load scale (default: laptop)
-  --scenario 01|02|03|04|all                  Scenario(s) to run (default: all)
-                                                01: engine-read-rps
-                                                02: engine-write-contention
+  --scenario 01|02|03|04|05|all               Scenario(s) to run (default: all)
+                                                01: engine-read-rps (k6 in-network)
+                                                02: engine-write-contention (k6 in-network)
                                                 03: sse-concurrency-fanout (asyncio SSE + k6 churn driver)
                                                 04: fullstack-mixed-peak (k6 mixed + asyncio SSE)
+                                                05: oha-host-native (host-native Rust oha CLI -> 127.0.0.1)
   --sse-connections <N>                       Override profile's concurrent SSE connections
+  --oha-concurrency <N>                       Override profile's host oha concurrency
   --rate-limit off|on                         Service rate limiting mode (default: off for raw ceiling)
   --runtime podman|docker                     Container runtime (default: auto-detect, prefers podman)
   --keep-stack                                Keep isolated containers/volumes up after completion
@@ -60,7 +64,8 @@ Options:
 Environment overrides:
   VUS, DURATION, TARGET_RPS, STUDENT_COUNT, HOT_SECTIONS, HOT_SECTION_CAP,
   NORMAL_SECTIONS, NORMAL_SECTION_CAP, CHURN_SECTIONS, CHURN_SECTION_CAP,
-  SSE_PERSONAL_RATIO, SSE_RAMP_RATE, BENCH_WRITER_PG_CONNS, BENCH_WRITER_BATCH_SIZE
+  SSE_PERSONAL_RATIO, SSE_RAMP_RATE, OHA_DURATION, BENCH_ENGINE_HOST_PORT,
+  BENCH_WRITER_PG_CONNS, BENCH_WRITER_BATCH_SIZE
 EOF
 }
 
@@ -71,11 +76,15 @@ while [ $# -gt 0 ]; do
             shift 2
             ;;
         --scenario)
-            SCENARIO="${2:?--scenario requires 01|02|03|04|all}"
+            SCENARIO="${2:?--scenario requires 01|02|03|04|05|all}"
             shift 2
             ;;
         --sse-connections)
             SSE_CONNECTIONS_OVERRIDE="${2:?--sse-connections requires a positive integer}"
+            shift 2
+            ;;
+        --oha-concurrency)
+            OHA_CONCURRENCY_OVERRIDE="${2:?--oha-concurrency requires a positive integer}"
             shift 2
             ;;
         --rate-limit)
@@ -115,9 +124,9 @@ case "$PROFILE" in
 esac
 
 case "$SCENARIO" in
-    01|02|03|04|all) ;;
+    01|02|03|04|05|all) ;;
     *)
-        log_err "Invalid --scenario '$SCENARIO'. Expected: 01 | 02 | 03 | 04 | all"
+        log_err "Invalid --scenario '$SCENARIO'. Expected: 01 | 02 | 03 | 04 | 05 | all"
         exit 1
         ;;
 esac
@@ -212,16 +221,18 @@ wait_for_service_readyz() {
 detect_runtime "$RUNTIME_ARG"
 
 case "$PROFILE" in
-    smoke)       DEFAULT_SSE_CONNS=100;  DEFAULT_RAMP_RATE=100; DEFAULT_HOLD_SEC=15 ;;
-    laptop)      DEFAULT_SSE_CONNS=500;  DEFAULT_RAMP_RATE=250; DEFAULT_HOLD_SEC=30 ;;
-    workstation) DEFAULT_SSE_CONNS=2000; DEFAULT_RAMP_RATE=500; DEFAULT_HOLD_SEC=45 ;;
-    stress)      DEFAULT_SSE_CONNS=5000; DEFAULT_RAMP_RATE=800; DEFAULT_HOLD_SEC=60 ;;
+    smoke)       DEFAULT_SSE_CONNS=100;  DEFAULT_RAMP_RATE=100; DEFAULT_HOLD_SEC=15; DEFAULT_OHA_CONNS=50;  DEFAULT_OHA_DURATION=15s ;;
+    laptop)      DEFAULT_SSE_CONNS=500;  DEFAULT_RAMP_RATE=250; DEFAULT_HOLD_SEC=30; DEFAULT_OHA_CONNS=100; DEFAULT_OHA_DURATION=20s ;;
+    workstation) DEFAULT_SSE_CONNS=2000; DEFAULT_RAMP_RATE=500; DEFAULT_HOLD_SEC=45; DEFAULT_OHA_CONNS=200; DEFAULT_OHA_DURATION=30s ;;
+    stress)      DEFAULT_SSE_CONNS=5000; DEFAULT_RAMP_RATE=800; DEFAULT_HOLD_SEC=60; DEFAULT_OHA_CONNS=400; DEFAULT_OHA_DURATION=45s ;;
 esac
 
 SSE_CONNECTIONS="${SSE_CONNECTIONS_OVERRIDE:-$DEFAULT_SSE_CONNS}"
 SSE_RAMP_RATE="${SSE_RAMP_RATE:-$DEFAULT_RAMP_RATE}"
 SSE_PERSONAL_RATIO="${SSE_PERSONAL_RATIO:-0.30}"
 SSE_HOLD_SEC="${SSE_HOLD_SEC:-$DEFAULT_HOLD_SEC}"
+OHA_CONCURRENCY="${OHA_CONCURRENCY_OVERRIDE:-$DEFAULT_OHA_CONNS}"
+OHA_DURATION="${OHA_DURATION:-$DEFAULT_OHA_DURATION}"
 
 RUN_ID="rust-bench-${PROFILE}-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$WORK_DIR" "$RESULTS_DIR"
@@ -288,6 +299,7 @@ log_info "Engine preload summary: $PRELOAD_SUMMARY"
 
 K6_FAILED=false
 SSE_FAILED=false
+OHA_FAILED=false
 
 run_k6_scenario() {
     local slug="$1"
@@ -402,6 +414,89 @@ run_sse_paired_scenario() {
     fi
 }
 
+run_oha_host_scenario() {
+    if ! command -v oha >/dev/null 2>&1; then
+        log_warn "Host CLI 'oha' not found in PATH. Install via: cargo install oha"
+        if [ "$SCENARIO" = "05" ]; then
+            log_err "Scenario 05 requested explicitly, but 'oha' is not installed."
+            OHA_FAILED=true
+        fi
+        return 0
+    fi
+
+    local oha_ver
+    oha_ver="$(oha --version | head -n 1)"
+    printf "%s\n" "$oha_ver" > "$RESULTS_DIR/${RUN_ID}-oha-version.txt"
+
+    local oha_base_url="http://127.0.0.1:${ENGINE_HOST_PORT}"
+    local oha_token
+    oha_token="$(python3 - "$WORK_DIR/bench-context.json" "$WORK_DIR/oha-read-urls.txt" "$WORK_DIR/oha-write-bodies.txt" "$oha_base_url" <<'PY'
+import json, sys
+from pathlib import Path
+
+ctx = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+read_path = Path(sys.argv[2])
+write_path = Path(sys.argv[3])
+base_url = sys.argv[4].rstrip("/")
+term_id = ctx["termId"]
+
+read_lines = [f"{base_url}/api/v1/enrollments/seats?termId={term_id}"] * 7 + [
+    f"{base_url}/api/v1/enrollments/me?termId={term_id}"
+] * 3
+read_path.write_text("\n".join(read_lines) + "\n", encoding="utf-8")
+
+section_ids = ctx["hotSectionIds"] + ctx["normalSectionIds"]
+write_lines = [json.dumps({"sectionId": sid, "action": "REGISTER"}, separators=(",", ":")) for sid in section_ids]
+write_path.write_text("\n".join(write_lines) + "\n", encoding="utf-8")
+
+# Use the last seeded student so k6 VUs (starting from index 0) do not collide
+print(ctx["students"][-1]["token"])
+PY
+)"
+
+    log_info "Running host-native oha read benchmark (05a-oha-read: $oha_ver, c=$OHA_CONCURRENCY, z=$OHA_DURATION -> $oha_base_url)..."
+    set +e
+    oha --no-tui \
+        -c "$OHA_CONCURRENCY" \
+        -z "$OHA_DURATION" \
+        -w \
+        --urls-from-file \
+        -H "Authorization: Bearer $oha_token" \
+        --output-format json \
+        -o "$RESULTS_DIR/${RUN_ID}-05a-oha-read.json" \
+        "$WORK_DIR/oha-read-urls.txt"
+    local rc_read=$?
+    set -e
+    if [ "$rc_read" -ne 0 ]; then
+        log_warn "oha read benchmark exited with status $rc_read"
+        OHA_FAILED=true
+    else
+        log_ok "Host-native oha read benchmark (05a-oha-read) completed"
+    fi
+
+    log_info "Running host-native oha write benchmark (05b-oha-write: $oha_ver, c=$OHA_CONCURRENCY, z=$OHA_DURATION -> $oha_base_url)..."
+    set +e
+    oha --no-tui \
+        -c "$OHA_CONCURRENCY" \
+        -z "$OHA_DURATION" \
+        -w \
+        -m POST \
+        -T "application/json" \
+        -Z "$WORK_DIR/oha-write-bodies.txt" \
+        -H "Authorization: Bearer $oha_token" \
+        --output-format json \
+        -o "$RESULTS_DIR/${RUN_ID}-05b-oha-write.json" \
+        "${oha_base_url}/api/v1/enrollments/register"
+    local rc_write=$?
+    set -e
+    if [ "$rc_write" -ne 0 ]; then
+        log_warn "oha write benchmark exited with status $rc_write"
+        OHA_FAILED=true
+    else
+        log_ok "Host-native oha write benchmark (05b-oha-write) completed"
+    fi
+}
+
 log_info "Stage D: Executing benchmark scenario(s)..."
 if [ "$SCENARIO" = "01" ] || [ "$SCENARIO" = "all" ]; then
     run_k6_scenario "01-engine-read-rps" "false"
@@ -414,6 +509,9 @@ if [ "$SCENARIO" = "03" ] || [ "$SCENARIO" = "all" ]; then
 fi
 if [ "$SCENARIO" = "04" ] || [ "$SCENARIO" = "all" ]; then
     run_sse_paired_scenario "04-sse" "04-fullstack-mixed-peak"
+fi
+if [ "$SCENARIO" = "05" ] || [ "$SCENARIO" = "all" ]; then
+    run_oha_host_scenario
 fi
 
 log_info "Stage E: Verifying Kafka drain, SQL invariants, and RAM-vs-PG consistency..."
@@ -441,8 +539,8 @@ python3 "$SCRIPT_DIR/collect_rust_report.py" \
 REP_RC=$?
 set -e
 
-if [ "$INV_RC" -ne 0 ] || [ "$REP_RC" -ne 0 ] || [ "$K6_FAILED" = "true" ] || [ "$SSE_FAILED" = "true" ]; then
-    log_err "Benchmark finished with failures (inv=$INV_RC report=$REP_RC k6_failed=$K6_FAILED sse_failed=$SSE_FAILED). Inspect: $RESULTS_DIR/${RUN_ID}-report.md"
+if [ "$INV_RC" -ne 0 ] || [ "$REP_RC" -ne 0 ] || [ "$K6_FAILED" = "true" ] || [ "$SSE_FAILED" = "true" ] || [ "$OHA_FAILED" = "true" ]; then
+    log_err "Benchmark finished with failures (inv=$INV_RC report=$REP_RC k6_failed=$K6_FAILED sse_failed=$SSE_FAILED oha_failed=$OHA_FAILED). Inspect: $RESULTS_DIR/${RUN_ID}-report.md"
     exit 1
 fi
 
