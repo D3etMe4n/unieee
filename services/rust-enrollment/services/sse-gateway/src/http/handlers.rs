@@ -1,10 +1,10 @@
 use crate::core::{
     AuthError, ConnectedPayload, GlobalControlEvent, OidcJwtVerifier, PersonalStreamEvent,
     PersonalSubscription, ReconnectReason, ReconnectRequestedPayload, ResyncReason,
-    ResyncRequiredPayload, SseHub, SseMetricsSnapshot, SseReadiness, TermStreamEvent,
-    TermSubscription, VerifiedClaims,
+    ResyncRequiredPayload, SseHub, SseMetricsSnapshot, SseRateLimiter, SseReadiness,
+    TermStreamEvent, TermSubscription, VerifiedClaims,
 };
-use crate::http::error::ApiError;
+use crate::http::error::{ApiError, HEADER_RATE_LIMIT_LIMIT, HEADER_RATE_LIMIT_REMAINING};
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast::error::RecvError, watch};
 use tokio::time::{sleep, Sleep};
+use unieee_cacheline::RateLimitDecision;
 use unieee_domain::{SectionId, TermId};
 use uuid::Uuid;
 
@@ -35,6 +36,7 @@ const HEADER_X_SSE_CONNECTION_ID: HeaderName = HeaderName::from_static("x-sse-co
 pub struct SseAppState {
     pub hub: Arc<SseHub>,
     pub verifier: Arc<OidcJwtVerifier>,
+    pub rate_limiter: Arc<SseRateLimiter>,
     pub shutdown_rx: watch::Receiver<bool>,
 }
 
@@ -61,6 +63,7 @@ impl FromRequestParts<SseAppState> for AuthenticatedUser {
 pub struct SseHealthResponse {
     pub status: &'static str,
     pub service: &'static str,
+    pub rate_limit_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -68,6 +71,7 @@ pub struct SseHealthResponse {
 pub struct SseReadinessResponse {
     pub ready: bool,
     pub state: &'static str,
+    pub rate_limit_enabled: bool,
     pub metrics: SseMetricsSnapshot,
 }
 
@@ -84,12 +88,13 @@ pub struct PersonalQuery {
     pub term_id: Option<String>,
 }
 
-pub async fn healthz() -> (StatusCode, Json<SseHealthResponse>) {
+pub async fn healthz(State(state): State<SseAppState>) -> (StatusCode, Json<SseHealthResponse>) {
     (
         StatusCode::OK,
         Json(SseHealthResponse {
             status: "UP",
             service: "sse-gateway",
+            rate_limit_enabled: state.rate_limiter.is_enabled(),
         }),
     )
 }
@@ -105,6 +110,7 @@ pub async fn readyz(State(state): State<SseAppState>) -> Response {
     let body = SseReadinessResponse {
         ready,
         state: readiness.as_str(),
+        rate_limit_enabled: state.rate_limiter.is_enabled(),
         metrics: state.hub.metrics_snapshot(),
     };
     (status, Json(body)).into_response()
@@ -113,18 +119,20 @@ pub async fn readyz(State(state): State<SseAppState>) -> Response {
 pub async fn sections_sse_handler(
     State(state): State<SseAppState>,
     uri: Uri,
+    headers: HeaderMap,
     AuthenticatedUser(claims): AuthenticatedUser,
     Query(query): Query<SectionsQuery>,
 ) -> Result<Response, ApiError> {
     let instance = uri.path();
     let term_id = parse_required_term_id(query.term_id.as_deref(), instance)?;
     let section_filter = parse_section_ids(query.section_ids.as_deref(), instance)?;
-    open_sections_stream(&state, &claims, term_id, section_filter, instance)
+    open_sections_stream(&state, &headers, &claims, term_id, section_filter, instance)
 }
 
 pub async fn sections_by_term_sse_handler(
     State(state): State<SseAppState>,
     uri: Uri,
+    headers: HeaderMap,
     AuthenticatedUser(claims): AuthenticatedUser,
     Path(raw_term_id): Path<String>,
     Query(query): Query<SectionsQuery>,
@@ -132,12 +140,13 @@ pub async fn sections_by_term_sse_handler(
     let instance = uri.path();
     let term_id = parse_required_term_id(Some(&raw_term_id), instance)?;
     let section_filter = parse_section_ids(query.section_ids.as_deref(), instance)?;
-    open_sections_stream(&state, &claims, term_id, section_filter, instance)
+    open_sections_stream(&state, &headers, &claims, term_id, section_filter, instance)
 }
 
 pub async fn me_sse_handler(
     State(state): State<SseAppState>,
     uri: Uri,
+    headers: HeaderMap,
     AuthenticatedUser(claims): AuthenticatedUser,
     Query(query): Query<PersonalQuery>,
 ) -> Result<Response, ApiError> {
@@ -148,6 +157,16 @@ pub async fn me_sse_handler(
     let student_id = claims
         .student_id_claim
         .ok_or_else(|| ApiError::from(AuthError::MissingStudentIdClaim).with_instance(instance))?;
+    let rl_key = SseRateLimiter::resolve_key(
+        Some(student_id),
+        &claims.sub,
+        extract_client_ip(&headers).as_deref(),
+    );
+    let decision = state.rate_limiter.check_connect(&rl_key);
+    if !decision.allowed {
+        return Err(ApiError::rate_limited("connect", decision, instance));
+    }
+
     let term_filter = parse_optional_term_id(query.term_id.as_deref(), instance)?;
 
     let sub = state
@@ -169,11 +188,17 @@ pub async fn me_sse_handler(
         initial_event,
     );
 
-    Ok(finalize_sse_response(stream, heartbeat, connection_id))
+    let resp = finalize_sse_response(stream, heartbeat, connection_id);
+    Ok(attach_rate_limit_headers(
+        resp,
+        state.rate_limiter.is_enabled(),
+        decision,
+    ))
 }
 
 fn open_sections_stream(
     state: &SseAppState,
+    headers: &HeaderMap,
     claims: &VerifiedClaims,
     term_id: TermId,
     section_filter: Option<HashSet<SectionId>>,
@@ -182,6 +207,16 @@ fn open_sections_stream(
     if !claims.has_any_role(&ALLOWED_SECTION_STREAM_ROLES) {
         return Err(ApiError::from(AuthError::Forbidden).with_instance(instance));
     }
+    let rl_key = SseRateLimiter::resolve_key(
+        claims.student_id_claim,
+        &claims.sub,
+        extract_client_ip(headers).as_deref(),
+    );
+    let decision = state.rate_limiter.check_connect(&rl_key);
+    if !decision.allowed {
+        return Err(ApiError::rate_limited("connect", decision, instance));
+    }
+
     let sub = state
         .hub
         .subscribe_sections(term_id)
@@ -202,7 +237,12 @@ fn open_sections_stream(
         initial_event,
     );
 
-    Ok(finalize_sse_response(stream, heartbeat, connection_id))
+    let resp = finalize_sse_response(stream, heartbeat, connection_id);
+    Ok(attach_rate_limit_headers(
+        resp,
+        state.rate_limiter.is_enabled(),
+        decision,
+    ))
 }
 
 fn build_handshake_metadata(
@@ -651,4 +691,40 @@ pub fn extract_bearer_token(header_val: &str) -> Option<&str> {
     } else {
         None
     }
+}
+
+fn extract_client_ip(headers: &HeaderMap) -> Option<String> {
+    if let Some(real_ip) = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(real_ip.to_owned());
+    }
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| raw.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn attach_rate_limit_headers(
+    mut resp: Response,
+    enabled: bool,
+    decision: RateLimitDecision,
+) -> Response {
+    if !enabled {
+        return resp;
+    }
+    let headers = resp.headers_mut();
+    if let Ok(limit_val) = HeaderValue::from_str(&decision.limit.to_string()) {
+        headers.insert(HEADER_RATE_LIMIT_LIMIT, limit_val);
+    }
+    if let Ok(rem_val) = HeaderValue::from_str(&decision.remaining.to_string()) {
+        headers.insert(HEADER_RATE_LIMIT_REMAINING, rem_val);
+    }
+    resp
 }

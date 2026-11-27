@@ -15,7 +15,8 @@ use sse_gateway::adapters::redis_io::{
 };
 use sse_gateway::config::{ConfigError, SseConfig};
 use sse_gateway::core::{
-    AuthError, JwksFetcher, OidcJwtVerifier, OidcVerifierConfig, SseHub, SseHubConfig, SseReadiness,
+    spawn_rate_limit_sweeper, AuthError, JwksFetcher, OidcJwtVerifier, OidcVerifierConfig, SseHub,
+    SseHubConfig, SseRateLimitConfig, SseRateLimiter, SseReadiness,
 };
 use sse_gateway::http::build_router;
 use sse_gateway::http::handlers::SseAppState;
@@ -396,6 +397,7 @@ async fn http_rfc9457_contract_covers_all_validation_auth_readiness_and_routing_
     let app = build_router(SseAppState {
         hub: Arc::clone(&hub),
         verifier: Arc::clone(&verifier),
+        rate_limiter: Arc::new(SseRateLimiter::default()),
         shutdown_rx: sd_rx,
     });
 
@@ -940,6 +942,7 @@ async fn redis_pubsub_subscriber_real_redis_end_to_end() {
     let app = build_router(SseAppState {
         hub: Arc::clone(&hub),
         verifier,
+        rate_limiter: Arc::new(SseRateLimiter::default()),
         shutdown_rx: sd_tx.subscribe(),
     });
     let tok = keypair.sign_jwt(
@@ -1090,4 +1093,244 @@ fn parse_resp_arrays(buf: &mut Vec<u8>) -> Vec<Vec<String>> {
         commands.push(items);
     }
     commands
+}
+
+#[tokio::test]
+async fn sse_rate_limiter_throttles_rapid_reconnects_isolates_students_and_supports_disable() {
+    let now = Utc::now();
+    let term_id = TermId::new_v4();
+    let s1 = StudentId::new_v4();
+    let s2 = StudentId::new_v4();
+
+    let keypair = RsaTestKeypair::generate("sse-rl-k1");
+    let verifier = make_test_verifier(&keypair);
+    let hub = SseHub::new_direct(SseHubConfig::default());
+    hub.set_readiness(SseReadiness::Ready);
+
+    let limiter = Arc::new(SseRateLimiter::new(SseRateLimitConfig {
+        enabled: true,
+        connect_capacity: 2,
+        connect_refill_milli_per_sec: 100,
+        idle_ttl: Duration::from_secs(600),
+        max_entries: 1024,
+    }));
+    let (_sd_tx, sd_rx) = watch::channel(false);
+    let app = build_router(SseAppState {
+        hub: Arc::clone(&hub),
+        verifier: Arc::clone(&verifier),
+        rate_limiter: Arc::clone(&limiter),
+        shutdown_rx: sd_rx,
+    });
+
+    let tok_s1 = keypair.sign_jwt(
+        "sub-sse-1",
+        "https://idp.test",
+        "unieee-web",
+        now.timestamp() + 300,
+        &["STUDENT"],
+        Some(s1),
+    );
+    let tok_s2 = keypair.sign_jwt(
+        "sub-sse-2",
+        "https://idp.test",
+        "unieee-web",
+        now.timestamp() + 300,
+        &["STUDENT"],
+        Some(s2),
+    );
+
+    // Exhaust 2 connection handshakes for Student 1 on shared IP
+    let resp1 = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/sse/sections/{term_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .header("x-real-ip", "203.0.113.88")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    assert_eq!(
+        resp1
+            .headers()
+            .get("x-ratelimit-limit")
+            .and_then(|v| v.to_str().ok()),
+        Some("2")
+    );
+    assert_eq!(
+        resp1
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok()),
+        Some("1")
+    );
+    drop(resp1);
+
+    let resp2 = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/sse/me?termId={term_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .header("x-real-ip", "203.0.113.88")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    assert_eq!(
+        resp2
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok()),
+        Some("0")
+    );
+    drop(resp2);
+
+    // 3rd handshake for Student 1 -> 429 RATE_LIMIT_EXCEEDED RFC 9457
+    let resp3 = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/sse/sections?termId={term_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .header("x-real-ip", "203.0.113.88")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(resp3.headers().contains_key(header::RETRY_AFTER));
+    assert_eq!(
+        resp3
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok()),
+        Some("0")
+    );
+    assert_problem_detail(
+        resp3,
+        StatusCode::TOO_MANY_REQUESTS,
+        "RATE_LIMIT_EXCEEDED",
+        "/api/v1/sse/sections",
+    )
+    .await;
+
+    // Student 2 on the same IP connects cleanly
+    let resp_s2 = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/sse/sections/{term_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s2}"))
+                .header("x-real-ip", "203.0.113.88")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_s2.status(), StatusCode::OK);
+    drop(resp_s2);
+
+    // Health, readiness, and metrics expose rate-limit status & counters
+    let hz: serde_json::Value = serde_json::from_slice(
+        &app.clone()
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    assert_eq!(hz["rateLimitEnabled"], true);
+
+    let m_body = String::from_utf8(
+        app.clone()
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(m_body.contains("unieee_sse_rate_limit_enabled"));
+    assert!(m_body.contains("unieee_sse_rate_limit_active_buckets"));
+    assert!(m_body.contains("unieee_sse_rate_limit_total"));
+
+    // Disabled mode allows unlimited handshakes and sets rateLimitEnabled=false
+    let (_sd_tx2, sd_rx2) = watch::channel(false);
+    let disabled_app = build_router(SseAppState {
+        hub: Arc::clone(&hub),
+        verifier,
+        rate_limiter: Arc::new(SseRateLimiter::new(SseRateLimitConfig::disabled())),
+        shutdown_rx: sd_rx2,
+    });
+    for _ in 0..4 {
+        let ok = disabled_app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/sse/sections/{term_id}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert!(!ok.headers().contains_key("x-ratelimit-limit"));
+    }
+    let disabled_rz: serde_json::Value = serde_json::from_slice(
+        &disabled_app
+            .clone()
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    assert_eq!(disabled_rz["rateLimitEnabled"], false);
+
+    // Config parsing & sweeper coverage
+    let mut env = HashMap::new();
+    env.insert("OIDC_JWKS_URI", "http://keycloak:8080/certs".to_owned());
+    env.insert("RATE_LIMIT_ENABLED", "false".to_owned());
+    env.insert("RATE_LIMIT_CONNECT_CAPACITY", "15".to_owned());
+    env.insert("RATE_LIMIT_CONNECT_REFILL_PER_SEC", "4.5".to_owned());
+    env.insert("RATE_LIMIT_IDLE_TTL_SECS", "300".to_owned());
+    env.insert("RATE_LIMIT_MAX_ENTRIES", "2048".to_owned());
+    env.insert("RATE_LIMIT_SWEEP_INTERVAL_SECS", "10".to_owned());
+    let cfg = SseConfig::from_lookup(|k| env.get(k).cloned()).unwrap();
+    assert!(!cfg.rate_limit_enabled);
+    assert_eq!(cfg.rate_limit_connect_capacity, 15);
+    assert_eq!(cfg.rate_limit_connect_refill_milli_per_sec, 4500);
+    assert!(!cfg.to_rate_limit_config().enabled);
+
+    for bad in [
+        ("RATE_LIMIT_ENABLED", "nope"),
+        ("RATE_LIMIT_CONNECT_CAPACITY", "0"),
+        ("RATE_LIMIT_CONNECT_REFILL_PER_SEC", "-1"),
+    ] {
+        let mut bad_env = env.clone();
+        bad_env.insert(bad.0, bad.1.to_owned());
+        assert!(matches!(
+            SseConfig::from_lookup(|k| bad_env.get(k).cloned()),
+            Err(ConfigError::InvalidValue { .. })
+        ));
+    }
+
+    let (sw_tx, sw_rx) = watch::channel(false);
+    let sw_handle = spawn_rate_limit_sweeper(limiter, Duration::from_secs(1), sw_rx);
+    let _ = sw_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_millis(200), sw_handle).await;
 }

@@ -15,15 +15,16 @@ use enrollment_engine::adapters::redis_io::{
 };
 use enrollment_engine::config::EngineConfig;
 use enrollment_engine::core::{
-    spawn_coalescer, spawn_state_sweeper, EnrollmentEngine, EventStatusCacheReader,
-    EventStatusFallbackStore, OidcJwtVerifier, SnapshotStore,
+    spawn_coalescer, spawn_rate_limit_sweeper, spawn_state_sweeper, EngineRateLimiter,
+    EnrollmentEngine, EventStatusCacheReader, EventStatusFallbackStore, OidcJwtVerifier,
+    SnapshotStore,
 };
 use enrollment_engine::http::build_router;
 use enrollment_engine::http::handlers::AppState;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -37,6 +38,11 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = EngineConfig::from_env().context("failed to load EngineConfig")?;
     let _ = enrollment_engine::metrics::init_prometheus_recorder();
+    let rate_limiter = Arc::new(EngineRateLimiter::new(cfg.to_rate_limit_config()));
+    if !cfg.rate_limit_enabled {
+        warn!("SECURITY WARNING: enrollment-engine rate limiting is DISABLED (RATE_LIMIT_ENABLED=false). Use only for isolated benchmark runs.");
+    }
+    enrollment_engine::metrics::refresh_rate_limit_gauges(&rate_limiter);
     let redis_backend = connect_redis_backend(&cfg).map_err(anyhow::Error::msg)?;
     let pg_adapter = PgPreloadAndReplayAdapter::connect(&cfg.database_url, 16)
         .await
@@ -82,6 +88,11 @@ async fn main() -> anyhow::Result<()> {
     let sweeper_handle = spawn_state_sweeper(
         Arc::clone(&engine),
         Duration::from_secs(cfg.event_index_sweep_interval_secs),
+        shutdown_rx.clone(),
+    );
+    let rate_limit_sweeper_handle = spawn_rate_limit_sweeper(
+        Arc::clone(&rate_limiter),
+        Duration::from_secs(cfg.rate_limit_sweep_interval_secs),
         shutdown_rx.clone(),
     );
 
@@ -134,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
     let router = build_router(AppState {
         engine,
         verifier,
+        rate_limiter,
         internal_ops_token: cfg.internal_ops_token.clone(),
     });
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr)
@@ -152,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = shutdown_tx.send(true);
     let _ = supervisor_handle.await;
     let _ = sweeper_handle.await;
+    let _ = rate_limit_sweeper_handle.await;
     drop(coalescer_handle);
     drop(jwks_handle);
     Ok(())

@@ -7,13 +7,13 @@ use anyhow::Context;
 use sse_gateway::adapters::jwks_http::ReqwestJwksFetcher;
 use sse_gateway::adapters::redis_io::{connect_redis_backend, spawn_pubsub_subscriber};
 use sse_gateway::config::SseConfig;
-use sse_gateway::core::{OidcJwtVerifier, SseHub};
+use sse_gateway::core::{spawn_rate_limit_sweeper, OidcJwtVerifier, SseHub, SseRateLimiter};
 use sse_gateway::http::build_router;
 use sse_gateway::http::handlers::SseAppState;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,6 +27,11 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = SseConfig::from_env().context("failed to load SseConfig")?;
     let _ = sse_gateway::metrics::init_prometheus_recorder();
+    let rate_limiter = Arc::new(SseRateLimiter::new(cfg.to_rate_limit_config()));
+    if !cfg.rate_limit_enabled {
+        warn!("SECURITY WARNING: sse-gateway rate limiting is DISABLED (RATE_LIMIT_ENABLED=false). Use only for isolated benchmark runs.");
+    }
+    sse_gateway::metrics::refresh_rate_limit_gauges(&rate_limiter);
     let redis_backend = connect_redis_backend(&cfg).map_err(anyhow::Error::msg)?;
     let jwks_fetcher = Arc::new(
         ReqwestJwksFetcher::new(cfg.oidc_jwks_uri.clone(), Duration::from_secs(5))
@@ -47,10 +52,16 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_millis(cfg.redis_reconnect_backoff_ms),
         shutdown_rx.clone(),
     );
+    let rate_limit_sweeper_handle = spawn_rate_limit_sweeper(
+        Arc::clone(&rate_limiter),
+        Duration::from_secs(cfg.rate_limit_sweep_interval_secs),
+        shutdown_rx.clone(),
+    );
 
     let router = build_router(SseAppState {
         hub: Arc::clone(&hub),
         verifier,
+        rate_limiter,
         shutdown_rx,
     });
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr)
@@ -69,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(handle) = coalescer_handle {
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
     }
+    let _ = tokio::time::timeout(Duration::from_secs(2), rate_limit_sweeper_handle).await;
     drop(jwks_handle);
     Ok(())
 }

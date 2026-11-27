@@ -66,9 +66,7 @@ where
 
     #[must_use]
     pub fn shard_index(&self, key: &K) -> usize {
-        let mut hasher = FnvHasher::default();
-        key.hash(&mut hasher);
-        (hasher.finish() as usize) & self.shard_mask
+        fnv_shard_index(key, self.shard_mask)
     }
 
     pub fn insert(&self, key: K, value: V) -> Option<V> {
@@ -179,6 +177,12 @@ where
         }
         evicted
     }
+}
+
+pub(crate) fn fnv_shard_index<K: Hash>(key: &K, shard_mask: usize) -> usize {
+    let mut hasher = FnvHasher::default();
+    key.hash(&mut hasher);
+    (hasher.finish() as usize) & shard_mask
 }
 
 struct FnvHasher(u64);

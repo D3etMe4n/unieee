@@ -1,4 +1,4 @@
-use crate::core::{EngineReadiness, EnrollmentEngine};
+use crate::core::{EngineRateLimiter, EngineReadiness, EnrollmentEngine};
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
@@ -88,10 +88,21 @@ pub fn refresh_engine_gauges(engine: &EnrollmentEngine) {
     metrics::gauge!("unieee_engine_in_flight_requests").set(engine.in_flight_count() as f64);
 }
 
+pub fn refresh_rate_limit_gauges(limiter: &EngineRateLimiter) {
+    metrics::gauge!("unieee_engine_rate_limit_enabled").set(if limiter.is_enabled() {
+        1.0
+    } else {
+        0.0
+    });
+    metrics::gauge!("unieee_engine_rate_limit_active_buckets")
+        .set(limiter.active_bucket_count() as f64);
+}
+
 pub async fn metrics_handler(State(state): State<crate::http::handlers::AppState>) -> Response {
     match init_prometheus_recorder() {
         Ok(handle) => {
             refresh_engine_gauges(&state.engine);
+            refresh_rate_limit_gauges(&state.rate_limiter);
             let mut headers = HeaderMap::new();
             headers.insert(
                 header::CONTENT_TYPE,

@@ -22,8 +22,9 @@ use enrollment_engine::adapters::redis_io::{
 };
 use enrollment_engine::config::{ConfigError, EngineConfig};
 use enrollment_engine::core::{
-    CommandPublisher, EngineReadiness, EnrollmentEngine, NodeRole, OidcJwtVerifier,
-    OidcVerifierConfig, RevertDedupStore, SeatTentativeCoalescerHandle, TentativeSeatSink,
+    spawn_rate_limit_sweeper, CommandPublisher, EngineRateLimitConfig, EngineRateLimiter,
+    EngineReadiness, EnrollmentEngine, NodeRole, OidcJwtVerifier, OidcVerifierConfig,
+    RevertDedupStore, SeatTentativeCoalescerHandle, TentativeSeatSink,
 };
 use enrollment_engine::http::build_router;
 use enrollment_engine::http::dto::{
@@ -117,6 +118,7 @@ async fn http_api_covers_register_drop_status_idor_healthz_readyz_and_promote() 
     let app = build_router(AppState {
         engine: Arc::clone(&engine),
         verifier: Arc::clone(&verifier),
+        rate_limiter: Arc::new(EngineRateLimiter::default()),
         internal_ops_token: Some("ops-secret".to_owned()),
     });
 
@@ -1855,6 +1857,7 @@ async fn http_hardening_covers_backpressure_503_idempotency_key_and_3tier_status
     let app = build_router(AppState {
         engine: Arc::clone(&engine),
         verifier: Arc::clone(&verifier),
+        rate_limiter: Arc::new(EngineRateLimiter::default()),
         internal_ops_token: None,
     });
     let tok_s1 = keypair.sign_jwt(
@@ -2310,11 +2313,13 @@ async fn http_api_hotpath_read_endpoints_seats_and_me_enforce_rbac_idor_and_stan
     let active_app = build_router(AppState {
         engine: Arc::clone(&active_engine),
         verifier: Arc::clone(&verifier),
+        rate_limiter: Arc::new(EngineRateLimiter::default()),
         internal_ops_token: None,
     });
     let standby_app = build_router(AppState {
         engine: Arc::clone(&standby_engine),
         verifier: Arc::clone(&verifier),
+        rate_limiter: Arc::new(EngineRateLimiter::default()),
         internal_ops_token: None,
     });
 
@@ -2534,4 +2539,321 @@ async fn http_api_hotpath_read_endpoints_seats_and_me_enforce_rbac_idor_and_stan
         "/api/v1/enrollments/seats",
     )
     .await;
+}
+
+#[tokio::test]
+async fn rate_limiter_isolates_students_on_shared_ip_enforces_429_and_supports_disable_flag() {
+    let now = Utc::now();
+    let term_id = TermId::new_v4();
+    let c1 = CourseId::new_v4();
+    let c2 = CourseId::new_v4();
+    let s1_id = StudentId::new_v4();
+    let s2_id = StudentId::new_v4();
+
+    let sec1 = make_section(term_id, 901, c1, "CS901", 3, 10, 0, 1, 1, 2);
+    let sec2 = make_section(term_id, 902, c2, "CS902", 3, 10, 0, 2, 1, 2);
+    let dataset = make_dataset(
+        term_id,
+        vec![sec1, sec2],
+        Vec::new(),
+        vec![
+            make_student(s1_id, "SV901", Some("sub-rl1"), "K24", "CSE"),
+            make_student(s2_id, "SV902", Some("sub-rl2"), "K24", "CSE"),
+        ],
+        now,
+    );
+
+    let keypair = RsaTestKeypair::generate("rl-k1");
+    let verifier = Arc::new(OidcJwtVerifier::new(
+        Arc::new(MockJwksFetcher::with_ok(
+            serde_json::json!({ "keys": [keypair.jwk_json] }).to_string(),
+        )),
+        OidcVerifierConfig {
+            issuers: vec!["https://idp.test".to_owned()],
+            audience: Some("unieee-web".to_owned()),
+            cache_ttl_secs: 30,
+            max_cached_tokens_per_shard: 64,
+        },
+    ));
+    let (engine, _, _) = common::make_ready_engine(dataset, NodeRole::Active);
+
+    // 1. Enabled mode: write capacity = 2, read capacity = 2
+    let rl_cfg = EngineRateLimitConfig {
+        enabled: true,
+        write_capacity: 2,
+        write_refill_milli_per_sec: 100,
+        read_capacity: 2,
+        read_refill_milli_per_sec: 100,
+        idle_ttl: std::time::Duration::from_secs(600),
+        max_entries: 1024,
+    };
+    let limiter = Arc::new(EngineRateLimiter::new(rl_cfg));
+    let app = build_router(AppState {
+        engine: Arc::clone(&engine),
+        verifier: Arc::clone(&verifier),
+        rate_limiter: Arc::clone(&limiter),
+        internal_ops_token: None,
+    });
+
+    let exp = now.timestamp() + 300;
+    let tok_s1 = keypair.sign_jwt(
+        "sub-rl1",
+        "https://idp.test",
+        "unieee-web",
+        exp,
+        &["STUDENT"],
+        Some(s1_id),
+    );
+    let tok_s2 = keypair.sign_jwt(
+        "sub-rl2",
+        "https://idp.test",
+        "unieee-web",
+        exp,
+        &["STUDENT"],
+        Some(s2_id),
+    );
+
+    // Exhaust write bucket for Student 1 while simulating shared campus NAT IP
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/enrollments/register")
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-real-ip", "203.0.113.10")
+                .body(Body::from(r#"{"sectionId":901}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        r1.headers()
+            .get("x-ratelimit-limit")
+            .and_then(|v| v.to_str().ok()),
+        Some("2")
+    );
+    assert_eq!(
+        r1.headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok()),
+        Some("1")
+    );
+
+    let r2 = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/enrollments/drop")
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-real-ip", "203.0.113.10")
+                .body(Body::from(r#"{"sectionId":901}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        r2.headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok()),
+        Some("0")
+    );
+
+    // 3rd write for Student 1 -> 429 RATE_LIMIT_EXCEEDED + Retry-After + X-RateLimit-*
+    let r3 = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/enrollments/register")
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-real-ip", "203.0.113.10")
+                .body(Body::from(r#"{"sectionId":902}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(r3.headers().contains_key(header::RETRY_AFTER));
+    assert_eq!(
+        r3.headers()
+            .get("x-ratelimit-limit")
+            .and_then(|v| v.to_str().ok()),
+        Some("2")
+    );
+    assert_eq!(
+        r3.headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok()),
+        Some("0")
+    );
+    assert_problem_detail(
+        r3,
+        StatusCode::TOO_MANY_REQUESTS,
+        "RATE_LIMIT_EXCEEDED",
+        "/api/v1/enrollments/register",
+    )
+    .await;
+
+    // Student 2 on the SAME campus IP is unaffected and still succeeds
+    let r_s2 = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/enrollments/register")
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s2}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-real-ip", "203.0.113.10")
+                .body(Body::from(r#"{"sectionId":901}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_s2.status(), StatusCode::ACCEPTED);
+
+    // Read bucket for Student 1 is independent of exhausted write bucket
+    for _ in 0..2 {
+        let ok_read = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/enrollments/seats?termId={term_id}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                    .header("x-forwarded-for", "198.51.100.7, 10.0.0.1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok_read.status(), StatusCode::OK);
+    }
+    let blocked_read = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/enrollments/me?termId={term_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_problem_detail(
+        blocked_read,
+        StatusCode::TOO_MANY_REQUESTS,
+        "RATE_LIMIT_EXCEEDED",
+        "/api/v1/enrollments/me",
+    )
+    .await;
+
+    // /healthz, /readyz, and /metrics expose rate limit status & counters
+    let hz_body: serde_json::Value = serde_json::from_slice(
+        &app.clone()
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    assert_eq!(hz_body["rateLimitEnabled"], true);
+
+    let metrics_body = String::from_utf8(
+        app.clone()
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(metrics_body.contains("unieee_engine_rate_limit_enabled"));
+    assert!(metrics_body.contains("unieee_engine_rate_limit_active_buckets"));
+    assert!(metrics_body.contains("unieee_engine_rate_limit_total"));
+
+    // 2. Disabled mode (benchmark overlay) allows unlimited requests and reports rateLimitEnabled=false
+    let disabled_app = build_router(AppState {
+        engine: Arc::clone(&engine),
+        verifier: Arc::clone(&verifier),
+        rate_limiter: Arc::new(EngineRateLimiter::new(EngineRateLimitConfig::disabled())),
+        internal_ops_token: None,
+    });
+    for i in 0..4 {
+        let path = if i % 2 == 0 {
+            "/api/v1/enrollments/register"
+        } else {
+            "/api/v1/enrollments/drop"
+        };
+        let ok = disabled_app
+            .clone()
+            .oneshot(
+                Request::post(path)
+                    .header(header::AUTHORIZATION, format!("Bearer {tok_s1}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("Idempotency-Key", format!("disabled-{i}"))
+                    .body(Body::from(r#"{"sectionId":902}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::ACCEPTED);
+        assert!(!ok.headers().contains_key("x-ratelimit-limit"));
+    }
+    let disabled_rz: serde_json::Value = serde_json::from_slice(
+        &disabled_app
+            .clone()
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    assert_eq!(disabled_rz["rateLimitEnabled"], false);
+
+    // 3. Config parsing & background sweeper shutdown
+    let mut cfg_env = HashMap::new();
+    cfg_env.insert(
+        "DATABASE_URL",
+        "postgres://u:p@pgbouncer:6432/unieee".to_owned(),
+    );
+    cfg_env.insert("OIDC_JWKS_URI", "http://keycloak:8080/certs".to_owned());
+    cfg_env.insert("RATE_LIMIT_ENABLED", "false".to_owned());
+    cfg_env.insert("RATE_LIMIT_WRITE_CAPACITY", "20".to_owned());
+    cfg_env.insert("RATE_LIMIT_WRITE_REFILL_PER_SEC", "5.5".to_owned());
+    cfg_env.insert("RATE_LIMIT_READ_CAPACITY", "80".to_owned());
+    cfg_env.insert("RATE_LIMIT_READ_REFILL_PER_SEC", "25.0".to_owned());
+    cfg_env.insert("RATE_LIMIT_IDLE_TTL_SECS", "120".to_owned());
+    cfg_env.insert("RATE_LIMIT_MAX_ENTRIES", "4096".to_owned());
+    cfg_env.insert("RATE_LIMIT_SWEEP_INTERVAL_SECS", "15".to_owned());
+    let parsed_cfg = EngineConfig::from_lookup(|k| cfg_env.get(k).cloned()).unwrap();
+    assert!(!parsed_cfg.rate_limit_enabled);
+    assert_eq!(parsed_cfg.rate_limit_write_capacity, 20);
+    assert_eq!(parsed_cfg.rate_limit_write_refill_milli_per_sec, 5500);
+    assert!(!parsed_cfg.to_rate_limit_config().enabled);
+
+    for bad in [
+        ("RATE_LIMIT_ENABLED", "maybe"),
+        ("RATE_LIMIT_WRITE_CAPACITY", "0"),
+        ("RATE_LIMIT_WRITE_REFILL_PER_SEC", "0"),
+        ("RATE_LIMIT_MAX_ENTRIES", "10"),
+    ] {
+        let mut bad_env = cfg_env.clone();
+        bad_env.insert(bad.0, bad.1.to_owned());
+        assert!(matches!(
+            EngineConfig::from_lookup(|k| bad_env.get(k).cloned()),
+            Err(ConfigError::InvalidValue { .. })
+        ));
+    }
+
+    let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
+    let sw_handle = spawn_rate_limit_sweeper(limiter, std::time::Duration::from_secs(1), sd_rx);
+    let _ = sd_tx.send(true);
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(200), sw_handle).await;
 }

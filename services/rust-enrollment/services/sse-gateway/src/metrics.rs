@@ -1,4 +1,4 @@
-use crate::core::{SseHub, SseReadiness};
+use crate::core::{SseHub, SseRateLimiter, SseReadiness};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -40,10 +40,21 @@ pub fn refresh_sse_gauges(hub: &SseHub) {
         .set(hub.active_student_channel_count() as f64);
 }
 
+pub fn refresh_rate_limit_gauges(limiter: &SseRateLimiter) {
+    metrics::gauge!("unieee_sse_rate_limit_enabled").set(if limiter.is_enabled() {
+        1.0
+    } else {
+        0.0
+    });
+    metrics::gauge!("unieee_sse_rate_limit_active_buckets")
+        .set(limiter.active_bucket_count() as f64);
+}
+
 pub async fn metrics_handler(State(state): State<crate::http::handlers::SseAppState>) -> Response {
     match init_prometheus_recorder() {
         Ok(handle) => {
             refresh_sse_gauges(&state.hub);
+            refresh_rate_limit_gauges(&state.rate_limiter);
             let mut headers = HeaderMap::new();
             headers.insert(
                 header::CONTENT_TYPE,

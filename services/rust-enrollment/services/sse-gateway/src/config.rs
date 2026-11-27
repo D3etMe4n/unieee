@@ -1,4 +1,4 @@
-use crate::core::{JitterPolicy, OidcVerifierConfig, SseHubConfig};
+use crate::core::{JitterPolicy, OidcVerifierConfig, SseHubConfig, SseRateLimitConfig};
 use std::net::SocketAddr;
 use std::time::Duration;
 use thiserror::Error;
@@ -34,6 +34,12 @@ pub struct SseConfig {
     pub control_channel_capacity: usize,
     pub max_connections: usize,
     pub redis_reconnect_backoff_ms: u64,
+    pub rate_limit_enabled: bool,
+    pub rate_limit_connect_capacity: u32,
+    pub rate_limit_connect_refill_milli_per_sec: u64,
+    pub rate_limit_idle_ttl_secs: u64,
+    pub rate_limit_max_entries: usize,
+    pub rate_limit_sweep_interval_secs: u64,
 }
 
 impl SseConfig {
@@ -191,6 +197,39 @@ impl SseConfig {
             50,
             60_000,
         )?;
+        let rate_limit_enabled =
+            parse_bool_or(non_empty("RATE_LIMIT_ENABLED"), "RATE_LIMIT_ENABLED", true)?;
+        let rate_limit_connect_capacity = parse_u32_min(
+            non_empty("RATE_LIMIT_CONNECT_CAPACITY"),
+            "RATE_LIMIT_CONNECT_CAPACITY",
+            10,
+            1,
+        )?;
+        let rate_limit_connect_refill_milli_per_sec = parse_rate_milli_or(
+            non_empty("RATE_LIMIT_CONNECT_REFILL_PER_SEC"),
+            "RATE_LIMIT_CONNECT_REFILL_PER_SEC",
+            2_000,
+        )?;
+        let rate_limit_idle_ttl_secs = parse_u64_range(
+            non_empty("RATE_LIMIT_IDLE_TTL_SECS"),
+            "RATE_LIMIT_IDLE_TTL_SECS",
+            600,
+            1,
+            86_400,
+        )?;
+        let rate_limit_max_entries = parse_usize_min(
+            non_empty("RATE_LIMIT_MAX_ENTRIES"),
+            "RATE_LIMIT_MAX_ENTRIES",
+            65_536,
+            256,
+        )?;
+        let rate_limit_sweep_interval_secs = parse_u64_range(
+            non_empty("RATE_LIMIT_SWEEP_INTERVAL_SECS"),
+            "RATE_LIMIT_SWEEP_INTERVAL_SECS",
+            60,
+            1,
+            86_400,
+        )?;
 
         Ok(Self {
             bind_addr,
@@ -214,6 +253,12 @@ impl SseConfig {
             control_channel_capacity,
             max_connections,
             redis_reconnect_backoff_ms,
+            rate_limit_enabled,
+            rate_limit_connect_capacity,
+            rate_limit_connect_refill_milli_per_sec,
+            rate_limit_idle_ttl_secs,
+            rate_limit_max_entries,
+            rate_limit_sweep_interval_secs,
         })
     }
 
@@ -243,6 +288,17 @@ impl SseConfig {
             student_channel_capacity: self.student_channel_capacity,
             control_channel_capacity: self.control_channel_capacity,
             max_connections: self.max_connections,
+        }
+    }
+
+    #[must_use]
+    pub fn to_rate_limit_config(&self) -> SseRateLimitConfig {
+        SseRateLimitConfig {
+            enabled: self.rate_limit_enabled,
+            connect_capacity: self.rate_limit_connect_capacity,
+            connect_refill_milli_per_sec: self.rate_limit_connect_refill_milli_per_sec,
+            idle_ttl: Duration::from_secs(self.rate_limit_idle_ttl_secs),
+            max_entries: self.rate_limit_max_entries,
         }
     }
 }
@@ -290,4 +346,74 @@ fn parse_usize_min(
         });
     }
     Ok(val)
+}
+
+fn parse_bool_or(
+    raw: Option<String>,
+    key: &'static str,
+    default: bool,
+) -> Result<bool, ConfigError> {
+    match raw {
+        None => Ok(default),
+        Some(v) => match v.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Ok(true),
+            "false" | "0" | "no" => Ok(false),
+            _ => Err(ConfigError::InvalidValue {
+                key,
+                reason: format!("expected boolean, got {v}"),
+            }),
+        },
+    }
+}
+
+fn parse_u32_min(
+    raw: Option<String>,
+    key: &'static str,
+    default: u32,
+    min: u32,
+) -> Result<u32, ConfigError> {
+    let val = match raw {
+        None => default,
+        Some(v) => v.parse::<u32>().map_err(|e| ConfigError::InvalidValue {
+            key,
+            reason: e.to_string(),
+        })?,
+    };
+    if val < min {
+        return Err(ConfigError::InvalidValue {
+            key,
+            reason: format!("must be >= {min}"),
+        });
+    }
+    Ok(val)
+}
+
+fn parse_rate_milli_or(
+    raw: Option<String>,
+    key: &'static str,
+    default_milli: u64,
+) -> Result<u64, ConfigError> {
+    match raw {
+        None => Ok(default_milli),
+        Some(v) => {
+            let parsed = v.parse::<f64>().map_err(|e| ConfigError::InvalidValue {
+                key,
+                reason: e.to_string(),
+            })?;
+            if !parsed.is_finite() || parsed <= 0.0 {
+                return Err(ConfigError::InvalidValue {
+                    key,
+                    reason: "must be finite and > 0".to_owned(),
+                });
+            }
+            let scaled = (parsed * 1000.0).round();
+            if !scaled.is_finite() || scaled > (u64::MAX as f64) {
+                return Err(ConfigError::InvalidValue {
+                    key,
+                    reason: "refill rate overflow".to_owned(),
+                });
+            }
+            Ok((scaled as u64).max(1))
+        }
+    }
 }

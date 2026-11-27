@@ -2,6 +2,7 @@ pub mod auth;
 pub mod coalescer;
 pub mod models;
 pub mod ports;
+pub mod rate_limit;
 pub mod rules;
 pub mod snapshot;
 pub mod state_machine;
@@ -20,5 +21,6 @@ pub use ports::{
     JwksFetcher, KafkaPartitionOffset, KafkaReplayBatch, KafkaReplaySource, PreloadSource,
     PublishError, RevertDedupStore, TentativeSeatSink,
 };
+pub use rate_limit::{spawn_rate_limit_sweeper, EngineRateLimitConfig, EngineRateLimiter};
 pub use snapshot::{DiskSnapshotMeta, LoadedDiskSnapshot, SnapshotError, SnapshotStore};
 pub use state_machine::{spawn_state_sweeper, EnrollmentEngine};
