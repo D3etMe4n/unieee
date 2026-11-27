@@ -2,241 +2,136 @@
 
 **Language:** **English** | [Tiếng Việt](./README.vi.md)
 
-**unieee** is a university academic management and course credit registration system engineered for extreme flash-crowd traffic during registration windows, built on a **Hybrid CQRS + Event Sourcing & Modular Monolith** architecture.
+**unieee** is a university academic management and course registration platform engineered for flash-crowd traffic using a **Hybrid CQRS + Event Sourcing & Modular Monolith** architecture. See the [Public Documentation Hub](./guides/README.md) for full guides.
 
 > [!WARNING]
-> **Project Scope Disclaimer:**
-> This is a **personal project** built for architectural research, design, and experimentation with high-throughput distributed systems. It has **not undergone a security audit or comprehensive production validation**, and **is not recommended for direct production deployment**.
+> **Project Scope:** Personal architectural research and experimentation project; not security-audited or validated for direct production deployment.
 
 > [!CAUTION]
-> **Security Notice — Rotate All Default Secrets Before Deployment:**
-> Because this repository is hosted publicly on GitHub, all default passwords, tokens, dev certificates, and sample accounts included in the codebase are strictly for local development. Before deploying to any non-local environment, **you must rotate and replace all secrets and default credentials** in the following files:
-> - [.env.example](./.env.example): Copy to `.env` (gitignored) and replace `POSTGRES_PASSWORD`, `REDIS_PASSWORD`, `KEYCLOAK_ADMIN_PASSWORD`, `KEYCLOAK_ADMIN_CLIENT_SECRET`, `INTERNAL_OPS_TOKEN`, `UNIEEE_OPS_ADMIN_PASSWORD`, `GRAFANA_ADMIN_PASSWORD`, `CLOUDFLARE_TUNNEL_TOKEN`, and `OPENAI_API_KEY` (if enabling external LLM mode for `ai_advisor`).
-> - [infra/compose.base.yml](./infra/compose.base.yml) & [infra/compose.monitoring.yml](./infra/compose.monitoring.yml): Contain development fallback defaults when environment variables are unset.
-> - [infra/compose.letsencrypt.yml](./infra/compose.letsencrypt.yml) & [infra/compose.cloudflared.yml](./infra/compose.cloudflared.yml): Let's Encrypt ACME and Cloudflare Tunnel (`TUNNEL_TOKEN`) configurations.
-> - [infra/keycloak/realm-unieee.json](./infra/keycloak/realm-unieee.json): Contains the `unieee-admin-cli` client secret and sample user passwords (`admin01`, `lecturer01`, `student01`) — rotate secrets and remove or reset sample accounts before use.
-> - [scripts/lib/certs.sh](./scripts/lib/certs.sh): Generates self-signed TLS certificates for local development (or loads custom PEM files); use valid CA-issued certificates, Let's Encrypt, or Cloudflare Tunnel in real deployments.
-
----
-
-## Documentation
-
-Public guides for repository visitors, operators, and contributors live under `guides/` (in both **English** and **Tiếng Việt**):
-
-- **[Public Documentation Hub (English)](./guides/README.md)** | [Trung tâm Tài liệu (Tiếng Việt)](./guides/README.vi.md)
-- [Getting Started & Local Ops](./guides/en/getting-started.md) — prerequisites, `scripts/unieee.sh` usage, TLS modes, Keycloak dev tokens, and running Java + Rust test/coverage suites.
-- [Registration-Season Usage, Operations & Failover](./guides/en/operations-and-hotpath.md) — `prepare-registration`, `open-registration` (24/7 multi-window), `close-registration` (Kafka drain & 3-way reconciliation), Hot Delta Sync, student `curl` Hot Path + SSE + AI Advisor walkthroughs, LLM configuration, and Active–Standby failover.
-- [System Architecture & Database Design](./guides/en/architecture.md) — Hybrid Warm/Hot Path, 4 Bounded Contexts + `common` DAG (`catalog`, `account`, `registration`, `ai_advisor`), PostgreSQL schemas (`V001`–`V005`), Policy Engine, Rust Hot Path cluster, Kafka/Redis event backbone, and observability topology.
-- [Rate Limiting & Anti-Bot Architecture](./guides/en/rate-limiting-and-anti-bot.md) — per-service Token Bucket rate limiting (`student_id` + IP fallback), isolated benchmark overlay, Cloudflare Turnstile Gate Ticket design, and self-hosted Proof-of-Work (ALTCHA / Hashcash).
-- [REST API Reference](./guides/en/api-reference.md) — JWT & public catalog auth rules, RBAC roles, unified RFC 9457 Problem Details, all `core-java` APIs (`/api/v1/public/*`, `warm-cache`, `ai_advisor`), Rust `enrollment-engine` & `sse-gateway` APIs, and internal ops & Prometheus metrics probes.
-- [Project Roadmap & Testing](./guides/en/roadmap-and-testing.md) — high-level project roadmap, tiered JaCoCo & `cargo-llvm-cov` coverage policy (`>= 90%` core, `>= 65%` edge), 7-scenario E2E regression suite ([run-e2e.sh](./tests/e2e/run-e2e.sh)), multi-device `k6` benchmarks ([run-benchmarks.sh](./tests/load/run-benchmarks.sh)), and 3-job CI guardrails.
-- [Keycloak Registration-Season Tuning & Identity Brokering](./infra/keycloak/IDENTITY_BROKERING.md) — token refresh jitter (`0.70–0.85`), Declarative User Profile attributes, and link-only Microsoft Entra ID / Google Workspace SSO setup.
+> **Security Notice:** All default passwords, OIDC secrets, and self-signed certs are strictly for local development. Before any non-local deployment, rotate every credential in [`.env.example`](./.env.example), [`infra/keycloak/realm-unieee.json`](./infra/keycloak/realm-unieee.json), and compose overlays, and replace dev certs generated by [`scripts/lib/certs.sh`](./scripts/lib/certs.sh).
 
 ---
 
 ## Architecture Overview
 
-- **Warm / Cold Path — Spring Boot 4.1.3 Modular Monolith (`services/core-java/` `1.1.0`):**
-  - Organized as **4 Bounded Contexts** (`catalog`, `account`, `registration`, `ai_advisor`) over an open shared kernel (`common` with fail-open `RedisReadThroughCache`, `UnieeeMetrics`, and per-identity Token Bucket rate limiting) enforcing a strict 1-way linear dependency DAG verified by Spring Modulith and schema-per-bounded-context PostgreSQL isolation (`V001`–`V005`).
-  - Manages academic terms, faculties/majors/curricula, courses & DAG prerequisites, course sections with 20-week bitmask schedules, unauthenticated read-only **Public Catalog** endpoints (`/api/v1/public/*` backed by Nginx `proxy_cache_lock on`), **Redis Read-Through Cache** (adaptive `45s`/`20m` timetable TTL, `1h` active policy cache, and static catalog merged with live Redis seat counts while keeping reconciliation, rosters, and audit logs uncached), Keycloak account provisioning (backed by Keycloak 26 Declarative User Profile `student_id`/`lecturer_id`), credit-weighted GPA, admin overrides protected by a **Single-Writer Gate Guard** (`409 REGISTRATION_GATE_OPEN` when `REGISTRATION_OPEN`), non-seat-reserving wish surveys, registration wave windows, a configurable **Multi-University Policy Engine** with SHA-256 snapshot export (`unieee:cache:policy:{termId}:snapshot`), **Redis Seat Cache Warmer** (`warm-cache`), **Hot Delta Sync** (`unieee.enrollment.deltas` during `REGISTRATION_OPEN`), the **Read-Only Spring AI `2.0.3` Schedule Advisor** (`ai_advisor`: 4 read-only `@Tool` functions, anti-IDOR/prompt-injection guardrails, deterministic Bitmask verification & fallback), and Micrometer **Prometheus `/actuator/prometheus`** instrumentation.
-  - Built with **Java 25 (Virtual Threads)**, **Spring Modulith 2.1.2** (Event Publication Registry + Cleanup Job), **Spring Data JPA**, **Flyway**, **Spring Security** (Keycloak OIDC 1.0 / OAuth 2.0 / JWT), **MapStruct**, and **Spring AI 2.0.3**.
-- **Hot Path — Rust Service Cluster (`services/rust-enrollment/` `1.1.0`):**
-  - Shared crates (`unieee-domain`, `unieee-events`, `unieee-cacheline`) provide `[u128; 20]` O(1) Bitmask schedule checks (`proptest`-verified), unified RFC 9457 `ProblemDetail`, versioned Kafka (`EnrollmentCommandEvent`, `EnrollmentOutcomeEvent`, `EnrollmentDeltaEvent`, `DeadLetterEvent`) & Redis Pub/Sub schemas, `#[repr(align(64))]` cache-line aligned slots, and sharded `ShardedTokenBucket` rate limiters.
-  - **Enrollment State-Machine (`enrollment-engine`, Axum 0.8 + Tokio):** Holds registration state in RAM (`SectionSeatSlot` + per-student `ShardedMap`), enforces per-student sharded write/read Token Bucket rate limits (`429 RATE_LIMIT_EXCEEDED`), serves lock-free RAM read endpoints (`/api/v1/enrollments/seats` & `/api/v1/enrollments/me`) alongside `/register`, `/drop`, `/status/{event_id}`, and Prometheus `/metrics`, verifies JWTs locally with singleflight JWKS refresh + SHA-256 token cache, validates rules & reserves seats atomically, publishes commands to **Kafka (KRaft)**, consumes durable outcomes from **`unieee.enrollment.outcomes`** on both `ACTIVE` & `STANDBY`, coalesces absolute-seat `SeatTentativeEvent`s over Redis pipelines, supports RAM-first `RevertEvent` idempotency, Hot Delta Sync, zero-PG disk snapshot + Kafka replay recovery, and Active–Standby failover with `REJOIN_AS_STANDBY_ON_RECOVERY=true` and `epoch` fencing.
-  - **Writer / Commit Service (`enrollment-writer`):** Consumes Kafka micro-batches from `unieee.enrollment.commands`, splits same-student/course churn into contiguous conflict-free waves (`split_into_conflict_free_chunks`) for **PostgreSQL** `UNNEST` + Atomic `UPDATE` + `CHECK` commits (via **PgBouncer**) with sequential per-event isolation fallback only when needed, pipelines `acks=all` `EnrollmentOutcomeEvent` produces (`try_join_all`) to **`unieee.enrollment.outcomes`** BEFORE committing consumer offsets, updates **Redis HA** Read Cache & Pub/Sub best-effort for SSE, and exposes Prometheus `/metrics`.
-  - **SSE Live-Update Service (`sse-gateway`, Axum 0.8 + Tokio):** Fans out real-time seat availability (`/api/v1/sse/sections`) and personal outcomes (`/api/v1/sse/me`) with per-student connection-handshake Token Bucket rate limiting, 150ms coalescing, randomized `retry`/`maxAge` jitter, heartbeats, lag resync notifications, and Prometheus `/metrics`.
-- **Infrastructure, Observability & Security (`infra/`, `scripts/`):**
-  - Sits behind **Nginx 1.27 Reverse Proxy** (TLS termination, routing, rate limiting, `proxy_cache_lock on` for `/api/v1/public/*` and `1s` `seats_cache` micro-cache on `/api/v1/enrollments/seats`, dynamic `$enrollment_read_upstream` read/write split to healthy `STANDBY` + Active–Standby `/readyz` failover monitor with no premature auto-failback, buffering disabled for SSE, and internal `:8089 /stub_status`) and **Keycloak 26.1** (self-registration disabled, `accessTokenLifespan: 1800`, Declarative User Profile, link-only external identity brokering).
-  - Optional monitoring overlay ([infra/compose.monitoring.yml](./infra/compose.monitoring.yml)) adds loopback-only **Prometheus** (`127.0.0.1:9090`, `--web.enable-remote-write-receiver` for `k6`), auto-provisioned **Grafana** (`127.0.0.1:3000`, `Production Overview` & `k6 Load Benchmark` dashboards), and internal-network exporters (`nginx`, `postgres`, `pgbouncer`, `redis`, `kafka`) with **zero public host ports on databases, pools, brokers, caches, or exporters**.
-  - Containerized with **Podman Compose** (default) and **Docker Compose** (fallback), without Kubernetes; orchestrates registration cycles via [scripts/unieee.sh](./scripts/unieee.sh).
+- **Warm / Cold Path — Spring Boot 4.1.3 Modular Monolith (`services/core-java/` `v1.1.0`):**
+  - 4 Bounded Contexts (`catalog`, `account`, `registration`, `ai_advisor`) over shared kernel `common` with schema-per-context PostgreSQL isolation (`V001`–`V005`).
+  - Handles academic setup, wish surveys, multi-university policy engine, Keycloak provisioning, admin overrides (blocked when `REGISTRATION_OPEN`), Redis read-through caching, Hot Delta Sync, and the read-only Spring AI schedule advisor.
+- **Hot Path — Rust Cluster (`services/rust-enrollment/` `v1.1.0`):**
+  - `enrollment-engine`: Lock-free in-memory seat slots (`#[repr(align(64))]`) & 20-week Bitmask schedule checks, local JWT verification, per-student Token Bucket rate limiting, Kafka command publishing, and Active–Standby failover with disk snapshot + Kafka replay.
+  - `enrollment-writer`: Conflict-free Kafka micro-batch commits to PostgreSQL via PgBouncer (`UNNEST` + `CHECK`), durable outcomes (`unieee.enrollment.outcomes`), and Redis cache/Pub/Sub updates.
+  - `sse-gateway`: Real-time SSE fan-out for live seat counts (`/api/v1/sse/sections`) and personal outcomes (`/api/v1/sse/me`).
+- **Data, Edge & Ops (`infra/`, `scripts/`):**
+  - PostgreSQL 17 (source of truth), Apache Kafka 3.9 (KRaft), Redis 7.4 HA (read cache & Pub/Sub), Keycloak 26.1 (OIDC/JWT), Nginx 1.27 (TLS, caching, Active–Standby failover), and optional Prometheus + Grafana, orchestrated via [`scripts/unieee.sh`](./scripts/unieee.sh) (Podman/Docker Compose, no Kubernetes).
 
----
-
-## Release Overview (`1.1.0`)
-
-**Release `1.1.0` (`core-java` `1.1.0`, `rust-enrollment` `1.1.0`)** builds upon the `1.0.0` end-to-end platform — adding identity-aware per-service Token Bucket rate limiting (`core-java`, `enrollment-engine`, `sse-gateway`) to preserve campus NAT fairness, an isolated benchmark overlay (`tests/load/compose.bench.yml` with automatic exit restore), internal `unieee_app` non-TLS `k6`/SSE load benchmarking (`--internal-http`), and bilingual anti-bot integration guides (Cloudflare Turnstile & self-hosted PoW), while maintaining **`0` overbooking, `0` schedule conflicts, and `0|0|0` reconciliation** under both steady-state flash crowds and Active–Standby failover drills. See [Project Roadmap & Testing](./guides/en/roadmap-and-testing.md).
+For architecture diagrams, module boundaries, and database schemas, see [System Architecture & Database Design](./guides/en/architecture.md).
 
 ---
 
 ## User Roles
 
-1. **Student (`STUDENT`):** Submits pre-registration wish surveys (non-seat-reserving), browses public open sections, consults the read-only AI schedule advisor, registers/drops/retakes/improves courses on the Hot Path, monitors live SSE seat counts & personal outcomes, and views personal timetables.
-2. **Lecturer (`LECTURER`):** Views assigned course sections, teaching schedules, and enrolled student rosters.
-3. **Academic Affairs (`ACADEMIC_ADMIN`):** Manages academic data, provisions student/lecturer accounts, creates and aggregates wish surveys, configures multi-institution registration policies, opens/closes registration waves, monitors/reconciles Hot Path cycles, and performs direct enrollment overrides outside `REGISTRATION_OPEN`.
+- **Student (`STUDENT`):** Submits non-reserving wish surveys, browses public sections, consults the read-only AI advisor, registers/drops courses on the Hot Path, and tracks live SSE updates and timetables.
+- **Lecturer (`LECTURER`):** Views assigned sections, teaching schedules, and enrolled student rosters.
+- **Academic Affairs (`ACADEMIC_ADMIN`):** Manages academic data, provisions accounts, configures policies/surveys, operates registration waves & reconciliation, and applies enrollment overrides outside open gates.
 
 ---
 
 ## Tech Stack
 
-| Layer / Component | Technology |
+| Layer | Technology |
 | :--- | :--- |
-| Core Monolith & AI | Java 25 (Virtual Threads), Spring Boot 4.1.3, Spring Modulith 2.1.2, Spring AI 2.0.3, Gradle Kotlin DSL, JPA, Flyway, MapStruct |
+| Core Monolith & AI | Java 25 (Virtual Threads), Spring Boot 4.1.3, Spring Modulith 2.1.2, Spring AI 2.0.3, JPA, Flyway, MapStruct |
 | Hot Path Services | Rust, Axum 0.8, Tokio, SQLx 0.8, `rdkafka` (`enrollment-engine`, `enrollment-writer`, `sse-gateway`) |
 | Database & Pooling | PostgreSQL 17 (`CHECK` constraints + Event Sourcing), PgBouncer |
 | Cache & Pub/Sub | Redis 7.4 HA (1 Master + 2 Replicas + 3 Sentinels, AOF/RDB) |
-| Event Streaming | Apache Kafka 3.9 (KRaft mode) |
-| Auth & Edge | Keycloak 26.1 (OIDC / OAuth 2.0 / JWT + link-only brokering), Nginx 1.27 Reverse Proxy |
-| Observability | Prometheus v3.2.1 (remote-write receiver), Grafana 11.5.2 (auto-provisioned dashboards), Micrometer, `metrics-exporter-prometheus`, exporter suite |
-| Container & Ops | Podman Compose (preferred), Docker Compose (fallback), Lifecycle CLI (`scripts/unieee.sh`) |
-| E2E & Benchmarks | Python 3 stdlib 7-scenario E2E suite ([tests/e2e/run-e2e.sh](./tests/e2e/run-e2e.sh)), full-stack `k6` suite ([tests/load/run-benchmarks.sh](./tests/load/run-benchmarks.sh)), isolated Rust Hot Path suite (`k6` + `oha` + `asyncio` SSE in [tests/load-rust/](./tests/load-rust/README.md)) |
+| Event Streaming | Apache Kafka 3.9 (KRaft) |
+| Auth & Edge | Keycloak 26.1 (OIDC / OAuth 2.0 / JWT), Nginx 1.27 Reverse Proxy |
+| Observability | Prometheus v3.2.1, Grafana 11.5.2, Micrometer, `metrics-exporter-prometheus` |
+| Containers & Testing | Podman Compose (default) / Docker Compose, [`scripts/unieee.sh`](./scripts/unieee.sh), Python E2E, `k6`, `oha` + `asyncio` SSE |
 
 ---
 
-## Monorepo Layout
+## Quick Start & Registration Lifecycle
 
-```text
-unieee/
-├── guides/                      # Public bilingual reader documentation (EN & VI)
-│   ├── README.md                # English documentation hub
-│   ├── README.vi.md             # Vietnamese documentation hub
-│   ├── en/                      # English guides (setup, ops/hotpath, architecture, API, roadmap)
-│   └── vi/                      # Vietnamese guides
-├── services/
-│   ├── core-java/               # Spring Boot 4.1.3 Modular Monolith v1.1.0
-│   └── rust-enrollment/         # Rust Cargo Workspace v1.1.0 (crates/ + services/)
-├── infra/
-│   ├── compose.base.yml         # Base stack (core profile)
-│   ├── compose.hotpath.yml      # High-throughput registration stack (hot-path)
-│   ├── compose.monitoring.yml   # Prometheus, Grafana & internal metrics exporters
-│   ├── compose.letsencrypt.yml  # Let's Encrypt auto-issuance & renewal overlay
-│   ├── compose.cloudflared.yml  # Cloudflare Tunnel overlay (Quick & Named)
-│   ├── monitoring/              # Prometheus scrape config + Grafana provisioning & dashboards
-│   ├── letsencrypt/             # Certbot ACME HTTP-01 entrypoint
-│   ├── reverse-proxy/           # TLS, routing, rate limiting, catalog cache lock, failover
-│   ├── keycloak/                # Realm, User Profile, roles, OIDC clients, brokering guide
-│   ├── pgbouncer/               # Transaction pooling config
-│   └── redis/                   # Master-Replica & Sentinel configs
-├── scripts/
-│   ├── unieee.sh                # Lifecycle CLI & Edge/TLS/Monitoring orchestrator
-│   └── lib/                     # Helpers (common, runtime, certs, health, lifecycle)
-├── tests/
-│   ├── e2e/                     # 7-scenario automated E2E & regression suite
-│   ├── load/                    # Full-stack k6 load benchmarks + SLO collector
-│   └── load-rust/               # Isolated Rust Hot Path benchmarks (k6 + host oha CLI + asyncio SSE)
-├── .editorconfig
-├── .env.example
-├── .gitignore
-├── LICENSE
-├── README.md
-└── README.vi.md
-```
+[`scripts/unieee.sh`](./scripts/unieee.sh) supports three Edge/TLS modes (`custom` default, `letsencrypt`, `cloudflared`):
 
----
+| Mode (`--tls-mode`) | Best For | Quick Command |
+| :--- | :--- | :--- |
+| **`custom`** *(default)* | Local dev (auto self-signed) or custom PEM certs | `./scripts/unieee.sh up` |
+| **`letsencrypt`** | Public host with DNS and open ports `80`/`443` | `./scripts/unieee.sh up --tls-mode letsencrypt --domain reg.example.edu.vn --email admin@example.edu.vn` |
+| **`cloudflared`** | Exposing without inbound firewall/router ports | `./scripts/unieee.sh up --tls-mode cloudflared` |
 
-## Startup Configuration & Reverse Proxy / TLS Modes
-
-The [scripts/unieee.sh](./scripts/unieee.sh) CLI lets you switch effortlessly between **3 Edge / TLS modes** via `--tls-mode` (or by setting `UNIEEE_TLS_MODE` in `.env` copied from [.env.example](./.env.example)):
-
-| Mode (`--tls-mode`) | When to Use | Requirements | Quick Command |
-| :--- | :--- | :--- | :--- |
-| **`custom`** *(default)* | Local development or loading your own PEM certificate/key pair | No domain needed (auto self-signed) or pass `--cert` & `--key` | `./scripts/unieee.sh up` |
-| **`letsencrypt`** | Public server with a domain pointing directly to the Reverse Proxy | Public DNS pointing to host, ports `80`/`443` open for ACME HTTP-01 | `./scripts/unieee.sh up --tls-mode letsencrypt --domain reg.example.edu.vn --email admin@example.edu.vn` |
-| **`cloudflared`** | Exposing without opening inbound router/firewall ports or using Cloudflare Edge | Outbound HTTPS access to Cloudflare Edge | `./scripts/unieee.sh up --tls-mode cloudflared` |
-
-### 1. Custom Certificate or Local Self-Signed (`custom`)
-```bash
-# Default local dev (auto-generates self-signed cert in infra/reverse-proxy/certs/)
-./scripts/unieee.sh up
-
-# Load an existing PEM certificate & key (CLI verifies public-key match)
-./scripts/unieee.sh up --tls-mode custom \
-  --cert /path/to/fullchain.pem \
-  --key /path/to/privkey.pem
-```
-
-### 2. Automated Let's Encrypt Registration & Renewal (`letsencrypt`)
-```bash
-# Test against Let's Encrypt Staging CA (default --staging)
-./scripts/unieee.sh up --tls-mode letsencrypt \
-  --domain reg.example.edu.vn \
-  --email admin@example.edu.vn
-
-# Issue a production certificate (Production CA)
-./scripts/unieee.sh up --tls-mode letsencrypt \
-  --domain reg.example.edu.vn \
-  --email admin@example.edu.vn \
-  --no-staging
-
-# Manually trigger renewal and reload Nginx without downtime (auto-runs every 12h inside container)
-./scripts/unieee.sh tls-renew
-```
-
-### 3. Cloudflare Tunnel Deployment (`cloudflared`)
-Nginx listens on an internal-only port `8088` (not published to the host) so `cloudflared` forwards traffic securely with `X-Forwarded-Proto: https` and `X-Forwarded-Port: 443`:
-- **Quick experimentation without a domain (Quick Tunnel `*.trycloudflare.com`):**
-  ```bash
-  ./scripts/unieee.sh up --tls-mode cloudflared
-  ./scripts/unieee.sh logs cloudflared-quick
-  ```
-- **Using a Custom Domain (Named Tunnel):**
-  1. Create a Tunnel in the Cloudflare Zero Trust Dashboard and map a **Public Hostname** (e.g., `reg.example.edu.vn`) with Service Type `HTTP` pointing to `reverse-proxy:8088`.
-  2. Start with your tunnel token and custom domain:
-     ```bash
-     ./scripts/unieee.sh up --tls-mode cloudflared \
-       --cf-token "<CLOUDFLARE_TUNNEL_TOKEN>" \
-       --domain reg.example.edu.vn
-     ```
-
-> While running in any mode, you can re-run `./scripts/unieee.sh up --tls-mode <other_mode>` to automatically remove the previous TLS overlay container and switch modes without losing database state.
-
----
-
-## Registration-Season Lifecycle Quick Reference
-
-During peak registration windows, [scripts/unieee.sh](./scripts/unieee.sh) orchestrates the Hot Path cluster cyclically around the 24/7 `core` stack:
+See [Getting Started & Local Ops](./guides/en/getting-started.md) for custom PEM certs, ACME production certificates, and Cloudflare Named Tunnels.
 
 ```bash
-# 0. Optional: start core stack with loopback-only Prometheus (:9090) & Grafana (:3000)
-./scripts/unieee.sh up --monitoring
+./scripts/unieee.sh up --monitoring                                  # Start core + loopback Prometheus (:9090) & Grafana (:3000)
+./scripts/unieee.sh prepare-registration --term 2026-FALL            # Export Policy Snapshot, start hot-path, warm Redis, verify checksum
+./scripts/unieee.sh open-registration --term 2026-FALL --window <UUID> # Open wave (re-run with next window UUID for 24/7 transitions)
+./scripts/unieee.sh health                                           # Inspect Redis Sentinel, Kafka, core-java & Rust /readyz
+./scripts/unieee.sh close-registration --term 2026-FALL              # Drain Kafka, verify 0|0|0 reconciliation, warm cache & stop hot-path
 
-# 1. Freeze term, export Policy Snapshot, start hot-path, warm Redis cache & verify RAM == PostgreSQL checksum
-./scripts/unieee.sh prepare-registration --term 2026-FALL
-
-# 2. Open registration gate for a wave (re-run with next --window UUID for 24/7 multi-window transitions)
-./scripts/unieee.sh open-registration --term 2026-FALL --window <WINDOW_UUID>
-
-# 3. Inspect Sentinel-aware Redis HA, Kafka topics, core-java, Rust /readyz & monitoring exporters
-./scripts/unieee.sh health
-
-# 4. Close gate, drain Kafka commands+outcomes lag=0, pass 3-way reconciliation, warm final Redis cache & stop hot-path
-./scripts/unieee.sh close-registration --term 2026-FALL
-
-# 5. Run the automated 7-scenario E2E regression suite, full-stack k6 benchmarks, or isolated Rust Hot Path benchmarks
-./tests/e2e/run-e2e.sh
+./tests/e2e/run-e2e.sh                                               # 7-scenario automated E2E regression suite
 ./tests/load/run-benchmarks.sh --profile laptop --scenario all --disable-rate-limit --close-after
-./tests/load-rust/run-rust-bench.sh --profile laptop
+./tests/load-rust/run-rust-bench.sh --profile laptop                 # Isolated Rust Hot Path suite (k6 + host oha + asyncio SSE)
 ```
 
-For full operator and student `curl` walkthroughs, AI Advisor setup, and Active–Standby failover behavior, see [Registration-Season Usage, Operations & Failover](./guides/en/operations-and-hotpath.md).
+For full `curl` walkthroughs, AI Advisor setup, and Active–Standby failover drills, see [Registration-Season Usage, Operations & Failover](./guides/en/operations-and-hotpath.md).
 
 ---
 
 ## Isolated Rust Hot Path Benchmark (`tests/load-rust/`)
 
 > [!IMPORTANT]
-> **Isolated Rust Stack Only (Excludes Java / Keycloak / Nginx):**
-> These measurements cover the **isolated Rust Hot Path stack** (`enrollment-engine`, `enrollment-writer`, `sse-gateway`, `PostgreSQL 17 + PgBouncer`, `Kafka 3.9`, `Redis 7.4`, static `jwks-server`) and **do NOT include** Spring Boot `core-java`, Keycloak, or Nginx Reverse Proxy/TLS termination. Host-native CLI scenarios require [`oha`](https://github.com/hatoo/oha) (`cargo install oha`). See [tests/load-rust/README.md](./tests/load-rust/README.md) for prerequisites, scenarios, and presets.
+> **Isolated Rust Stack Only:** Measures **only the isolated Rust Hot Path** (`enrollment-engine`, `enrollment-writer`, `sse-gateway`, PostgreSQL 17 + PgBouncer, Kafka 3.9, Redis 7.4, static `jwks-server`) and **excludes** Java `core-java`, Keycloak, and Nginx/TLS. Host scenarios require [`oha`](https://github.com/hatoo/oha) (`cargo install oha`). Details in [`tests/load-rust/README.md`](./tests/load-rust/README.md).
 
-- **Benchmark Environment:** `CPU: AMD Ryzen 5 PRO 5650U (6C/12T)` | `RAM: 24 GB` | Single-host Linux (`laptop` profile, `--rate-limit off`).
-- **Host-Native `oha` CLI (`oha 1.17.0`, `c=100`, no Docker):**
-  - `05a-oha-read` (`GET /seats` + `GET /me`): **`64,987.8 req/s`** (`1,300,017` reqs), HTTP `p50=1.41 ms`, `p95=2.81 ms`, `p99=4.33 ms`, `p99.9=8.82 ms`, `0.000%` error.
-  - `05b-oha-write` (`POST /register`): **`66,282.6 req/s`** (`1,325,953` reqs), HTTP `p50=1.36 ms`, `p95=2.87 ms`, `p99=4.40 ms`, `p99.9=7.97 ms`, `0.000%` error.
-- **In-Network `k6` (60 VUs) & Concurrent `asyncio` SSE (`500/500` streams):**
-  - `01-engine-read-rps`: **`25,869.5 req/s`** (`p95=4.92 ms`, `p99=7.81 ms`); `02-engine-write-contention`: **`13,410.3 req/s`** (`p95=13.80 ms`); `04-fullstack-mixed-peak`: **`17,164.2 req/s`** (`p95=8.33 ms`, `p99=14.77 ms`).
-  - Concurrent SSE: **`500/500` streams** (`350` section + `150` personal), `0` drops/errors; `03-sse` delivered `786,677` events (`24,323.6 ev/s`, seat lag `p50=117.3 ms`, `p95=909.3 ms`), `04-sse` delivered `1,189,041` events (`27,676.5 ev/s`).
-- **Internal Service & Correctness Summary:** `enrollment-engine` server-side `p50=0.26 ms` / `p95=0.49 ms` (`83.08 MB` peak RAM); `enrollment-writer` committed `55,185` PostgreSQL events across `795` batches (`0` DLQ); **`0` overbooking**, **`0` 20-week Bitmask conflicts**, **`0` duplicates**, **`0|0|0` reconciliation**, and `RAM == PostgreSQL` (`597 == 597`).
+- **Environment:** `CPU: AMD Ryzen 5 PRO 5650U (6C/12T)` | `RAM: 24 GB` | Single-host Linux (`laptop` profile, `--rate-limit off`).
 
----
+| Scenario / Tool | Throughput | Latency / Delivery | Errors |
+| :--- | :--- | :--- | :--- |
+| `05a-oha-read` (host `oha 1.17.0`, `c=100`) | **64,987.8 req/s** (1,300,017 reqs) | `p50=1.41 ms`, `p95=2.81 ms`, `p99=4.33 ms` | `0.000%` |
+| `05b-oha-write` (host `oha 1.17.0`, `c=100`) | **66,282.6 req/s** (1,325,953 reqs) | `p50=1.36 ms`, `p95=2.87 ms`, `p99=4.40 ms` | `0.000%` |
+| `01-engine-read-rps` (`k6`, 60 VUs) | **25,869.5 req/s** | `p95=4.92 ms`, `p99=7.81 ms` | `0.000%` |
+| `02-engine-write-contention` (`k6`, 60 VUs) | **13,410.3 req/s** | `p95=13.80 ms` | `0.000%` |
+| `04-fullstack-mixed-peak` (`k6`, 60 VUs + SSE) | **17,164.2 req/s** | `p95=8.33 ms`, `p99=14.77 ms` | `0.000%` |
+| `03` / `04` SSE (`asyncio`, 500 streams) | **24,323.6** / **27,676.5 ev/s** | `500/500` streams (`350` section + `150` personal) | `0` drops |
 
-## Contributing (Git Workflow)
-
-1. Always start from the latest `dev` branch: `git checkout dev && git pull`.
-2. Create a dedicated branch following `feat/<feature-name>`, `fix/<issue-name>`, or `docs/<topic>`.
-3. Make clean **atomic commits** using **Conventional Commits** (`feat`, `fix`, `perf`, `refactor`, `test`, `chore`, `docs`).
-4. Once changes and tests pass, open a **Pull Request into `dev`** for review; **never self-approve or self-merge a PR** without explicit approval.
+- **Telemetry & Invariants:** `enrollment-engine` internal `p50=0.26 ms` / `p95=0.49 ms` (`83.08 MB` peak RAM); `enrollment-writer` committed `55,185` PostgreSQL events across `795` batches (`0` DLQ); **`0` overbooking**, **`0` 20-week Bitmask conflicts**, **`0` duplicates**, **`0|0|0` reconciliation**, and `RAM == PG` (`597 == 597`).
 
 ---
 
-## License
+## Repository Layout
+
+```text
+unieee/
+├── guides/                  # Bilingual public documentation (EN & VI)
+├── services/
+│   ├── core-java/           # Spring Boot 4.1.3 Modular Monolith v1.1.0
+│   └── rust-enrollment/     # Rust Cargo Workspace v1.1.0 (crates/ + services/)
+├── infra/                   # Compose stacks, Nginx, Keycloak, PgBouncer, Redis HA, monitoring
+├── scripts/                 # unieee.sh lifecycle CLI and helpers
+└── tests/
+    ├── e2e/                 # 7-scenario E2E & regression suite
+    ├── load/                # Full-stack k6 benchmark suite
+    └── load-rust/           # Isolated Rust Hot Path suite (k6 + host oha + asyncio SSE)
+```
+
+---
+
+## Documentation
+
+- **[Documentation Hub (EN)](./guides/README.md)** | [Trung tâm Tài liệu (VI)](./guides/README.vi.md)
+- [Getting Started & Local Ops](./guides/en/getting-started.md) — prerequisites, `scripts/unieee.sh`, TLS modes, and test/coverage suites.
+- [Operations, Hot Path & Failover](./guides/en/operations-and-hotpath.md) — wave lifecycle, Hot Delta Sync, `curl` walkthroughs, LLM config, and failover.
+- [System Architecture & Database Design](./guides/en/architecture.md) — Bounded Contexts, PostgreSQL schemas (`V001`–`V005`), Rust engine, Kafka/Redis, observability.
+- [Rate Limiting & Anti-Bot](./guides/en/rate-limiting-and-anti-bot.md) — per-service Token Bucket limits, Cloudflare Turnstile, and ALTCHA / Hashcash PoW.
+- [REST API Reference](./guides/en/api-reference.md) — OIDC/JWT rules, RFC 9457 errors, Warm/Hot/SSE endpoints, and metrics probes.
+- [Project Roadmap & Testing](./guides/en/roadmap-and-testing.md) — roadmap, tiered coverage (`>= 90%` / `>= 65%`), E2E, `k6` & Rust benchmarks, CI.
+- [Keycloak Tuning & Identity Brokering](./infra/keycloak/IDENTITY_BROKERING.md) — token jitter, Declarative User Profile, and link-only SSO.
+
+---
+
+## Contributing & License
+
+Branch from latest `dev` (`feat/*`, `fix/*`, `docs/*`), use clean **Conventional Commits**, verify tests/links, and open a **Pull Request into `dev`** (never self-approve or self-merge).
 
 Released under [LICENSE](./LICENSE).
