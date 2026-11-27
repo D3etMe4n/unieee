@@ -85,7 +85,6 @@ Báo cáo Markdown và JSON tự động xuất tại `tests/load-rust/results/<
 
 - **Phạm vi:** **Chỉ benchmark cụm Rust Hot Path cô lập** (`enrollment-engine`, `enrollment-writer`, `sse-gateway`, `PostgreSQL 17 + PgBouncer`, `Kafka 3.9 KRaft`, `Redis 7.4`, `jwks-server`) — **chưa bao gồm Spring Boot `core-java`, Keycloak và Nginx**.
 - **CPU:** `AMD Ryzen 5 PRO 5650U` (`6 cores / 12 threads`)
-- **GPU:** `AMD Radeon Graphics (tích hợp Vega / Cezanne, không tham gia tính toán — tải thuần CPU/I/O)`
 - **RAM:** `24 GB`
 - **Mô hình chạy:** Single-host Linux chạy toàn bộ container cùng lúc với `k6`, client `asyncio` SSE và CLI `oha 1.17.0` trên host (`--rate-limit off`).
 
