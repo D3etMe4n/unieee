@@ -63,14 +63,21 @@ Supports hardware-scaled presets (`BENCH_PROFILE=smoke|laptop|workstation|stress
 ./tests/load/run-benchmarks.sh --profile smoke --scenario 04 --chaos engine --bench-nginx --close-after
 ```
 
-**Measured `1.0.0` Benchmark Summary (Single-Host Linux Laptop, 40 VUs `laptop` + Chaos `engine` Drill):**
+**Measured `1.0.0` Reference Benchmark Summary (Single-Host Consumer Laptop):**
+
+> [!NOTE]
+> **Benchmark Environment & Methodology Disclaimer:**
+> - **Consumer Single-Host Hardware:** These figures are reference measurements collected on an ordinary consumer Linux laptop running the entire stack (**20+ containers** — PostgreSQL, PgBouncer, Redis HA with 3 Sentinels, Kafka, Keycloak, Nginx, `core-java`, Rust Hot Path cluster, Prometheus, and Grafana) **alongside the `k6` load generator on the same machine**.
+> - **Why Observed Throughput Is Host-Bound:** On a single host, **Nginx TLS termination** and **co-located `k6` virtual users** consume the majority of CPU cores well before the Rust `enrollment-engine` saturates (internal Prometheus metrics confirm the Rust engine itself continues serving at sub-millisecond `p95` while client-side numbers reflect single-host CPU contention).
+> - **Future Direction for Accurate Capacity Testing:** To measure true cluster ceilings in future evaluations, run `k6` from dedicated external load-generator host(s), isolate Nginx / TLS termination on a separate edge node, and deploy PostgreSQL, Kafka, Redis HA, and the Rust/Java services on dedicated multi-node hardware.
+
 - **Correctness SLOs (Both Steady-State & Chaos Failover):** **`0`** overbooked sections (`0%`), **`0`** 20-week Bitmask schedule conflicts (`0%`), **`0`** duplicate active course enrollments, **`0|0|0`** 3-way reconciliation (`reconcileApiMismatchCount = 0`), and `RAM == PostgreSQL` parity on both `ACTIVE` and `STANDBY` nodes.
-- **Steady-State `laptop` (`bench-laptop-20261126T235326Z`):**
+- **Steady-State Benchmark (`laptop` profile, 40 VUs):**
   - `01-warm-read` (`core-java` + Redis): **`5,347.2 RPS`**, `p50 = 6.39 ms`, `p95 = 17.79 ms`, `p99 = 26.20 ms`, `0.000%` 5xx, Nginx cache hit `99.892%` (Core Java Read-Through Cache hit ratio `99.336%`).
   - `02-hot-read` (Rust Standby RAM + `seats_cache`): **`16,978.3 RPS`**, `p50 = 1.79 ms`, `p95 = 4.84 ms`, `p99 = 7.64 ms`, `0.000%` 5xx, Nginx cache hit `99.924%`.
   - `03-hot-write-contention` (`enrollment-engine` Active + Kafka + Writer): **`7,018.7 RPS`**, `p50 = 4.22 ms`, `p95 = 12.47 ms`, `p99 = 21.24 ms`, `0.009%` unexpected 5xx.
   - `04-mixed-peak-hour` (Reads + Writes + AI + SSE): **`7,105.6 RPS`**, `p95 = 17.09 ms`, `p99 = 31.08 ms`, `0.000%` 5xx; 20 concurrent SSE clients received `75,125` seat updates with **`p95 = 263.48 ms`**, **`p99 = 325.92 ms`** (`< 500 ms` SLO).
-- **Chaos Active-Engine Kill (`bench-smoke-20261126T235655Z`, `5,679.7 RPS`):** Promoted Standby (`epoch=2`) and recovered killed node cleanly as `STANDBY` (no premature auto-failback), `0.000%` unexpected errors (`0.151%` transient promotion `502/503`), and `0|0|0` reconciliation.
+- **Chaos Active-Engine Failover Drill (`smoke` profile, `5,679.7 RPS`):** Promoted Standby (`epoch=2`) and recovered the killed node cleanly as `STANDBY` (no premature auto-failback), `0.000%` unexpected errors (`0.151%` transient promotion `502/503`), and `0|0|0` reconciliation.
 
 ---
 

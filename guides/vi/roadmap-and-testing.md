@@ -63,14 +63,21 @@ Hỗ trợ các preset cấu hình (`BENCH_PROFILE=smoke|laptop|workstation|stre
 ./tests/load/run-benchmarks.sh --profile smoke --scenario 04 --chaos engine --bench-nginx --close-after
 ```
 
-**Kết quả Benchmark Đo thực tế Bản `1.0.0` (Single-Host Linux Laptop, 40 VUs `laptop` + Chaos `engine` Drill):**
+**Kết quả Benchmark Tham khảo Bản `1.0.0` (Chạy Single-Host trên Laptop Cá nhân):**
+
+> [!NOTE]
+> **Lưu ý về Môi trường & Phương pháp Đo (Benchmark Disclaimer):**
+> - **Chạy toàn bộ trên một chiếc laptop phổ thông:** Các số liệu dưới đây chỉ mang tính tham khảo, được đo trên một máy laptop Linux cá nhân chạy đồng thời **hơn 20 container** (PostgreSQL, PgBouncer, Redis HA kèm 3 Sentinel, Kafka, Keycloak, Nginx, `core-java`, cụm Rust Hot Path, Prometheus và Grafana) **cùng với chính trình phát tải `k6` trên cùng một máy**.
+> - **Lý do thông lượng đo được ở mức trung bình:** Trong mô hình single-host, **quá trình mã hóa/giải mã TLS của Nginx** và **trình phát tải `k6` chạy chung máy** đã chiếm phần lớn tài nguyên CPU trước khi cụm Rust `enrollment-engine` kịp chạm ngưỡng bão hòa (metrics nội bộ từ Prometheus cho thấy bản thân Rust engine vẫn xử lý ở mức dưới 1 ms ở `p95`, trong khi số liệu phía client chịu ảnh hưởng bởi tranh chấp CPU cùng máy).
+> - **Định hướng đo chuẩn xác hơn trong tương lai:** Để đánh giá đúng giới hạn tải thực tế của hệ thống, bài benchmark cần được tách riêng máy phát tải `k6` sang node độc lập, tách tầng Reverse Proxy / TLS termination ra biên riêng và triển khai các thành phần dữ liệu (PostgreSQL, Kafka, Redis HA) cùng tầng ứng dụng trên cụm nhiều máy chủ chuyên dụng.
+
 - **Bất biến Đúng đắn (Cả Steady-State lẫn Chaos Failover):** **`0`** lớp overbooking (`0%`), **`0`** cặp trùng lịch Bitmask 20 tuần (`0%`), **`0`** trùng môn học `CONFIRMED`, đối soát 3 chiều đạt **`0|0|0`** (`reconcileApiMismatchCount = 0`) và khớp 100% RAM == PostgreSQL trên cả hai node `ACTIVE` & `STANDBY`.
-- **Steady-State `laptop` (`bench-laptop-20261126T235326Z`):**
+- **Benchmark Steady-State (Cấu hình `laptop`, 40 VUs):**
   - `01-warm-read` (`core-java` + Redis): **`5,347.2 RPS`**, `p50 = 6.39 ms`, `p95 = 17.79 ms`, `p99 = 26.20 ms`, `0.000%` 5xx, Nginx cache hit `99.892%` (tỷ lệ Hit Read-Through Cache trên `core-java` `99.336%`).
   - `02-hot-read` (Rust Standby RAM + `seats_cache`): **`16,978.3 RPS`**, `p50 = 1.79 ms`, `p95 = 4.84 ms`, `p99 = 7.64 ms`, `0.000%` 5xx, Nginx cache hit `99.924%`.
   - `03-hot-write-contention` (`enrollment-engine` Active + Kafka + Writer): **`7,018.7 RPS`**, `p50 = 4.22 ms`, `p95 = 12.47 ms`, `p99 = 21.24 ms`, `0.009%` 5xx ngoài dự kiến.
   - `04-mixed-peak-hour` (Đọc + Ghi + AI + SSE): **`7,105.6 RPS`**, `p95 = 17.09 ms`, `p99 = 31.08 ms`, `0.000%` 5xx; 20 client SSE đồng thời nhận `75,125` biến động chỗ trống với độ trễ **`p95 = 263.48 ms`**, **`p99 = 325.92 ms`** (đạt SLO `< 500 ms`).
-- **Chaos Active-Engine Kill (`bench-smoke-20261126T235655Z`, `5,679.7 RPS`):** Standby tự động thăng cấp (`epoch=2`), node chết phục hồi từ snapshot + Kafka gia nhập lại vai trò `STANDBY` (không cướp quyền Active sớm), `0.000%` lỗi ngoài dự kiến (`0.151%` `502/503` trong ~1s chuyển mạch) và đối soát `0|0|0`.
+- **Diễn tập Chaos Active-Engine Failover (Cấu hình `smoke`, `5,679.7 RPS`):** Standby tự động thăng cấp (`epoch=2`), node chết phục hồi từ snapshot + Kafka gia nhập lại vai trò `STANDBY` (không cướp quyền Active sớm), `0.000%` lỗi ngoài dự kiến (`0.151%` `502/503` trong ~1s chuyển mạch) và đối soát `0|0|0`.
 
 ---
 
