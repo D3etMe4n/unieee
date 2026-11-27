@@ -20,7 +20,7 @@ Chào mừng bạn đến với bộ tài liệu dành cho người đọc, kỹ
 | [Kiến trúc Hệ thống & Thiết kế CSDL](./vi/architecture.md) | Kỹ sư & Kiến trúc sư | Tách biệt Warm/Hot Path, đồ thị 4 Bounded Contexts tuyến tính 1 chiều (bao gồm `ai_advisor`), PostgreSQL (`V001`–`V005`), Policy Engine, cụm Rust Hot Path và hệ thống Kafka/Redis Pub/Sub. |
 | [Hướng dẫn Rate Limiting & Tích hợp Anti-Bot](./vi/rate-limiting-and-anti-bot.md) | Kiến trúc sư & Bảo mật/Ops | Token Bucket theo từng service (`student_id` + IP fallback), RFC 9457 `429`, overlay cô lập benchmark, thiết kế Cloudflare Turnstile Gate Ticket và Proof-of-Work tự host (ALTCHA / Hashcash). |
 | [Tài liệu REST API](./vi/api-reference.md) | Frontend / QA / Integrator | Xác thực JWT & danh mục công khai, phân quyền RBAC, chuẩn lỗi RFC 9457 (gồm `429 RATE_LIMIT_EXCEEDED`), toàn bộ endpoint `core-java`, Rust `enrollment-engine` & `sse-gateway` và probe nội bộ. |
-| [Lộ trình Dự án & Chiến lược Kiểm thử](./vi/roadmap-and-testing.md) | Cộng tác viên & Reviewer | Lộ trình tổng quan dự án, chính sách coverage phân tầng JaCoCo & `cargo-llvm-cov` (`>= 90%` core, `>= 65%` tầng biên), bộ E2E 7 kịch bản, benchmark `k6` (`host-tls` & `--internal-http`) và GitHub Actions CI. |
+| [Lộ trình Dự án & Chiến lược Kiểm thử](./vi/roadmap-and-testing.md) | Cộng tác viên & Reviewer | Lộ trình tổng quan dự án, chính sách coverage phân tầng JaCoCo & `cargo-llvm-cov` (`>= 90%` core, `>= 65%` tầng biên), bộ E2E 7 kịch bản, benchmark toàn stack `k6` & cụm Rust cô lập (`k6` + `oha` + `asyncio` SSE) và GitHub Actions CI. |
 
 ---
 

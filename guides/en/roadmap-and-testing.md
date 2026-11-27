@@ -70,21 +70,36 @@ Supports hardware-scaled presets (`BENCH_PROFILE=smoke|laptop|workstation|stress
 ./tests/load/run-benchmarks.sh --profile smoke --scenario 04 --chaos engine --disable-rate-limit --close-after
 ```
 
-**Measured `1.0.0` Reference Benchmark Summary (Single-Host Consumer Laptop):**
+### 3.3 Isolated Rust Hot Path Full-Stack Benchmark ([tests/load-rust/](../../tests/load-rust/README.md))
 
-> [!NOTE]
-> **Benchmark Environment & Methodology Disclaimer:**
-> - **Consumer Single-Host Hardware:** These figures are reference measurements collected on an ordinary consumer Linux laptop running the entire stack (**20+ containers** — PostgreSQL, PgBouncer, Redis HA with 3 Sentinels, Kafka, Keycloak, Nginx, `core-java`, Rust Hot Path cluster, Prometheus, and Grafana) **alongside the `k6` load generator on the same machine**.
-> - **Why Observed Throughput Is Host-Bound:** On a single host, **Nginx TLS termination** and **co-located `k6` virtual users** consume the majority of CPU cores well before the Rust `enrollment-engine` saturates (internal Prometheus metrics confirm the Rust engine itself continues serving at sub-millisecond `p95` while client-side numbers reflect single-host CPU contention).
-> - **Future Direction for Accurate Capacity Testing:** To measure true cluster ceilings in future evaluations, run `k6` from dedicated external load-generator host(s), isolate Nginx / TLS termination on a separate edge node, and deploy PostgreSQL, Kafka, Redis HA, and the Rust/Java services on dedicated multi-node hardware.
+> [!IMPORTANT]
+> **Scope Disclaimer — Isolated Rust Stack Only (Excludes Java / Keycloak / Nginx):**
+> The isolated suite in `tests/load-rust/` evaluates **only the Rust Hot Path stack** (`enrollment-engine`, `enrollment-writer`, `sse-gateway`, `PostgreSQL 17 + PgBouncer`, `Kafka 3.9 KRaft`, `Redis 7.4`, and a lightweight static `jwks-server`). It **does NOT include** Spring Boot `core-java`, Keycloak, or Nginx Reverse Proxy/TLS termination, and it leaves all original project APIs untouched.
 
-- **Correctness SLOs (Both Steady-State & Chaos Failover):** **`0`** overbooked sections (`0%`), **`0`** 20-week Bitmask schedule conflicts (`0%`), **`0`** duplicate active course enrollments, **`0|0|0`** 3-way reconciliation (`reconcileApiMismatchCount = 0`), and `RAM == PostgreSQL` parity on both `ACTIVE` and `STANDBY` nodes.
-- **Steady-State Benchmark (`laptop` profile, 40 VUs):**
-  - `01-warm-read` (`core-java` + Redis): **`5,347.2 RPS`**, `p50 = 6.39 ms`, `p95 = 17.79 ms`, `p99 = 26.20 ms`, `0.000%` 5xx, Nginx cache hit `99.892%` (Core Java Read-Through Cache hit ratio `99.336%`).
-  - `02-hot-read` (Rust Standby RAM + `seats_cache`): **`16,978.3 RPS`**, `p50 = 1.79 ms`, `p95 = 4.84 ms`, `p99 = 7.64 ms`, `0.000%` 5xx, Nginx cache hit `99.924%`.
-  - `03-hot-write-contention` (`enrollment-engine` Active + Kafka + Writer): **`7,018.7 RPS`**, `p50 = 4.22 ms`, `p95 = 12.47 ms`, `p99 = 21.24 ms`, `0.009%` unexpected 5xx.
-  - `04-mixed-peak-hour` (Reads + Writes + AI + SSE): **`7,105.6 RPS`**, `p95 = 17.09 ms`, `p99 = 31.08 ms`, `0.000%` 5xx; 20 concurrent SSE clients received `75,125` seat updates with **`p95 = 263.48 ms`**, **`p99 = 325.92 ms`** (`< 500 ms` SLO).
-- **Chaos Active-Engine Failover Drill (`smoke` profile, `5,679.7 RPS`):** Promoted Standby (`epoch=2`) and recovered the killed node cleanly as `STANDBY` (no premature auto-failback), `0.000%` unexpected errors (`0.151%` transient promotion `502/503`), and `0|0|0` reconciliation.
+- **Required Dependency for Scenario 05 (Host-Native CLI):** [`oha`](https://github.com/hatoo/oha) (`cargo install oha`, tested on `oha 1.17.0`) runs directly on the host machine (outside Docker/Podman) targeting `127.0.0.1:18081`.
+- **Single-Host Benchmark Environment:**
+  - **CPU:** `AMD Ryzen 5 PRO 5650U` (`6 cores / 12 threads`)
+  - **RAM:** `24 GB`
+  - **Topology:** Single-host Linux running isolated Compose containers alongside `k6`, `asyncio` SSE harness, and host-native `oha` (`--profile laptop`, `--rate-limit off`).
+
+```bash
+# Full isolated Rust benchmark (k6 + 500 concurrent asyncio SSE + host-native oha CLI)
+./tests/load-rust/run-rust-bench.sh --profile laptop
+```
+
+**Verified `laptop` Profile Measurements (Isolated Rust Hot Path Stack):**
+
+| Tool & Scenario | Requests / Streams | Throughput | Latency (`p50 / p95 / p99`) | Unexpected Errors |
+| :--- | ---: | ---: | ---: | ---: |
+| **`oha` Host CLI (`05a-oha-read`, `c=100`)** | `1,300,017` reqs | **`64,987.8 req/s`** | `1.41 / 2.81 / 4.33 ms` *(p99.9: `8.82 ms`)* | `0.000%` |
+| **`oha` Host CLI (`05b-oha-write`, `c=100`)** | `1,325,953` reqs | **`66,282.6 req/s`** | `1.36 / 2.87 / 4.40 ms` *(p99.9: `7.97 ms`)* | `0.000%` |
+| **`k6` In-Network (`01-engine-read-rps`, 60 VUs)** | `776,126` reqs | **`25,869.5 req/s`** | `1.71 / 4.92 / 7.81 ms` | `0.000%` |
+| **`k6` In-Network (`02-engine-write-contention`, 60 VUs)** | `402,377` reqs | **`13,410.3 req/s`** | `2.28 / 13.80 / 28.44 ms` | `0.000%` |
+| **`k6` In-Network (`04-fullstack-mixed-peak`, 60 VUs + SSE)** | `515,002` reqs | **`17,164.2 req/s`** | `2.33 / 8.33 / 14.77 ms` | `0.000%` |
+| **`asyncio` SSE (`03-sse` + churn, `500/500` streams)** | `786,677` events | **`24,323.6 ev/s`** | Seat lag `p50=117.3 ms`, `p95=909.3 ms`; Personal `p95=766.9 ms` | `0` drops / `0` errors |
+| **`asyncio` SSE (`04-sse` mixed peak, `500/500` streams)** | `1,189,041` events | **`27,676.5 ev/s`** | Handshake `p95=1.84 ms` *(client-side single-core Python `json.loads` queuing under full-CPU mixed load)* | `0` drops / `0` errors |
+
+- **Internal Rust Service Telemetry & Correctness SLOs:** `enrollment-engine` served `4,349,030` requests at server-side **`p50 = 0.26 ms`**, **`p95 = 0.49 ms`**, **`p99 = 5.97 ms`** (`83.08 MB` peak RAM); `enrollment-writer` committed `55,185` PostgreSQL events across `795` batches (`p50 = 14.86 ms`, `p95 = 47.16 ms`, `0` DLQ); `sse-gateway` sustained `500/500` streams with `0` `slow_consumer_lagged_events` (`40.07 MB` peak RAM); post-run verification confirmed **`0` overbooking**, **`0` 20-week Bitmask schedule conflicts**, **`0` duplicate enrollments**, **`0|0|0` reconciliation**, and `RAM == PostgreSQL` parity (`597 == 597`).
 
 ---
 
@@ -93,9 +108,9 @@ Supports hardware-scaled presets (`BENCH_PROFILE=smoke|laptop|workstation|stress
 Every Pull Request into `dev` or `main` must pass **3 GitHub Actions jobs**:
 1. **Infra, Scripts & Guardrails:**
    - Rejects any tracked secret files (`.env`, `*.pem`, `*.key`, `*.crt`, `*.p12`) or local-only workspace files.
-   - Validates shell script syntax (`bash -n` / `sh -n`), including `20-enrollment-healthcheck.sh`, `tests/e2e/run-e2e.sh`, and `tests/load/run-benchmarks.sh` *(without executing `k6` in CI)*.
+   - Validates shell script syntax (`bash -n` / `sh -n`), including `20-enrollment-healthcheck.sh`, `tests/e2e/run-e2e.sh`, `tests/load/run-benchmarks.sh`, and `tests/load-rust/run-rust-bench.sh` *(without executing `k6` or `oha` in CI)*, plus `python3 -m py_compile` on `tests/load-rust/*.py`.
    - Validates Keycloak realm integrity (`registrationAllowed == false`, `accessTokenLifespan` in `1800..3600s`, all 3 roles, `unieee-first-broker-login-link-only` flow without `idp-create-user-if-unique`, and `UserProfileProvider` declaring admin-only editable `student_id` & `lecturer_id`), Nginx cache lock / read-write split / `:8089 stub_status` / failover config, Grafana JSON dashboards, and `compose.hotpath.yml` (`unieee.enrollment.outcomes`).
-   - Validates all Compose configuration overlays (`compose.base.yml`, `compose.hotpath.yml`, `compose.monitoring.yml` standalone & combined `--profile hot-path`, `compose.letsencrypt.yml`, `compose.cloudflared.yml` quick & named, and `tests/load/compose.bench.yml`).
+   - Validates all Compose configuration overlays (`compose.base.yml`, `compose.hotpath.yml`, `compose.monitoring.yml` standalone & combined `--profile hot-path`, `compose.letsencrypt.yml`, `compose.cloudflared.yml` quick & named, `tests/load/compose.bench.yml`, and `tests/load-rust/compose.rust-bench.yml`).
    - Verifies that all relative links in `README.md` and `README.vi.md` resolve cleanly.
 2. **Spring Boot 4.1.3 Core & Modulith:**
    - Runs `./gradlew check --no-daemon` on Java 25 against real Testcontainers PostgreSQL, enforcing `ModularityVerificationTest` and JaCoCo tiered coverage rules.
