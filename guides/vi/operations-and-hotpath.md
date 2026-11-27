@@ -208,6 +208,22 @@ Module `ai_advisor` (`POST /api/v1/ai/advisor/chat`) hỗ trợ hai chế độ 
 
 ## 5. Tinh chỉnh Keycloak Mùa Đăng ký & Identity Brokering
 
-- [realm-unieee.json](../../infra/keycloak/realm-unieee.json) cấu hình `accessTokenLifespan: 1800` (30 phút), `ssoSessionIdleTimeout: 3600` (60 phút) và `registrationAllowed: false`.
+- [realm-unieee.json](../../infra/keycloak/realm-unieee.json) cấu hình `accessTokenLifespan: 1800` (30 phút), `ssoSessionIdleTimeout: 3600` (60 phút), `registrationAllowed: false` và `UserProfileProvider` của Keycloak 26 giới hạn chỉ Admin mới được sửa `student_id` & `lecturer_id`.
 - Client web/mobile nên áp dụng refresh jitter ngẫu nhiên trong khoảng `[0.70, 0.85]` của `expires_in` để tránh dồn tải vào Keycloak khi token hết hạn đồng loạt.
 - Hỗ trợ đăng nhập SSO qua **Microsoft Entra ID** hoặc **Google Workspace** bằng flow **`unieee-first-broker-login-link-only`** (chỉ liên kết vào tài khoản do Phòng Đào tạo cấp sẵn, tuyệt đối không tự tạo user mới). Xem hướng dẫn chi tiết tại [IDENTITY_BROKERING.md](../../infra/keycloak/IDENTITY_BROKERING.md).
+
+---
+
+## 6. Hệ thống Giám sát Production & Telemetry Benchmark (`compose.monitoring.yml`)
+
+Khởi chạy stack kèm Prometheus + Grafana ngay từ đầu (hoặc chạy thêm cờ `--monitoring` khi đang vận hành):
+
+```bash
+./scripts/unieee.sh up --monitoring
+# Chỉ tắt các container giám sát trong khi vẫn giữ hệ thống core hoạt động 24/7
+./scripts/unieee.sh down --monitoring-only
+```
+
+- **Truy cập Cục bộ (Loopback Only `127.0.0.1`):**
+  - **Prometheus (`http://127.0.0.1:9090`):** Tự động scrape `core-java` (`/actuator/prometheus`), 3 dịch vụ Rust (`/metrics`) cùng các exporter nội bộ (`nginx`, `postgres`, `pgbouncer`, `redis`, và `kafka` khi bật `hot-path`), đồng thời bật `--web.enable-remote-write-receiver` nhận luồng metrics thời gian thực từ `k6`.
+  - **Grafana (`http://127.0.0.1:3000`):** Tự động cấu hình datasource Prometheus và 2 dashboard sẵn có — **`unieee — Production Overview`** (`unieee-production-overview`) và **`unieee — k6 Load Benchmark`** (`unieee-k6-benchmark`). Hãy luôn đổi mật khẩu mặc định `GRAFANA_ADMIN_PASSWORD` trong `.env` (mẫu tại [.env.example](../../.env.example)).

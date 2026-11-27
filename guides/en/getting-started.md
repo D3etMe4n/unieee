@@ -17,22 +17,23 @@ This guide shows how to start the **unieee** stack locally, authenticate with Ke
 | **Docker + Compose** *(fallback)* | Docker Engine + Compose v2 | Selected automatically if Podman is absent, or forced via `--runtime docker`. |
 | **Java JDK** | Temurin / OpenJDK **25 (LTS)** | Required only if running `./gradlew check` outside containers. |
 | **Rust Toolchain** | Stable (`rustfmt`, `clippy`, `llvm-tools-preview`, `cargo-llvm-cov`) | Required only if running Cargo tests & coverage outside containers. |
-| **CLI utilities** | `bash`, `curl`, `jq`, `python3` | `python3` is used by `scripts/lib/lifecycle.sh`, `health.sh`, and `ci/check_coverage.py`. |
+| **CLI utilities** | `bash`, `curl`, `jq`, `python3` | `python3` is used by `scripts/lib/lifecycle.sh`, `health.sh`, `ci/check_coverage.py`, `tests/e2e/`, and `tests/load/`. |
+| **k6** *(optional)* | Grafana `k6` (`2.x`+) | Optional host CLI for load benchmarks ([run-benchmarks.sh](../../tests/load/run-benchmarks.sh)); falls back automatically to `grafana/k6` container. |
 
 ---
 
 ## 2. Starting & Checking the Stack
 
-Copy the environment template if you want to customize passwords, `INTERNAL_OPS_TOKEN`, or TLS settings:
+Copy the environment template if you want to customize passwords, `INTERNAL_OPS_TOKEN`, `GRAFANA_ADMIN_PASSWORD`, or TLS settings:
 
 ```bash
 cp .env.example .env
 ```
 
-Start the **core** profile (`postgres`, `pgbouncer`, `redis-master` + 2 replicas + 3 sentinels, `keycloak`, `reverse-proxy`, and `core-java`) using local self-signed HTTPS on port `8443`:
+Start the **core** profile (`postgres`, `pgbouncer`, `redis-master` + 2 replicas + 3 sentinels, `keycloak`, `reverse-proxy`, and `core-java`) using local self-signed HTTPS on port `8443` (optionally add `--monitoring` for loopback-only Prometheus `:9090` & Grafana `:3000`):
 
 ```bash
-./scripts/unieee.sh up
+./scripts/unieee.sh up --monitoring
 ./scripts/unieee.sh health
 ```
 
@@ -42,11 +43,12 @@ Useful lifecycle commands:
 # Force Docker instead of Podman
 ./scripts/unieee.sh --runtime docker up
 
-# Start core + Kafka + Rust Hot Path cluster (rebuild images when code changed)
-./scripts/unieee.sh up --hot-path --build
+# Start core + Kafka + Rust Hot Path + Monitoring (rebuild images when code changed)
+./scripts/unieee.sh up --hot-path --monitoring --build
 
-# Stop only hot-path containers while keeping core stack 24/7
+# Stop only hot-path or only monitoring containers while keeping core stack 24/7
 ./scripts/unieee.sh down --hot-path-only
+./scripts/unieee.sh down --monitoring-only
 
 # Stream logs from a specific service
 ./scripts/unieee.sh logs core-java --tail 100 -f
@@ -56,7 +58,7 @@ Useful lifecycle commands:
 ./scripts/unieee.sh down --volumes
 ```
 
-For full **registration-season lifecycle commands** (`prepare-registration`, `open-registration`, `close-registration`), see [Registration-Season Usage, Operations & Failover Guide](./operations-and-hotpath.md). For **Let's Encrypt** (`--tls-mode letsencrypt`) and **Cloudflare Tunnel** (`--tls-mode cloudflared`), see the [Root README](../../README.md).
+For full **registration-season lifecycle commands** (`prepare-registration`, `open-registration`, `close-registration`) and monitoring dashboards, see [Registration-Season Usage, Operations & Failover Guide](./operations-and-hotpath.md). For **Let's Encrypt** (`--tls-mode letsencrypt`) and **Cloudflare Tunnel** (`--tls-mode cloudflared`), see the [Root README](../../README.md). For running the **7-scenario E2E suite** (`./tests/e2e/run-e2e.sh`) and **k6 benchmarks** (`./tests/load/run-benchmarks.sh`), see [Implementation Roadmap & Testing](./roadmap-and-testing.md).
 
 ---
 

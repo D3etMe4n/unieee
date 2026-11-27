@@ -50,7 +50,7 @@ Toàn bộ HTTP API đi qua **Reverse Proxy** (`https://localhost:8443` ở ch�
 
 ---
 
-## 2. Warm / Cold Path (`services/core-java`, Phases 3–5, 10–11)
+## 2. Warm / Cold Path (`services/core-java` `1.0.0`)
 
 ### Xác thực & Chẩn đoán (`common`)
 
@@ -310,9 +310,10 @@ Các lệnh ghi & tra cứu status đi qua Nginx `/api/v1/enrollments/*` tới `
 | Service (Cổng) | Phương thức & Đường dẫn | Mục đích |
 | :--- | :--- | :--- |
 | `reverse-proxy` (`:80`/`:8088`/`:8443`) | `GET /proxy-health` | Trả về `200 OK` (`OK`) kiểm tra sức khỏe Reverse Proxy. |
-| `enrollment-engine` (`:8081`) | `GET /healthz` | Liveness probe (`status`, `service`, `role`, `epoch`). |
-| `enrollment-engine` (`:8081`) | `GET /readyz` | Readiness probe (`200` khi `READY`, `503` khi chưa sẵn sàng; trả `state`, `role`, `gateState`, `epoch`, `checkpointSeq`). |
+| `reverse-proxy` (`:8089` nội bộ) | `GET /stub_status` | Thống kê kết nối/request của Nginx chỉ mở cho `nginx-exporter` trong mạng nội bộ. |
+| `core-java` (`:8080`) | `GET /actuator/prometheus` | Endpoint scrape Prometheus của Micrometer (`unieee_read_cache_*`, `unieee_policy_*`, `unieee_admin_override_*`, `unieee_hot_delta_*`, `unieee_ai_advisor_*`, JVM/Hikari). |
+| `enrollment-engine` (`:8081`) | `GET /healthz`, `GET /readyz`, `GET /metrics` | Liveness, readiness (`state`, `role`, `gateState`, `epoch`, `checkpointSeq`) và Prometheus `/metrics` (`unieee_engine_*`). |
 | `enrollment-engine` (`:8081`) | `POST /internal/promote` | Thăng cấp Standby đang `READY` thành `ACTIVE` và tăng fencing `epoch` (`x-internal-ops-token`). |
 | `enrollment-engine` (`:8081`) | `GET /internal/preload-summary` | Trả về `PreloadSummarySnapshot` (`sectionCount`, `studentCount`, `totalMaxCapacity`, `totalEnrolledSeats`, `totalAvailableSeats`, `seatChecksumSha256`) để đối chiếu `RAM == PostgreSQL` (`x-internal-ops-token`). |
-| `enrollment-writer` (`:8082`) | `GET /healthz`, `GET /readyz` | Liveness & readiness probe của Writer (kèm `WriterMetricsSnapshot`). |
-| `sse-gateway` (`:8083`) | `GET /healthz`, `GET /readyz` | Liveness & readiness probe của SSE Gateway (kèm `SseMetricsSnapshot`). |
+| `enrollment-writer` (`:8082`) | `GET /healthz`, `GET /readyz`, `GET /metrics` | Liveness/readiness probe của Writer kèm Prometheus `/metrics` (`unieee_writer_*`). |
+| `sse-gateway` (`:8083`) | `GET /healthz`, `GET /readyz`, `GET /metrics` | Liveness/readiness probe của SSE Gateway kèm Prometheus `/metrics` (`unieee_sse_*`). |

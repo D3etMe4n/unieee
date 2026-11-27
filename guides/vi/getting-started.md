@@ -17,22 +17,23 @@ Tài liệu này hướng dẫn cách khởi động hệ thống **unieee** tr�
 | **Docker + Compose** *(fallback)* | Docker Engine + Compose v2 | Tự động chọn nếu không có Podman, hoặc ép buộc qua `--runtime docker`. |
 | **Java JDK** | Temurin / OpenJDK **25 (LTS)** | Cần khi chạy `./gradlew check` trực tiếp bên ngoài container. |
 | **Rust Toolchain** | Stable (`rustfmt`, `clippy`, `llvm-tools-preview`, `cargo-llvm-cov`) | Cần khi chạy `cargo test` và kiểm tra coverage bên ngoài container. |
-| **Tiện ích CLI** | `bash`, `curl`, `jq`, `python3` | `python3` được dùng bởi `scripts/lib/lifecycle.sh`, `health.sh` và `ci/check_coverage.py`. |
+| **Tiện ích CLI** | `bash`, `curl`, `jq`, `python3` | `python3` được dùng bởi `scripts/lib/lifecycle.sh`, `health.sh`, `ci/check_coverage.py`, `tests/e2e/` và `tests/load/`. |
+| **k6** *(tùy chọn)* | Grafana `k6` (`2.x`+) | CLI chạy benchmark tải ([run-benchmarks.sh](../../tests/load/run-benchmarks.sh)); tự fallback sang container `grafana/k6` nếu máy chưa cài. |
 
 ---
 
 ## 2. Khởi động & Kiểm tra Health Stack
 
-Sao chép file biến môi trường mẫu nếu bạn muốn tùy chỉnh mật khẩu, `INTERNAL_OPS_TOKEN` hoặc chế độ TLS:
+Sao chép file biến môi trường mẫu nếu bạn muốn tùy chỉnh mật khẩu, `INTERNAL_OPS_TOKEN`, `GRAFANA_ADMIN_PASSWORD` hoặc chế độ TLS:
 
 ```bash
 cp .env.example .env
 ```
 
-Khởi chạy profile **core** (`postgres`, `pgbouncer`, `redis-master` + 2 replicas + 3 sentinels, `keycloak`, `reverse-proxy` và `core-java`) với HTTPS self-signed trên cổng `8443`:
+Khởi chạy profile **core** (`postgres`, `pgbouncer`, `redis-master` + 2 replicas + 3 sentinels, `keycloak`, `reverse-proxy` và `core-java`) với HTTPS self-signed trên cổng `8443` (thêm `--monitoring` để bật kèm Prometheus `127.0.0.1:9090` & Grafana `127.0.0.1:3000`):
 
 ```bash
-./scripts/unieee.sh up
+./scripts/unieee.sh up --monitoring
 ./scripts/unieee.sh health
 ```
 
@@ -42,11 +43,12 @@ Các lệnh vận hành thường dùng:
 # Ép chạy bằng Docker thay vì Podman
 ./scripts/unieee.sh --runtime docker up
 
-# Khởi động core + Kafka + cụm Rust Hot Path (kèm rebuild image khi sửa code)
-./scripts/unieee.sh up --hot-path --build
+# Khởi động core + Kafka + cụm Rust Hot Path + Monitoring (kèm rebuild image khi sửa code)
+./scripts/unieee.sh up --hot-path --monitoring --build
 
-# Chỉ tắt các container hot-path trong khi giữ core chạy 24/7
+# Chỉ tắt hot-path hoặc chỉ tắt monitoring trong khi giữ core chạy 24/7
 ./scripts/unieee.sh down --hot-path-only
+./scripts/unieee.sh down --monitoring-only
 
 # Xem log của một service
 ./scripts/unieee.sh logs core-java --tail 100 -f
@@ -56,7 +58,7 @@ Các lệnh vận hành thường dùng:
 ./scripts/unieee.sh down --volumes
 ```
 
-Để vận hành trọn vẹn **vòng đời mùa đăng ký** (`prepare-registration`, `open-registration`, `close-registration`), xem [Hướng dẫn Sử dụng, Vận hành Mùa Đăng ký & Failover](./operations-and-hotpath.md). Để cấu hình **Let's Encrypt** (`--tls-mode letsencrypt`) hoặc **Cloudflare Tunnel** (`--tls-mode cloudflared`), xem thêm tại [README gốc](../../README.vi.md).
+Để vận hành trọn vẹn **vòng đời mùa đăng ký** (`prepare-registration`, `open-registration`, `close-registration`) và dashboard giám sát, xem [Hướng dẫn Sử dụng, Vận hành Mùa Đăng ký & Failover](./operations-and-hotpath.md). Để cấu hình **Let's Encrypt** hoặc **Cloudflare Tunnel**, xem [README gốc](../../README.vi.md). Để chạy **bộ kiểm thử E2E 7 kịch bản** (`./tests/e2e/run-e2e.sh`) và **benchmark k6** (`./tests/load/run-benchmarks.sh`), xem [Lộ trình 12 Phases & Chiến lược Kiểm thử](./roadmap-and-testing.md).
 
 ---
 

@@ -50,7 +50,7 @@ All HTTP endpoints are served behind the **Reverse Proxy** (`https://localhost:8
 
 ---
 
-## 2. Warm / Cold Path (`services/core-java`, Phases 3–5, 10–11)
+## 2. Warm / Cold Path (`services/core-java` `1.0.0`)
 
 ### Authentication & Diagnostics (`common`)
 
@@ -310,9 +310,10 @@ Routed via Nginx `/api/v1/sse/*` (`proxy_buffering off`, `gzip off`, `X-Accel-Bu
 | Service (Port) | Method & Path | Purpose |
 | :--- | :--- | :--- |
 | `reverse-proxy` (`:80`/`:8088`/`:8443`) | `GET /proxy-health` | Returns `200 OK` (`OK`) for Reverse Proxy health checks. |
-| `enrollment-engine` (`:8081`) | `GET /healthz` | Liveness probe (`status`, `service`, `role`, `epoch`). |
-| `enrollment-engine` (`:8081`) | `GET /readyz` | Readiness probe (`200` when `READY`, `503` otherwise; includes `state`, `role`, `gateState`, `epoch`, `checkpointSeq`). |
+| `reverse-proxy` (`:8089` internal only) | `GET /stub_status` | Nginx active connection/request counters scraped only by internal `nginx-exporter`. |
+| `core-java` (`:8080`) | `GET /actuator/prometheus` | Micrometer Prometheus scrape endpoint (`unieee_read_cache_*`, `unieee_policy_*`, `unieee_admin_override_*`, `unieee_hot_delta_*`, `unieee_ai_advisor_*`, JVM/Hikari metrics). |
+| `enrollment-engine` (`:8081`) | `GET /healthz`, `GET /readyz`, `GET /metrics` | Liveness, readiness (`state`, `role`, `gateState`, `epoch`, `checkpointSeq`), and Prometheus `/metrics` (`unieee_engine_*`). |
 | `enrollment-engine` (`:8081`) | `POST /internal/promote` | Promotes a `READY` Standby engine to `ACTIVE` and increments fencing `epoch` (`x-internal-ops-token`). |
 | `enrollment-engine` (`:8081`) | `GET /internal/preload-summary` | Returns `PreloadSummarySnapshot` (`sectionCount`, `studentCount`, `totalMaxCapacity`, `totalEnrolledSeats`, `totalAvailableSeats`, `seatChecksumSha256`) for `RAM == PostgreSQL` verification (`x-internal-ops-token`). |
-| `enrollment-writer` (`:8082`) | `GET /healthz`, `GET /readyz` | Writer liveness & readiness probes (includes `WriterMetricsSnapshot`). |
-| `sse-gateway` (`:8083`) | `GET /healthz`, `GET /readyz` | SSE gateway liveness & readiness probes (includes `SseMetricsSnapshot`). |
+| `enrollment-writer` (`:8082`) | `GET /healthz`, `GET /readyz`, `GET /metrics` | Writer liveness/readiness probes and Prometheus `/metrics` (`unieee_writer_*`). |
+| `sse-gateway` (`:8083`) | `GET /healthz`, `GET /readyz`, `GET /metrics` | SSE gateway liveness/readiness probes and Prometheus `/metrics` (`unieee_sse_*`). |
