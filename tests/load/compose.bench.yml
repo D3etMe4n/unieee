@@ -1,0 +1,22 @@
+name: unieee
+
+services:
+  reverse-proxy:
+    volumes:
+      - ../tests/load/nginx-bench.conf:/etc/nginx/nginx.conf:ro
+
+  core-java:
+    environment:
+      UNIEEE_RATE_LIMIT_ENABLED: "false"
+
+  enrollment-engine-active:
+    environment:
+      RATE_LIMIT_ENABLED: "false"
+
+  enrollment-engine-standby:
+    environment:
+      RATE_LIMIT_ENABLED: "false"
+
+  sse-gateway:
+    environment:
+      RATE_LIMIT_ENABLED: "false"
