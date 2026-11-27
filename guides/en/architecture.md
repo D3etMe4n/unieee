@@ -73,7 +73,7 @@ Each Bounded Context owns its PostgreSQL schema, with **zero cross-schema foreig
 ### Single-Writer Gate Guard
 While an academic term is in `REGISTRATION_OPEN`, the Rust Hot Path exclusively owns seat mutations in `catalog.course_sections` and `registration.enrollments`. Any Core Java admin mutation (`ADMIN_ADD`, `ADMIN_DROP`, `ADMIN_TRANSFER`) checks term status via `CatalogFacade` and fails immediately with **`409 Conflict` (`errorCode = "REGISTRATION_GATE_OPEN"`)**.
 
-### Multi-University Configurable Policy Engine (Phase 5)
+### Multi-University Configurable Policy Engine
 To support different university academic regulations without modifying core code, `EnrollmentPolicy` combines typed columns with extensible `extended_rules` (`JSONB`) evaluated by an ordered Strategy chain (`EnrollmentRuleEvaluator`):
 
 ```mermaid
@@ -90,7 +90,7 @@ Before opening registration, `PolicySnapshotExporter` compiles the active policy
 
 ---
 
-## 5. Rust Hot Path Cluster (`services/rust-enrollment/` — Phases 6–9, 11–12)
+## 5. Rust Hot Path Cluster (`services/rust-enrollment/`)
 
 ### Shared Workspace Crates (`crates/`)
 - **`unieee-domain`:** Strongly typed domain IDs (`TermId`, `StudentId`, `CourseId`, `SectionId`, `EventId`, `WindowId`), `RuleErrorCode`, unified RFC 9457 `ProblemDetail`, and `ScheduleBitmask` (`[u128; 20]` — 20 weeks x 112 bits) supporting `O(1)` bitwise overlap and buffer-gap checks verified against an interval oracle via `proptest`.
@@ -141,7 +141,7 @@ flowchart LR
 
 ---
 
-## 7. Production Observability Architecture (`infra/compose.monitoring.yml`, Phase 12)
+## 7. Production Observability Architecture (`infra/compose.monitoring.yml`)
 
 - **Instrumentation:** `core-java` exposes Micrometer `/actuator/prometheus` (`UnieeeMetrics` covering Redis Read-Through Cache hit/miss/fallback, Seat Overlay, Policy Engine, Admin Override, Hot Delta Sync, and AI Advisor); all 3 Rust services expose `/metrics` via `metrics-exporter-prometheus`.
 - **Internal Scraping & Network Isolation:** **Prometheus** (`127.0.0.1:9090`, `--web.enable-remote-write-receiver` for `k6`) scrapes internal-network targets over `app`/`data` (`core-java:8080`, `enrollment-engine-{active,standby}:8081`, `enrollment-writer:8082`, `sse-gateway:8083`, `nginx-exporter:9113` via Nginx `:8089 /stub_status`, `postgres-exporter:9187`, `pgbouncer-exporter:9127`, multi-target `redis-exporter:9121`, and `hot-path` `kafka-exporter:9308`). **PostgreSQL, PgBouncer, Redis, Kafka, and exporters publish zero host ports.**

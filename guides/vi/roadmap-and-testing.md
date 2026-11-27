@@ -1,27 +1,21 @@
-# Lộ trình 12 Phases & Chiến lược Kiểm thử
+# Lộ trình Dự án & Chiến lược Kiểm thử
 
 **Ngôn ngữ:** [English](../en/roadmap-and-testing.md) | **Tiếng Việt** | [Trung tâm Tài liệu](../README.vi.md)
 
-**unieee** được triển khai tuần tự qua **12 Phases**; mỗi phase phát triển trên một nhánh `feat/*` riêng và chỉ merge vào `dev` sau khi vượt qua kiểm thử và được duyệt Pull Request.
+Trang này cung cấp cái nhìn tổng quan về các cột mốc của dự án **unieee** (bản phát hành `1.0.0` và định hướng tương lai), đi kèm chiến lược kiểm thử, chính sách độ phủ phân tầng, bộ E2E/benchmark chịu tải và kiểm soát CI.
 
 ---
 
-## 1. Trạng thái Lộ trình 12 Phases
+## 1. Lộ trình Tổng quan Dự án
 
-| Phase | Nội dung chính | Trạng thái |
+| Hạng mục / Cột mốc | Năng lực Chính | Trạng thái |
 | :--- | :--- | :--- |
-| **Phase 1** | Cấu trúc monorepo, `.gitignore`, `.editorconfig`, tài liệu gốc | **Hoàn thành** (`dev`) |
-| **Phase 2** | Hạ tầng Podman/Docker Compose, PostgreSQL, PgBouncer, Redis HA (Sentinel), Keycloak, Reverse Proxy (3 chế độ TLS), CLI `scripts/unieee.sh` | **Hoàn thành** (`dev`) |
-| **Phase 3** | Nền tảng Spring Boot 4.1.3 + Java 25 Virtual Threads, Spring Modulith 2.1.2 Outbox & Cleanup Job, JWT Security, chuẩn lỗi thống nhất RFC 9457 `ProblemDetail`, JaCoCo CI | **Hoàn thành** (`dev`) |
-| **Phase 4** | Tổ chức 4 Bounded Contexts (`common`, `catalog`, `account`, `registration`), PostgreSQL schemas (`V002`–`V004`), cấp phát Keycloak, GPA trọng số tín chỉ, Admin Override + Single-Writer Gate Guard | **Hoàn thành** (`dev`) |
-| **Phase 5** | Khảo sát nguyện vọng (không giữ ghế), quản lý đợt đăng ký (`RegistrationWindow`), Policy Engine đa trường (6 rules), SHA-256 Policy Snapshot Exporter + Redis Read Cache (`V005`) | **Hoàn thành** (`dev`) |
-| **Phase 6** | Rust Cargo Workspace (`services/rust-enrollment/`), `unieee-domain` (Bitmask Engine + `proptest`), `unieee-events`, `unieee-cacheline` (`#[repr(align(64))]`) | **Hoàn thành** (`dev`) |
-| **Phase 7** | Rust `enrollment-engine` (Axum + Tokio, xác thực JWKS singleflight cục bộ, preload PostgreSQL + disk snapshots, CAS lock-free, Kafka producer, replay phục hồi theo epoch & Hot Delta Sync) | **Hoàn thành** (`dev`) |
-| **Phase 8** | Rust `enrollment-writer` (Kafka micro-batch consumer, SQL `UNNEST` + `CHECK`, producer `unieee.enrollment.outcomes` at-least-once kèm re-emit khi duplicate thay cho runtime outbox, đồng bộ Redis cache & SSE Pub/Sub) | **Hoàn thành** (`dev`) |
-| **Phase 9** | Rust `sse-gateway` (Redis Pub/Sub subscriber với sĩ số tuyệt đối, `tokio::sync::broadcast`, gộp 150ms, jitter `retry`/`maxAge` & resync chống lag) | **Hoàn thành** (`dev`) |
-| **Phase 10** | Module Spring AI 2.0.3 `ai_advisor` (4 `@Tool` chỉ đọc, Guardrails chống IDOR/prompt injection, kiểm chứng bằng `BitmaskConflictChecker` & fallback xác định) | **Hoàn thành** (`dev`) |
-| **Phase 11** | Hoàn thiện CLI vận hành (`prepare-registration`, `open-registration`, `close-registration` drain lag=0 cả `commands`+`outcomes`, đối soát 3 chiều & `warm-cache` cuối kỳ), `/api/v1/public/*` cache lock, Nginx tách `$enrollment_read_upstream` + `1s` `seats_cache`, `/internal/preload-summary` đối chiếu SHA-256, Active–Standby `/readyz` failover, `core-java` Redis Read-Through Cache, Keycloak link-only brokering & Hot Delta Sync | **Hoàn thành** (`dev`) |
-| **Phase 12** | Hạ tầng giám sát Prometheus + Grafana (`UnieeeMetrics` `/actuator/prometheus`, Rust `/metrics`, `compose.monitoring.yml`, dashboard dựng sẵn), tối ưu pipeline `try_join_all` Kafka outcomes & chunking không xung đột, khai báo Keycloak 26 Declarative User Profile, bộ kiểm thử E2E 7 kịch bản ([tests/e2e/](../../tests/e2e/run-e2e.sh)), bộ benchmark `k6` đa thiết bị ([tests/load/](../../tests/load/run-benchmarks.sh)) và chốt bản phát hành **`1.0.0`** | **Hoàn thành** (`1.0.0`) |
+| **Hạ tầng & Vận hành** | Stack Podman/Docker Compose (`core`, `hot-path`, `monitoring`), PostgreSQL 17 + PgBouncer, Redis 7.4 HA (Sentinel), Apache Kafka (KRaft), Keycloak 26.1 (OIDC + SSO brokering link-only), Nginx Reverse Proxy (3 chế độ TLS, cache lock, tách đọc/ghi, Active–Standby failover) và CLI vòng đời `scripts/unieee.sh` (`prepare-registration`, `open-registration`, `close-registration`). | **Đã phát hành (`1.0.0`)** |
+| **Nền tảng Học vụ & Policy Engine** | Spring Boot 4.1.3 + Java 25 Virtual Threads Modular Monolith (`catalog`, `account`, `registration`), phân tách PostgreSQL schema-per-bounded-context (`V001`–`V005`), Redis Read-Through Cache fail-open, GPA trọng số tín chỉ, khảo sát nguyện vọng không giữ ghế, đợt mở cổng nhiều giai đoạn, Policy Engine 6 quy tắc cấu hình đa trường kèm SHA-256 snapshot và Single-Writer Gate Guard. | **Đã phát hành (`1.0.0`)** |
+| **Cụm Rust Hot Path & Cập nhật SSE** | `enrollment-engine` xử lý trong RAM (`#[repr(align(64))]`, Bitmask 20 tuần, xác thực JWKS cục bộ, phục hồi disk snapshot không truy vấn PG, Hot Delta Sync), `enrollment-writer` ghi lô `UNNEST` chia chunk không xung đột kèm Kafka `unieee.enrollment.outcomes` an toàn khi crash, và `sse-gateway` phát biến động sĩ số/kết quả thời gian thực. | **Đã phát hành (`1.0.0`)** |
+| **Trợ lý AI Read-Only & Giám sát** | Spring AI 2.0.3 `ai_advisor` (4 `@Tool` chỉ đọc, guardrails chống IDOR/prompt injection, kiểm chứng Bitmask xác định & fallback offline), Micrometer `/actuator/prometheus`, Rust `/metrics` và Prometheus + Grafana auto-provision dashboard. | **Đã phát hành (`1.0.0`)** |
+| **Kiểm thử E2E & Benchmark Chịu tải** | Kiểm soát coverage phân tầng JaCoCo & `cargo-llvm-cov` trên CI, bộ E2E & Regression 7 kịch bản tự động ([tests/e2e/](../../tests/e2e/run-e2e.sh)) và bộ benchmark chịu tải + diễn tập chaos failover bằng `k6` đa thiết bị ([tests/load/](../../tests/load/run-benchmarks.sh)). | **Đã phát hành (`1.0.0`)** |
+| **Định hướng Tương lai** | Giao diện web frontend riêng cho Sinh viên, Giảng viên và Phòng Đào tạo; cấu hình triển khai đa máy chủ / hạ tầng managed bên ngoài; kiểm toán bảo mật độc lập trước khi áp dụng vào production. | **Dự kiến** |
 
 ---
 

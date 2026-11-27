@@ -1,27 +1,21 @@
-# Implementation Roadmap & Testing Strategy
+# Project Roadmap & Testing Strategy
 
 **Language:** **English** | [Tiếng Việt](../vi/roadmap-and-testing.md) | [Documentation Hub](../README.md)
 
-**unieee** is developed incrementally across **12 sequential phases**, where every phase is delivered on a `feat/*` branch and reviewed via Pull Request into `dev`.
+This page provides a high-level overview of **unieee**'s product milestones (`1.0.0` release and future directions), along with the project's testing strategy, coverage policy, automated E2E/load suites, and CI guardrails.
 
 ---
 
-## 1. 12-Phase Roadmap Status
+## 1. Project Roadmap Overview
 
-| Phase | Scope | Status |
+| Milestone / Area | Key Capabilities | Status |
 | :--- | :--- | :--- |
-| **Phase 1** | Monorepo layout, `.gitignore`, `.editorconfig`, root documentation | **Completed** (`dev`) |
-| **Phase 2** | Podman/Docker Compose infrastructure, PostgreSQL, PgBouncer, Redis HA (Sentinels), Keycloak, Reverse Proxy (3 TLS modes), `scripts/unieee.sh` | **Completed** (`dev`) |
-| **Phase 3** | Spring Boot 4.1.3 + Java 25 Virtual Threads foundation, Spring Modulith 2.1.2 Outbox & Cleanup Job, JWT Security, unified RFC 9457 `ProblemDetail`, JaCoCo CI | **Completed** (`dev`) |
-| **Phase 4** | DDD Bounded Contexts (`common`, `catalog`, `account`, `registration`), PostgreSQL schemas (`V002`–`V004`), Keycloak provisioning, credit-weighted GPA, Admin Overrides + Single-Writer Gate Guard | **Completed** (`dev`) |
-| **Phase 5** | Wish Surveys (non-seat-reserving), Registration Windows lifecycle, Multi-University Policy Engine (6 rules), SHA-256 Policy Snapshot Exporter + Redis Read Cache (`V005`) | **Completed** (`dev`) |
-| **Phase 6** | Rust Cargo Workspace (`services/rust-enrollment/`), `unieee-domain` (Bitmask Engine + `proptest`), `unieee-events`, `unieee-cacheline` (`#[repr(align(64))]`) | **Completed** (`dev`) |
-| **Phase 7** | Rust `enrollment-engine` (Axum + Tokio, local JWKS singleflight verify, PostgreSQL preload + disk snapshots, lock-free CAS, Kafka producer, epoch recovery replay & Hot Delta Sync) | **Completed** (`dev`) |
-| **Phase 8** | Rust `enrollment-writer` (Kafka micro-batch consumer, SQL `UNNEST` + `CHECK`, crash-safe at-least-once `unieee.enrollment.outcomes` Kafka producer + duplicate re-emit replacing runtime outbox, Redis cache sync & SSE Pub/Sub) | **Completed** (`dev`) |
-| **Phase 9** | Rust `sse-gateway` (Redis Pub/Sub subscriber with absolute seat counts, `tokio::sync::broadcast`, 150ms coalescing, jittered `retry`/`maxAge` & lag resync) | **Completed** (`dev`) |
-| **Phase 10** | Spring AI 2.0.3 `ai_advisor` module (4 Read-Only `@Tool` functions, anti-IDOR/prompt-injection guardrails, deterministic `BitmaskConflictChecker` & fallback) | **Completed** (`dev`) |
-| **Phase 11** | Operational Lifecycle CLI (`prepare-registration`, `open-registration`, `close-registration` Kafka `commands`+`outcomes` lag=0 drain, 3-way reconciliation & final `warm-cache`), `/api/v1/public/*` cache lock, Nginx `$enrollment_read_upstream` read/write split + `1s` `seats_cache`, `/internal/preload-summary` SHA-256 verification, Active–Standby `/readyz` failover, `core-java` Redis Read-Through Cache, Keycloak link-only brokering & Hot Delta Sync | **Completed** (`dev`) |
-| **Phase 12** | Prometheus + Grafana observability (`UnieeeMetrics` `/actuator/prometheus`, Rust `/metrics`, `compose.monitoring.yml`, dashboards), pipelined Kafka outcome publishing + conflict-free batch chunking, Keycloak 26 Declarative User Profile attributes, 7-scenario automated E2E Regression Suite ([tests/e2e/](../../tests/e2e/run-e2e.sh)), multi-device `k6` Load Benchmark Suite ([tests/load/](../../tests/load/run-benchmarks.sh)), and bilingual **`1.0.0`** release | **Completed** (`1.0.0`) |
+| **Infrastructure & Operations** | Podman/Docker Compose stacks (`core`, `hot-path`, `monitoring`), PostgreSQL 17 + PgBouncer, Redis 7.4 HA (Sentinels), Apache Kafka (KRaft), Keycloak 26.1 (OIDC + link-only SSO brokering), Nginx Reverse Proxy (3 TLS modes, cache lock, read/write split, Active–Standby failover), and `scripts/unieee.sh` lifecycle CLI (`prepare-registration`, `open-registration`, `close-registration`). | **Released (`1.0.0`)** |
+| **Core Academic Platform & Policy Engine** | Spring Boot 4.1.3 + Java 25 Virtual Threads Modular Monolith (`catalog`, `account`, `registration`), PostgreSQL schema-per-bounded-context (`V001`–`V005`), fail-open Redis Read-Through Cache, credit-weighted GPA, non-seat-reserving wish surveys, multi-wave registration windows, configurable 6-rule Policy Engine with SHA-256 snapshots, and Single-Writer Gate Guard. | **Released (`1.0.0`)** |
+| **Rust Hot Path & Live SSE Updates** | In-memory `enrollment-engine` (`#[repr(align(64))]`, 20-week Bitmask, local JWKS verify, zero-PG disk snapshot recovery, Hot Delta Sync), conflict-free chunked `UNNEST` `enrollment-writer` with crash-safe Kafka `unieee.enrollment.outcomes`, and `sse-gateway` real-time seat/outcome streaming. | **Released (`1.0.0`)** |
+| **Read-Only AI Advisor & Observability** | Spring AI 2.0.3 `ai_advisor` (4 read-only `@Tool` functions, anti-IDOR/prompt-injection guardrails, deterministic Bitmask verification & offline fallback), Micrometer `/actuator/prometheus`, Rust `/metrics`, and auto-provisioned Prometheus + Grafana dashboards. | **Released (`1.0.0`)** |
+| **Verification, E2E & Load Benchmarks** | Tiered JaCoCo & `cargo-llvm-cov` CI guardrails, automated 7-scenario E2E regression suite ([tests/e2e/](../../tests/e2e/run-e2e.sh)), and multi-device `k6` load & chaos failover benchmarks ([tests/load/](../../tests/load/run-benchmarks.sh)). | **Released (`1.0.0`)** |
+| **Future Directions** | Dedicated web frontend portals (Student, Lecturer, Academic Admin), multi-host / external managed cluster deployment profiles, and formal security auditing for production readiness. | **Planned** |
 
 ---
 
