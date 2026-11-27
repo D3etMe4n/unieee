@@ -179,7 +179,7 @@ where
     }
 }
 
-pub(crate) fn fnv_shard_index<K: Hash>(key: &K, shard_mask: usize) -> usize {
+pub(crate) fn fnv_shard_index<K: Hash + ?Sized>(key: &K, shard_mask: usize) -> usize {
     let mut hasher = FnvHasher::default();
     key.hash(&mut hasher);
     (hasher.finish() as usize) & shard_mask

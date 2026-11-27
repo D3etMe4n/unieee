@@ -7,7 +7,6 @@ import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
-import java.util.Optional;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -32,6 +31,9 @@ public class TokenBucketRateLimitFilter extends OncePerRequestFilter {
     private final UnieeeMetrics metrics;
     private final AntiBotVerificationHook antiBotHook;
     private final Clock clock;
+    private final TokenBucketPolicy publicCatalogPolicy;
+    private final TokenBucketPolicy aiAdvisorPolicy;
+    private final TokenBucketPolicy generalApiPolicy;
 
     public TokenBucketRateLimitFilter(
         RateLimitProperties properties,
@@ -47,6 +49,18 @@ public class TokenBucketRateLimitFilter extends OncePerRequestFilter {
         this.metrics = metrics;
         this.antiBotHook = antiBotHook;
         this.clock = clock;
+        this.publicCatalogPolicy = toPolicy(
+            RateLimitKeyResolver.BUCKET_PUBLIC_CATALOG,
+            properties.getPublicCatalog()
+        );
+        this.aiAdvisorPolicy = toPolicy(
+            RateLimitKeyResolver.BUCKET_AI_ADVISOR,
+            properties.getAiAdvisor()
+        );
+        this.generalApiPolicy = toPolicy(
+            RateLimitKeyResolver.BUCKET_GENERAL_API,
+            properties.getGeneralApi()
+        );
     }
 
     @Override
@@ -60,13 +74,13 @@ public class TokenBucketRateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
-        Optional<TokenBucketPolicy> maybePolicy = keyResolver.resolvePolicy(request.getRequestURI(), properties);
-        if (maybePolicy.isEmpty()) {
+        String requestUri = request.getRequestURI();
+        TokenBucketPolicy policy = resolveCachedPolicy(requestUri);
+        if (policy == null) {
             filterChain.doFilter(request, response);
             return;
         }
 
-        TokenBucketPolicy policy = maybePolicy.get();
         Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
         String identityKey = keyResolver.resolveIdentityKey(request, authentication);
         String bucketKey = policy.bucketName() + ":" + identityKey;
@@ -78,19 +92,36 @@ public class TokenBucketRateLimitFilter extends OncePerRequestFilter {
         if (!decision.allowed()) {
             metrics.recordRateLimit(SERVICE_NAME, policy.bucketName(), "rejected");
             response.setHeader(HttpHeaders.RETRY_AFTER, Long.toString(decision.retryAfterSeconds()));
-            writeTooManyRequestsProblem(response, request.getRequestURI(), policy.bucketName(), decision);
+            writeTooManyRequestsProblem(response, requestUri, policy.bucketName(), decision);
             return;
         }
 
         if (!antiBotHook.isChallengeSatisfied(request, policy.bucketName(), identityKey, decision)) {
             metrics.recordRateLimit(SERVICE_NAME, policy.bucketName(), "rejected");
             response.setHeader(HttpHeaders.RETRY_AFTER, "1");
-            writeChallengeRequiredProblem(response, request.getRequestURI());
+            writeChallengeRequiredProblem(response, requestUri);
             return;
         }
 
         metrics.recordRateLimit(SERVICE_NAME, policy.bucketName(), "allowed");
         filterChain.doFilter(request, response);
+    }
+
+    private TokenBucketPolicy resolveCachedPolicy(String requestUri) {
+        if (requestUri == null || !requestUri.startsWith("/api/v1/")) {
+            return null;
+        }
+        if (requestUri.equals("/api/v1/public") || requestUri.startsWith("/api/v1/public/")) {
+            return publicCatalogPolicy;
+        }
+        if (requestUri.equals("/api/v1/ai") || requestUri.startsWith("/api/v1/ai/")) {
+            return aiAdvisorPolicy;
+        }
+        return generalApiPolicy;
+    }
+
+    private static TokenBucketPolicy toPolicy(String bucketName, RateLimitProperties.BucketRule rule) {
+        return new TokenBucketPolicy(bucketName, rule.getCapacity(), rule.getRefillPerSecond());
     }
 
     private void writeTooManyRequestsProblem(

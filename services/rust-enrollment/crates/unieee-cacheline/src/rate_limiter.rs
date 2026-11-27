@@ -1,7 +1,9 @@
 use crate::padded::CachePadded;
 use crate::sharded::{fnv_shard_index, DEFAULT_NUM_SHARDS};
 use parking_lot::Mutex;
+use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::fmt::{self, Write as _};
 use std::hash::Hash;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -233,39 +235,58 @@ where
         let refill_milli = u128::from(self.policy.refill_milli_per_sec);
 
         let mut map = self.shards[idx].lock();
-        if !map.contains_key(&key) && map.len() >= self.max_entries_per_shard {
-            let idle_ttl_ns = self.idle_ttl_ns;
-            map.retain(|_, entry| now_ns.saturating_sub(entry.last_seen_ns) < idle_ttl_ns);
-            if map.len() >= self.max_entries_per_shard {
-                if let Some(oldest_key) = map
-                    .iter()
-                    .min_by_key(|(_, entry)| entry.last_seen_ns)
-                    .map(|(k, _)| k.clone())
-                {
-                    map.remove(&oldest_key);
-                }
-            }
+        if let Some(entry) = map.get_mut(&key) {
+            return consume_entry(entry, now_ns, self.policy.capacity, max_micro, refill_milli);
         }
-
+        evict_shard_if_full(
+            &mut map,
+            now_ns,
+            self.idle_ttl_ns,
+            self.max_entries_per_shard,
+        );
         let entry = map.entry(key).or_insert(BucketEntry {
             tokens_micro: max_micro,
             last_refill_ns: now_ns,
             last_seen_ns: now_ns,
         });
+        consume_entry(entry, now_ns, self.policy.capacity, max_micro, refill_milli)
+    }
 
-        refill_entry(entry, now_ns, max_micro, refill_milli);
-        entry.last_seen_ns = now_ns;
+    /// Zero-allocation fast-path token acquisition when the bucket key already exists in shard state.
+    pub fn try_acquire_ref<Q>(&self, key: &Q) -> RateLimitDecision
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
+    {
+        let now_ns = self.elapsed_ns();
+        self.try_acquire_ref_at(key, now_ns)
+    }
 
-        if entry.tokens_micro >= MICRO_PER_TOKEN {
-            entry.tokens_micro -= MICRO_PER_TOKEN;
-            let remaining = u32::try_from(entry.tokens_micro / MICRO_PER_TOKEN).unwrap_or(u32::MAX);
-            RateLimitDecision::allowed(self.policy.capacity, remaining)
-        } else {
-            let deficit_micro = MICRO_PER_TOKEN - entry.tokens_micro;
-            let denom = refill_milli * 1_000;
-            let retry_after = u64::try_from(deficit_micro.div_ceil(denom)).unwrap_or(u64::MAX);
-            RateLimitDecision::rejected(self.policy.capacity, retry_after.max(1))
+    pub fn try_acquire_ref_at<Q>(&self, key: &Q, now_ns: u64) -> RateLimitDecision
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
+    {
+        let idx = fnv_shard_index(key, self.shard_mask);
+        let max_micro = u128::from(self.policy.capacity) * MICRO_PER_TOKEN;
+        let refill_milli = u128::from(self.policy.refill_milli_per_sec);
+
+        let mut map = self.shards[idx].lock();
+        if let Some(entry) = map.get_mut(key) {
+            return consume_entry(entry, now_ns, self.policy.capacity, max_micro, refill_milli);
         }
+        evict_shard_if_full(
+            &mut map,
+            now_ns,
+            self.idle_ttl_ns,
+            self.max_entries_per_shard,
+        );
+        let entry = map.entry(key.to_owned()).or_insert(BucketEntry {
+            tokens_micro: max_micro,
+            last_refill_ns: now_ns,
+            last_seen_ns: now_ns,
+        });
+        consume_entry(entry, now_ns, self.policy.capacity, max_micro, refill_milli)
     }
 
     pub fn evict_idle(&self) -> usize {
@@ -285,6 +306,48 @@ where
 
     fn elapsed_ns(&self) -> u64 {
         u64::try_from(self.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+}
+
+fn evict_shard_if_full<K: Eq + Hash + Clone>(
+    map: &mut HashMap<K, BucketEntry>,
+    now_ns: u64,
+    idle_ttl_ns: u64,
+    max_entries_per_shard: usize,
+) {
+    if map.len() >= max_entries_per_shard {
+        map.retain(|_, entry| now_ns.saturating_sub(entry.last_seen_ns) < idle_ttl_ns);
+        if map.len() >= max_entries_per_shard {
+            if let Some(oldest_key) = map
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_seen_ns)
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest_key);
+            }
+        }
+    }
+}
+
+fn consume_entry(
+    entry: &mut BucketEntry,
+    now_ns: u64,
+    capacity: u32,
+    max_micro: u128,
+    refill_milli: u128,
+) -> RateLimitDecision {
+    refill_entry(entry, now_ns, max_micro, refill_milli);
+    entry.last_seen_ns = now_ns;
+
+    if entry.tokens_micro >= MICRO_PER_TOKEN {
+        entry.tokens_micro -= MICRO_PER_TOKEN;
+        let remaining = u32::try_from(entry.tokens_micro / MICRO_PER_TOKEN).unwrap_or(u32::MAX);
+        RateLimitDecision::allowed(capacity, remaining)
+    } else {
+        let deficit_micro = MICRO_PER_TOKEN - entry.tokens_micro;
+        let denom = refill_milli * 1_000;
+        let retry_after = u64::try_from(deficit_micro.div_ceil(denom)).unwrap_or(u64::MAX);
+        RateLimitDecision::rejected(capacity, retry_after.max(1))
     }
 }
 
@@ -323,15 +386,65 @@ pub fn resolve_identity_key(
     subject: &str,
     client_ip: Option<&str>,
 ) -> String {
+    with_identity_key(
+        student_id,
+        subject,
+        || client_ip.map(ToOwned::to_owned),
+        ToOwned::to_owned,
+    )
+}
+
+/// Evaluates `f` with a stack-formatted identity key when `<= 64` bytes (zero heap
+/// allocation for UUID `student_id` or typical `sub`), invoking `client_ip` lazily.
+pub fn with_identity_key<R>(
+    student_id: Option<StudentId>,
+    subject: &str,
+    client_ip: impl FnOnce() -> Option<String>,
+    f: impl FnOnce(&str) -> R,
+) -> R {
     if let Some(id) = student_id {
-        return format!("student:{id}");
+        return with_prefixed_key("student:", id, f);
     }
     let trimmed_sub = subject.trim();
     if !trimmed_sub.is_empty() {
-        return format!("sub:{trimmed_sub}");
+        return with_prefixed_key("sub:", trimmed_sub, f);
     }
-    if let Some(ip) = client_ip.map(str::trim).filter(|ip| !ip.is_empty()) {
-        return format!("ip:{ip}");
+    if let Some(raw_ip) = client_ip() {
+        let trimmed_ip = raw_ip.trim();
+        if !trimmed_ip.is_empty() {
+            return with_prefixed_key("ip:", trimmed_ip, f);
+        }
     }
-    "ip:unknown".to_owned()
+    f("ip:unknown")
+}
+
+struct StackKeyBuf {
+    bytes: [u8; 64],
+    len: usize,
+}
+
+impl fmt::Write for StackKeyBuf {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let src = s.as_bytes();
+        let next = self.len.checked_add(src.len()).ok_or(fmt::Error)?;
+        if next > self.bytes.len() {
+            return Err(fmt::Error);
+        }
+        self.bytes[self.len..next].copy_from_slice(src);
+        self.len = next;
+        Ok(())
+    }
+}
+
+fn with_prefixed_key<R>(prefix: &str, value: impl fmt::Display, f: impl FnOnce(&str) -> R) -> R {
+    let mut buf = StackKeyBuf {
+        bytes: [0u8; 64],
+        len: 0,
+    };
+    if buf.write_str(prefix).is_ok() && write!(buf, "{value}").is_ok() {
+        if let Ok(key) = std::str::from_utf8(&buf.bytes[..buf.len]) {
+            return f(key);
+        }
+    }
+    f(&format!("{prefix}{value}"))
 }

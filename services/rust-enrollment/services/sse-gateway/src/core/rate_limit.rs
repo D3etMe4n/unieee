@@ -4,7 +4,8 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::debug;
 use unieee_cacheline::{
-    resolve_identity_key, RateLimitDecision, ShardedTokenBucket, TokenBucketPolicy,
+    resolve_identity_key, with_identity_key, RateLimitDecision, ShardedTokenBucket,
+    TokenBucketPolicy,
 };
 use unieee_domain::StudentId;
 
@@ -76,12 +77,31 @@ impl SseRateLimiter {
 
     pub fn check_connect(&self, identity_key: &str) -> RateLimitDecision {
         if !self.enabled {
-            return RateLimitDecision::allowed(
-                self.connect_bucket.policy().capacity,
-                self.connect_bucket.policy().capacity,
-            );
+            let cap = self.connect_bucket.policy().capacity;
+            return RateLimitDecision::allowed(cap, cap);
         }
-        let decision = self.connect_bucket.try_acquire(identity_key.to_owned());
+        Self::record_decision(self.connect_bucket.try_acquire_ref(identity_key))
+    }
+
+    pub fn check_connect_identity<F>(
+        &self,
+        student_id: Option<StudentId>,
+        subject: &str,
+        client_ip: F,
+    ) -> RateLimitDecision
+    where
+        F: FnOnce() -> Option<String>,
+    {
+        if !self.enabled {
+            let cap = self.connect_bucket.policy().capacity;
+            return RateLimitDecision::allowed(cap, cap);
+        }
+        with_identity_key(student_id, subject, client_ip, |key| {
+            Self::record_decision(self.connect_bucket.try_acquire_ref(key))
+        })
+    }
+
+    fn record_decision(decision: RateLimitDecision) -> RateLimitDecision {
         metrics::counter!(
             "unieee_sse_rate_limit_total",
             "bucket" => "connect",

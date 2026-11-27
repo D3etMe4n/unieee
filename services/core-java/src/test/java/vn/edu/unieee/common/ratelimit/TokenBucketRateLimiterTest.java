@@ -218,6 +218,12 @@ class TokenBucketRateLimiterTest {
         clock.advance(Duration.ofSeconds(10));
         new RateLimitConfig.RateLimitBucketSweeper(limiter).evictIdleBuckets();
         assertThat(limiter.activeBucketCount()).isZero();
+
+        // System UTC clock uses monotonic System.nanoTime() fast path
+        TokenBucketRateLimiter monoLimiter = new TokenBucketRateLimiter(Duration.ofMinutes(1), 8, Clock.systemUTC());
+        TokenBucketPolicy fastPolicy = new TokenBucketPolicy("general_api", 2, 1.0);
+        assertThat(monoLimiter.tryConsume("mono:1", fastPolicy).allowed()).isTrue();
+        assertThat(monoLimiter.tryConsume("mono:1", fastPolicy).remaining()).isZero();
     }
 
     private static JwtAuthenticationToken jwtAuth(

@@ -6,8 +6,8 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 use unieee_cacheline::{
-    resolve_identity_key, CachePadded, RateLimitDecision, RateLimiterConfigError,
-    ShardedTokenBucket, TokenBucketPolicy, CACHE_LINE_SIZE,
+    resolve_identity_key, with_identity_key, CachePadded, RateLimitDecision,
+    RateLimiterConfigError, ShardedTokenBucket, TokenBucketPolicy, CACHE_LINE_SIZE,
 };
 use unieee_domain::StudentId;
 
@@ -198,4 +198,41 @@ fn resolve_identity_key_prioritizes_student_id_then_sub_then_ip() {
         "ip:203.0.113.5"
     );
     assert_eq!(resolve_identity_key(None, "", Some("  ")), "ip:unknown");
+
+    // Stack-buffered fast path keeps lazy closure unevaluated on JWT hits and falls back on long keys
+    let mut ip_called = false;
+    let stack_key = with_identity_key(
+        Some(sid),
+        "sub-ignored",
+        || {
+            ip_called = true;
+            Some("10.0.0.2".to_owned())
+        },
+        ToOwned::to_owned,
+    );
+    assert!(!ip_called);
+    assert_eq!(stack_key, format!("student:{sid}"));
+
+    let long_sub = "s".repeat(80);
+    let heap_key = with_identity_key(None, &long_sub, || None, ToOwned::to_owned);
+    assert_eq!(heap_key, format!("sub:{long_sub}"));
+}
+
+#[test]
+fn try_acquire_ref_avoids_miss_alloc_on_repeat_hits_and_evicts_at_shard_cap() {
+    let policy = TokenBucketPolicy::from_milli_rate(2, 1000).unwrap();
+    let bucket =
+        ShardedTokenBucket::<String>::with_shard_count(1, policy, Duration::from_secs(30), 2)
+            .expect("valid limiter");
+
+    let first = bucket.try_acquire_ref("student:alpha");
+    assert_eq!(first, RateLimitDecision::allowed(2, 1));
+    let hit = bucket.try_acquire_ref_at("student:alpha", 0);
+    assert_eq!(hit, RateLimitDecision::allowed(2, 0));
+    let rejected = bucket.try_acquire_ref_at("student:alpha", 0);
+    assert!(!rejected.allowed);
+
+    assert!(bucket.try_acquire_ref_at("student:beta", 10).allowed);
+    assert!(bucket.try_acquire_ref_at("student:gamma", 20).allowed);
+    assert_eq!(bucket.len(), 2);
 }

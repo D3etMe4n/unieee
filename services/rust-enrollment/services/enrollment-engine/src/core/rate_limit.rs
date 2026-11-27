@@ -4,7 +4,8 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::debug;
 use unieee_cacheline::{
-    resolve_identity_key, RateLimitDecision, ShardedTokenBucket, TokenBucketPolicy,
+    resolve_identity_key, with_identity_key, RateLimitDecision, ShardedTokenBucket,
+    TokenBucketPolicy,
 };
 use unieee_domain::StudentId;
 
@@ -86,33 +87,85 @@ impl EngineRateLimiter {
     }
 
     pub fn check_write(&self, identity_key: &str) -> RateLimitDecision {
-        if !self.enabled {
-            return RateLimitDecision::allowed(
-                self.write_bucket.policy().capacity,
-                self.write_bucket.policy().capacity,
-            );
-        }
-        let decision = self.write_bucket.try_acquire(identity_key.to_owned());
-        metrics::counter!(
-            "unieee_engine_rate_limit_total",
-            "bucket" => "write",
-            "result" => if decision.allowed { "allowed" } else { "rejected" }
-        )
-        .increment(1);
-        decision
+        Self::eval_bucket_key(self.enabled, &self.write_bucket, "write", identity_key)
     }
 
     pub fn check_read(&self, identity_key: &str) -> RateLimitDecision {
-        if !self.enabled {
-            return RateLimitDecision::allowed(
-                self.read_bucket.policy().capacity,
-                self.read_bucket.policy().capacity,
-            );
+        Self::eval_bucket_key(self.enabled, &self.read_bucket, "read", identity_key)
+    }
+
+    pub fn check_write_identity<F>(
+        &self,
+        student_id: Option<StudentId>,
+        subject: &str,
+        client_ip: F,
+    ) -> RateLimitDecision
+    where
+        F: FnOnce() -> Option<String>,
+    {
+        Self::eval_identity(
+            self.enabled,
+            &self.write_bucket,
+            "write",
+            student_id,
+            subject,
+            client_ip,
+        )
+    }
+
+    pub fn check_read_identity<F>(
+        &self,
+        student_id: Option<StudentId>,
+        subject: &str,
+        client_ip: F,
+    ) -> RateLimitDecision
+    where
+        F: FnOnce() -> Option<String>,
+    {
+        Self::eval_identity(
+            self.enabled,
+            &self.read_bucket,
+            "read",
+            student_id,
+            subject,
+            client_ip,
+        )
+    }
+
+    fn eval_identity<F>(
+        enabled: bool,
+        bucket: &ShardedTokenBucket<String>,
+        bucket_label: &'static str,
+        student_id: Option<StudentId>,
+        subject: &str,
+        client_ip: F,
+    ) -> RateLimitDecision
+    where
+        F: FnOnce() -> Option<String>,
+    {
+        if !enabled {
+            let cap = bucket.policy().capacity;
+            return RateLimitDecision::allowed(cap, cap);
         }
-        let decision = self.read_bucket.try_acquire(identity_key.to_owned());
+        with_identity_key(student_id, subject, client_ip, |key| {
+            Self::eval_bucket_key(enabled, bucket, bucket_label, key)
+        })
+    }
+
+    fn eval_bucket_key(
+        enabled: bool,
+        bucket: &ShardedTokenBucket<String>,
+        bucket_label: &'static str,
+        identity_key: &str,
+    ) -> RateLimitDecision {
+        if !enabled {
+            let cap = bucket.policy().capacity;
+            return RateLimitDecision::allowed(cap, cap);
+        }
+        let decision = bucket.try_acquire_ref(identity_key);
         metrics::counter!(
             "unieee_engine_rate_limit_total",
-            "bucket" => "read",
+            "bucket" => bucket_label,
             "result" => if decision.allowed { "allowed" } else { "rejected" }
         )
         .increment(1);

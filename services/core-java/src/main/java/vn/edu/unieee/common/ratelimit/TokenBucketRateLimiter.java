@@ -17,7 +17,9 @@ public class TokenBucketRateLimiter {
     private static final long MICRO_PER_TOKEN = 1_000_000L;
 
     private final Clock clock;
+    private final boolean useSystemNanoTime;
     private final Instant baseInstant;
+    private final long baseNanoTime;
     private final long idleTtlNanos;
     private final int maxBuckets;
     private final ConcurrentHashMap<String, BucketState> buckets = new ConcurrentHashMap<>();
@@ -38,7 +40,9 @@ public class TokenBucketRateLimiter {
             throw new IllegalArgumentException("maxBuckets must be >= 1");
         }
         this.clock = Objects.requireNonNull(clock, "clock must not be null");
-        this.baseInstant = clock.instant();
+        this.useSystemNanoTime = Clock.systemUTC().equals(clock);
+        this.baseInstant = useSystemNanoTime ? Instant.EPOCH : clock.instant();
+        this.baseNanoTime = useSystemNanoTime ? System.nanoTime() : 0L;
         this.idleTtlNanos = idleTtl.toNanos();
         this.maxBuckets = maxBuckets;
     }
@@ -50,17 +54,19 @@ public class TokenBucketRateLimiter {
         Objects.requireNonNull(policy, "policy must not be null");
 
         long nowNanos = currentNanos();
-        if (!buckets.containsKey(key) && buckets.size() >= maxBuckets) {
-            evictIdleAt(nowNanos);
-            if (buckets.size() >= maxBuckets) {
-                evictOldest(Math.max(1, maxBuckets / 100));
-            }
-        }
-
         long maxMicro = (long) policy.capacity() * MICRO_PER_TOKEN;
         long refillMilliPerSec = Math.max(1L, Math.round(policy.refillPerSecond() * 1000.0));
 
-        BucketState state = buckets.computeIfAbsent(key, ignored -> new BucketState(maxMicro, nowNanos));
+        BucketState state = buckets.get(key);
+        if (state == null) {
+            if (buckets.size() >= maxBuckets) {
+                evictIdleAt(nowNanos);
+                if (buckets.size() >= maxBuckets) {
+                    evictOldest(Math.max(1, maxBuckets / 100));
+                }
+            }
+            state = buckets.computeIfAbsent(key, ignored -> new BucketState(maxMicro, nowNanos));
+        }
         synchronized (state) {
             refill(state, nowNanos, maxMicro, refillMilliPerSec);
             state.lastAccessNanos = nowNanos;
@@ -164,6 +170,9 @@ public class TokenBucketRateLimiter {
     }
 
     private long currentNanos() {
+        if (useSystemNanoTime) {
+            return Math.max(0L, System.nanoTime() - baseNanoTime);
+        }
         return Math.max(0L, Duration.between(baseInstant, clock.instant()).toNanos());
     }
 

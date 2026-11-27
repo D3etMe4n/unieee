@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 use unieee_cacheline::RateLimitDecision;
-use unieee_domain::{EventId, SectionId, TermId};
+use unieee_domain::{EventId, SectionId, StudentId, TermId};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -91,25 +91,19 @@ pub async fn register_handler(
     if !claims.has_role("STUDENT") {
         return Err(ApiError::from(AuthError::Forbidden).with_instance(instance));
     }
-    let resolved_student = claims
-        .student_id_claim
-        .or_else(|| state.engine.resolve_student_id(&claims.sub, None).ok());
-    let rl_key = EngineRateLimiter::resolve_key(
-        resolved_student,
-        &claims.sub,
-        extract_client_ip(&headers).as_deref(),
-    );
-    let decision = state.rate_limiter.check_write(&rl_key);
+    let resolved_student = resolve_student_hint(&state, &claims);
+    let decision = state
+        .rate_limiter
+        .check_write_identity(resolved_student, &claims.sub, || {
+            extract_client_ip(&headers)
+        });
     if !decision.allowed {
         return Err(ApiError::rate_limited("write", decision, instance));
     }
 
     let idempotency_key = extract_idempotency_key(&headers, instance)?;
     validate_positive_section_id(req.section_id, instance)?;
-    let student_id = state
-        .engine
-        .resolve_student_id(&claims.sub, claims.student_id_claim)
-        .map_err(|err| ApiError::from(err).with_instance(instance))?;
+    let student_id = resolve_required_student(&state, &claims, resolved_student, instance)?;
     let accepted = state
         .engine
         .register_with_idempotency(
@@ -157,25 +151,19 @@ pub async fn drop_handler(
     if !claims.has_role("STUDENT") {
         return Err(ApiError::from(AuthError::Forbidden).with_instance(instance));
     }
-    let resolved_student = claims
-        .student_id_claim
-        .or_else(|| state.engine.resolve_student_id(&claims.sub, None).ok());
-    let rl_key = EngineRateLimiter::resolve_key(
-        resolved_student,
-        &claims.sub,
-        extract_client_ip(&headers).as_deref(),
-    );
-    let decision = state.rate_limiter.check_write(&rl_key);
+    let resolved_student = resolve_student_hint(&state, &claims);
+    let decision = state
+        .rate_limiter
+        .check_write_identity(resolved_student, &claims.sub, || {
+            extract_client_ip(&headers)
+        });
     if !decision.allowed {
         return Err(ApiError::rate_limited("write", decision, instance));
     }
 
     let idempotency_key = extract_idempotency_key(&headers, instance)?;
     validate_positive_section_id(req.section_id, instance)?;
-    let student_id = state
-        .engine
-        .resolve_student_id(&claims.sub, claims.student_id_claim)
-        .map_err(|err| ApiError::from(err).with_instance(instance))?;
+    let student_id = resolve_required_student(&state, &claims, resolved_student, instance)?;
     let accepted = state
         .engine
         .drop_section_with_idempotency(
@@ -224,15 +212,12 @@ pub async fn get_status_handler(
         return Err(ApiError::from(AuthError::Forbidden).with_instance(instance));
     }
 
-    let resolved_student = claims
-        .student_id_claim
-        .or_else(|| state.engine.resolve_student_id(&claims.sub, None).ok());
-    let rl_key = EngineRateLimiter::resolve_key(
-        resolved_student,
-        &claims.sub,
-        extract_client_ip(&headers).as_deref(),
-    );
-    let decision = state.rate_limiter.check_read(&rl_key);
+    let resolved_student = resolve_student_hint(&state, &claims);
+    let decision = state
+        .rate_limiter
+        .check_read_identity(resolved_student, &claims.sub, || {
+            extract_client_ip(&headers)
+        });
     if !decision.allowed {
         return Err(ApiError::rate_limited("read", decision, instance));
     }
@@ -246,12 +231,12 @@ pub async fn get_status_handler(
     })?;
 
     let caller_student_id = if !is_admin {
-        Some(
-            state
-                .engine
-                .resolve_student_id(&claims.sub, claims.student_id_claim)
-                .map_err(|err| ApiError::from(err).with_instance(instance))?,
-        )
+        Some(resolve_required_student(
+            &state,
+            &claims,
+            resolved_student,
+            instance,
+        )?)
     } else {
         None
     };
@@ -309,15 +294,12 @@ pub async fn get_seats_handler(
     {
         return Err(ApiError::from(AuthError::Forbidden).with_instance(instance));
     }
-    let resolved_student = claims
-        .student_id_claim
-        .or_else(|| state.engine.resolve_student_id(&claims.sub, None).ok());
-    let rl_key = EngineRateLimiter::resolve_key(
-        resolved_student,
-        &claims.sub,
-        extract_client_ip(&headers).as_deref(),
-    );
-    let decision = state.rate_limiter.check_read(&rl_key);
+    let resolved_student = resolve_student_hint(&state, &claims);
+    let decision = state
+        .rate_limiter
+        .check_read_identity(resolved_student, &claims.sub, || {
+            extract_client_ip(&headers)
+        });
     if !decision.allowed {
         return Err(ApiError::rate_limited("read", decision, instance));
     }
@@ -357,24 +339,18 @@ pub async fn get_my_enrollments_handler(
     if !claims.has_role("STUDENT") {
         return Err(ApiError::from(AuthError::Forbidden).with_instance(instance));
     }
-    let resolved_student = claims
-        .student_id_claim
-        .or_else(|| state.engine.resolve_student_id(&claims.sub, None).ok());
-    let rl_key = EngineRateLimiter::resolve_key(
-        resolved_student,
-        &claims.sub,
-        extract_client_ip(&headers).as_deref(),
-    );
-    let decision = state.rate_limiter.check_read(&rl_key);
+    let resolved_student = resolve_student_hint(&state, &claims);
+    let decision = state
+        .rate_limiter
+        .check_read_identity(resolved_student, &claims.sub, || {
+            extract_client_ip(&headers)
+        });
     if !decision.allowed {
         return Err(ApiError::rate_limited("read", decision, instance));
     }
 
     let term_id = parse_required_term_id(&params, instance)?;
-    let student_id = state
-        .engine
-        .resolve_student_id(&claims.sub, claims.student_id_claim)
-        .map_err(|err| ApiError::from(err).with_instance(instance))?;
+    let student_id = resolve_required_student(&state, &claims, resolved_student, instance)?;
     let view = state
         .engine
         .get_student_enrollments(term_id, student_id)
@@ -580,6 +556,30 @@ fn extract_client_ip(headers: &HeaderMap) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn resolve_student_hint(state: &AppState, claims: &VerifiedClaims) -> Option<StudentId> {
+    if !state.rate_limiter.is_enabled() {
+        return claims.student_id_claim;
+    }
+    claims
+        .student_id_claim
+        .or_else(|| state.engine.resolve_student_id(&claims.sub, None).ok())
+}
+
+fn resolve_required_student(
+    state: &AppState,
+    claims: &VerifiedClaims,
+    resolved: Option<StudentId>,
+    instance: &str,
+) -> Result<StudentId, ApiError> {
+    match resolved {
+        Some(id) => Ok(id),
+        None => state
+            .engine
+            .resolve_student_id(&claims.sub, claims.student_id_claim)
+            .map_err(|err| ApiError::from(err).with_instance(instance)),
+    }
 }
 
 fn attach_rate_limit_headers(

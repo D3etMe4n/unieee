@@ -157,12 +157,11 @@ pub async fn me_sse_handler(
     let student_id = claims
         .student_id_claim
         .ok_or_else(|| ApiError::from(AuthError::MissingStudentIdClaim).with_instance(instance))?;
-    let rl_key = SseRateLimiter::resolve_key(
-        Some(student_id),
-        &claims.sub,
-        extract_client_ip(&headers).as_deref(),
-    );
-    let decision = state.rate_limiter.check_connect(&rl_key);
+    let decision = state
+        .rate_limiter
+        .check_connect_identity(Some(student_id), &claims.sub, || {
+            extract_client_ip(&headers)
+        });
     if !decision.allowed {
         return Err(ApiError::rate_limited("connect", decision, instance));
     }
@@ -207,12 +206,12 @@ fn open_sections_stream(
     if !claims.has_any_role(&ALLOWED_SECTION_STREAM_ROLES) {
         return Err(ApiError::from(AuthError::Forbidden).with_instance(instance));
     }
-    let rl_key = SseRateLimiter::resolve_key(
-        claims.student_id_claim,
-        &claims.sub,
-        extract_client_ip(headers).as_deref(),
-    );
-    let decision = state.rate_limiter.check_connect(&rl_key);
+    let decision =
+        state
+            .rate_limiter
+            .check_connect_identity(claims.student_id_claim, &claims.sub, || {
+                extract_client_ip(headers)
+            });
     if !decision.allowed {
         return Err(ApiError::rate_limited("connect", decision, instance));
     }

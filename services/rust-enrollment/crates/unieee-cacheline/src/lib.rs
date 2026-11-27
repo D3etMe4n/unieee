@@ -10,8 +10,8 @@ pub mod sharded;
 
 pub use padded::{CachePadded, CACHE_LINE_SIZE};
 pub use rate_limiter::{
-    resolve_identity_key, RateLimitDecision, RateLimiterConfigError, ShardedTokenBucket,
-    TokenBucketPolicy,
+    resolve_identity_key, with_identity_key, RateLimitDecision, RateLimiterConfigError,
+    ShardedTokenBucket, TokenBucketPolicy,
 };
 pub use seat_slot::{
     SeatOpError, SeatRelease, SeatReservation, SeatSlotTable, SeatSnapshot, SeatTableError,
