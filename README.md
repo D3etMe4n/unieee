@@ -28,7 +28,7 @@ Public guides for repository visitors, operators, and contributors live under `g
 - [Registration-Season Usage, Operations & Failover](./guides/en/operations-and-hotpath.md) — `prepare-registration`, `open-registration` (24/7 multi-window), `close-registration` (Kafka drain & 3-way reconciliation), Hot Delta Sync, student `curl` Hot Path + SSE + AI Advisor walkthroughs, LLM configuration, and Active–Standby failover.
 - [System Architecture & Database Design](./guides/en/architecture.md) — Hybrid Warm/Hot Path, 4 Bounded Contexts + `common` DAG (`catalog`, `account`, `registration`, `ai_advisor`), PostgreSQL schemas (`V001`–`V005`), Policy Engine, Rust Hot Path cluster, Kafka/Redis event backbone, and observability topology.
 - [REST API Reference](./guides/en/api-reference.md) — JWT & public catalog auth rules, RBAC roles, unified RFC 9457 Problem Details, all `core-java` APIs (`/api/v1/public/*`, `warm-cache`, `ai_advisor`), Rust `enrollment-engine` & `sse-gateway` APIs, and internal ops & Prometheus metrics probes.
-- [Implementation Roadmap & Testing](./guides/en/roadmap-and-testing.md) — 12-phase delivery status (all 12 phases completed, **`1.0.0`** release), tiered JaCoCo & `cargo-llvm-cov` coverage policy (`>= 90%` core, `>= 65%` edge), 7-scenario E2E regression suite ([run-e2e.sh](./tests/e2e/run-e2e.sh)), multi-device `k6` benchmarks ([run-benchmarks.sh](./tests/load/run-benchmarks.sh)), and 3-job CI guardrails.
+- [Project Roadmap & Testing](./guides/en/roadmap-and-testing.md) — high-level project roadmap (`1.0.0` milestones & future directions), tiered JaCoCo & `cargo-llvm-cov` coverage policy (`>= 90%` core, `>= 65%` edge), 7-scenario E2E regression suite ([run-e2e.sh](./tests/e2e/run-e2e.sh)), multi-device `k6` benchmarks ([run-benchmarks.sh](./tests/load/run-benchmarks.sh)), and 3-job CI guardrails.
 - [Keycloak Registration-Season Tuning & Identity Brokering](./infra/keycloak/IDENTITY_BROKERING.md) — token refresh jitter (`0.70–0.85`), Declarative User Profile attributes, and link-only Microsoft Entra ID / Google Workspace SSO setup.
 
 ---
@@ -51,9 +51,9 @@ Public guides for repository visitors, operators, and contributors live under `g
 
 ---
 
-## Implementation Status (`1.0.0`)
+## Release Overview (`1.0.0`)
 
-**All 12 Phases are complete (`1.0.0` release: `core-java` `1.0.0`, `rust-enrollment` `1.0.0`)** — covering container infrastructure & TLS automation, Spring Boot 4.1.3 Modulith core with fail-open Redis Read-Through Cache, `catalog`/`account`/`registration`/`ai_advisor` bounded contexts (`V001`–`V005`), Rust Hot Path cluster (`enrollment-engine`, `enrollment-writer`, `sse-gateway`) with pipelined Kafka `unieee.enrollment.outcomes`, Hot Delta Sync, Nginx read/write split + Active–Standby failover, Keycloak User Profile & brokering, Prometheus + Grafana observability, automated 7-scenario E2E regression tests (`tests/e2e/`), and multi-device multi-scenario `k6` load benchmarks (`tests/load/`) proving **`0` overbooking, `0` schedule conflicts, and `0|0|0` reconciliation** under both steady-state flash crowds and Active–Standby failover drills. See [Implementation Roadmap & Testing](./guides/en/roadmap-and-testing.md).
+**Release `1.0.0` (`core-java` `1.0.0`, `rust-enrollment` `1.0.0`)** delivers the full end-to-end platform — covering container infrastructure & TLS automation, Spring Boot 4.1.3 Modulith core with fail-open Redis Read-Through Cache, `catalog`/`account`/`registration`/`ai_advisor` bounded contexts (`V001`–`V005`), Rust Hot Path cluster (`enrollment-engine`, `enrollment-writer`, `sse-gateway`) with pipelined Kafka `unieee.enrollment.outcomes`, Hot Delta Sync, Nginx read/write split + Active–Standby failover, Keycloak User Profile & brokering, Prometheus + Grafana observability, automated 7-scenario E2E regression tests (`tests/e2e/`), and multi-device multi-scenario `k6` load benchmarks (`tests/load/`) proving **`0` overbooking, `0` schedule conflicts, and `0|0|0` reconciliation** under both steady-state flash crowds and Active–Standby failover drills. See [Project Roadmap & Testing](./guides/en/roadmap-and-testing.md).
 
 ---
 
@@ -210,10 +210,10 @@ For full operator and student `curl` walkthroughs, AI Advisor setup, and Active�
 
 ## Contributing (Git Workflow)
 
-1. Always start each phase from the latest `dev` branch: `git checkout dev && git pull`.
-2. Create a dedicated feature branch per phase following `feat/<feature-name>`.
+1. Always start from the latest `dev` branch: `git checkout dev && git pull`.
+2. Create a dedicated branch following `feat/<feature-name>`, `fix/<issue-name>`, or `docs/<topic>`.
 3. Make clean **atomic commits** using **Conventional Commits** (`feat`, `fix`, `perf`, `refactor`, `test`, `chore`, `docs`).
-4. Once deliverables and tests pass, open a **Pull Request into `dev`** for review; **never self-approve or self-merge a PR** without explicit approval.
+4. Once changes and tests pass, open a **Pull Request into `dev`** for review; **never self-approve or self-merge a PR** without explicit approval.
 
 ---
 

@@ -69,7 +69,7 @@ Mỗi Bounded Context sở hữu schema PostgreSQL riêng, **tuyệt đối khô
 ### Chốt chặn Single-Writer Gate Guard
 Khi học kỳ ở trạng thái `REGISTRATION_OPEN`, cụm Rust Hot Path nắm độc quyền ghi vào `catalog.course_sections` và `registration.enrollments`. Mọi thao tác can thiệp ghi từ Core Java (`ADMIN_ADD`, `ADMIN_DROP`, `ADMIN_TRANSFER`) đều kiểm tra trạng thái học kỳ qua `CatalogFacade` và từ chối ngay với **`409 Conflict` (`errorCode = "REGISTRATION_GATE_OPEN"`)**.
 
-### Policy Engine Cấu hình Đa trường (Phase 5)
+### Policy Engine Cấu hình Đa trường
 Để đáp ứng quy chế học vụ khác nhau của nhiều trường đại học mà không sửa mã nguồn lõi, `EnrollmentPolicy` kết hợp cột tham số chuẩn hóa với cột `extended_rules` (`JSONB`) và được đánh giá qua chuỗi Strategy sắp thứ tự (`EnrollmentRuleEvaluator`):
 
 ```mermaid
@@ -86,7 +86,7 @@ Trước giờ mở cổng, `PolicySnapshotExporter` biên dịch policy đang k
 
 ---
 
-## 5. Cụm Rust Hot Path (`services/rust-enrollment/` — Phases 6–9, 11–12)
+## 5. Cụm Rust Hot Path (`services/rust-enrollment/`)
 
 ### Các Shared Workspace Crates (`crates/`)
 - **`unieee-domain`:** Các kiểu ID định danh mạnh (`TermId`, `StudentId`, `CourseId`, `SectionId`, `EventId`, `WindowId`), `RuleErrorCode`, chuẩn lỗi `ProblemDetail` RFC 9457, và `ScheduleBitmask` (`[u128; 20]` — 20 tuần x 112 bit) hỗ trợ kiểm tra trùng lịch & khoảng đệm `O(1)` được kiểm chứng bằng `proptest`.
@@ -138,7 +138,7 @@ flowchart LR
 
 ---
 
-## 7. Kiến trúc Giám sát Observability (`infra/compose.monitoring.yml`, Phase 12)
+## 7. Kiến trúc Giám sát Observability (`infra/compose.monitoring.yml`)
 
 - **Instrumentation:** `core-java` xuất Micrometer `/actuator/prometheus` (`UnieeeMetrics` cho Redis Read-Through Cache hit/miss/fallback, Seat Overlay, Policy Engine, Admin Override, Hot Delta Sync và AI Advisor); cả 3 dịch vụ Rust xuất `/metrics` chuẩn Prometheus qua `metrics-exporter-prometheus`.
 - **Thu thập Nội bộ & Cô lập Mạng:** **Prometheus** (`127.0.0.1:9090`, bật `--web.enable-remote-write-receiver` cho `k6`) scrape các target nội bộ qua mạng `app`/`data` (`core-java:8080`, `enrollment-engine-{active,standby}:8081`, `enrollment-writer:8082`, `sse-gateway:8083`, `nginx-exporter:9113` qua Nginx `:8089 /stub_status`, `postgres-exporter:9187`, `pgbouncer-exporter:9127`, multi-target `redis-exporter:9121` và `kafka-exporter:9308` khi chạy `hot-path`). **PostgreSQL, PgBouncer, Redis, Kafka và toàn bộ exporter tuyệt đối không mở port ra host.**

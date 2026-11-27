@@ -28,7 +28,7 @@ Bộ tài liệu công khai dành cho người xem repository, kỹ sư vận h�
 - [Hướng dẫn Sử dụng, Vận hành Mùa Đăng ký & Failover](./guides/vi/operations-and-hotpath.md) — `prepare-registration`, `open-registration` (chuyển đợt 24/7), `close-registration` (drain Kafka & đối soát 3 chiều), Hot Delta Sync, luồng `curl` Hot Path + SSE + Trợ lý AI, cấu hình LLM và Active–Standby failover.
 - [Kiến trúc Hệ thống & Thiết kế CSDL](./guides/vi/architecture.md) — kiến trúc lai Warm/Hot Path, đồ thị 4 Bounded Contexts + `common` (`catalog`, `account`, `registration`, `ai_advisor`), PostgreSQL (`V001`–`V005`), Policy Engine, cụm Rust Hot Path, hệ thống Kafka/Redis và kiến trúc observability.
 - [Tài liệu REST API](./guides/vi/api-reference.md) — quy tắc JWT & danh mục công khai, phân quyền RBAC, chuẩn lỗi RFC 9457 thống nhất, toàn bộ API `core-java` (`/api/v1/public/*`, `warm-cache`, `ai_advisor`), Rust `enrollment-engine` & `sse-gateway` và các probe/metrics nội bộ.
-- [Lộ trình 12 Phases & Chiến lược Kiểm thử](./guides/vi/roadmap-and-testing.md) — tiến độ 12 phases (**hoàn tất 12/12, bản phát hành `1.0.0`**), chính sách coverage phân tầng JaCoCo & `cargo-llvm-cov` (`>= 90%` core, `>= 65%` tầng biên), bộ E2E 7 kịch bản ([run-e2e.sh](./tests/e2e/run-e2e.sh)), benchmark `k6` đa thiết bị ([run-benchmarks.sh](./tests/load/run-benchmarks.sh)) và 3 job CI guardrails.
+- [Lộ trình Dự án & Chiến lược Kiểm thử](./guides/vi/roadmap-and-testing.md) — lộ trình tổng quan dự án (bản phát hành `1.0.0` & định hướng tiếp theo), chính sách coverage phân tầng JaCoCo & `cargo-llvm-cov` (`>= 90%` core, `>= 65%` tầng biên), bộ E2E 7 kịch bản ([run-e2e.sh](./tests/e2e/run-e2e.sh)), benchmark `k6` đa thiết bị ([run-benchmarks.sh](./tests/load/run-benchmarks.sh)) và 3 job CI guardrails.
 - [Tinh chỉnh Keycloak Mùa Đăng ký & Identity Brokering](./infra/keycloak/IDENTITY_BROKERING.md) — refresh jitter (`0.70–0.85`), thuộc tính Declarative User Profile và cấu hình SSO liên kết chỉ đọc với Microsoft Entra ID / Google Workspace.
 
 ---
@@ -51,9 +51,9 @@ Bộ tài liệu công khai dành cho người xem repository, kỹ sư vận h�
 
 ---
 
-## Trạng thái Phát hành (`1.0.0`)
+## Tổng quan Bản phát hành (`1.0.0`)
 
-**Toàn bộ 12 Phases đã hoàn thành (bản phát hành `1.0.0`: `core-java` `1.0.0`, `rust-enrollment` `1.0.0`)** — hoàn thiện hạ tầng container & TLS, nền tảng Spring Boot 4.1.3 Modulith kèm Read-Through Cache fail-open, 4 Bounded Contexts (`V001`–`V005`), cụm Rust Hot Path (`enrollment-engine`, `enrollment-writer`, `sse-gateway`) đồng bộ qua `unieee.enrollment.outcomes` được pipeline hóa, Hot Delta Sync, Nginx read/write split + Active–Standby failover, Keycloak User Profile & brokering, hệ thống Prometheus + Grafana thực chiến, bộ E2E 7 kịch bản (`tests/e2e/`) và bộ benchmark `k6` đa thiết bị (`tests/load/`) chứng minh **`0` overbooking, `0` trùng lịch và `0|0|0` đối soát** trên cả steady-state lẫn chaos failover drill — xem chi tiết tại [Lộ trình 12 Phases & Chiến lược Kiểm thử](./guides/vi/roadmap-and-testing.md).
+**Bản phát hành `1.0.0` (`core-java` `1.0.0`, `rust-enrollment` `1.0.0`)** hoàn thiện đầy đủ nền tảng đầu cuối — bao gồm hạ tầng container & TLS, nền tảng Spring Boot 4.1.3 Modulith kèm Read-Through Cache fail-open, 4 Bounded Contexts (`V001`–`V005`), cụm Rust Hot Path (`enrollment-engine`, `enrollment-writer`, `sse-gateway`) đồng bộ qua `unieee.enrollment.outcomes` được pipeline hóa, Hot Delta Sync, Nginx read/write split + Active–Standby failover, Keycloak User Profile & brokering, hệ thống Prometheus + Grafana thực chiến, bộ E2E 7 kịch bản (`tests/e2e/`) và bộ benchmark `k6` đa thiết bị (`tests/load/`) chứng minh **`0` overbooking, `0` trùng lịch và `0|0|0` đối soát** trên cả steady-state lẫn chaos failover drill — xem chi tiết tại [Lộ trình Dự án & Chiến lược Kiểm thử](./guides/vi/roadmap-and-testing.md).
 
 ---
 
@@ -210,10 +210,10 @@ Xem đầy đủ hướng dẫn vận hành, ví dụ `curl` cho sinh viên, c�
 
 ## Quy trình Đóng góp (Git Workflow)
 
-1. Bắt đầu mọi phase từ nhánh `dev` mới nhất: `git checkout dev && git pull`.
-2. Tạo nhánh tính năng riêng cho từng phase theo quy ước `feat/<ten-tinh-nang>`.
+1. Luôn bắt đầu từ nhánh `dev` mới nhất: `git checkout dev && git pull`.
+2. Tạo nhánh riêng theo quy ước `feat/<ten-tinh-nang>`, `fix/<ten-loi>` hoặc `docs/<chu-de>`.
 3. Thực hiện các **atomic commits** theo chuẩn **Conventional Commits** (`feat`, `fix`, `perf`, `refactor`, `test`, `chore`, `docs`).
-4. Khi hoàn thành deliverables và pass toàn bộ kiểm thử của phase, mở **Pull Request vào `dev`** để review; **không tự duyệt hoặc tự merge PR** trước khi được chấp thuận.
+4. Khi hoàn thành thay đổi và pass toàn bộ kiểm thử, mở **Pull Request vào `dev`** để review; **không tự duyệt hoặc tự merge PR** trước khi được chấp thuận.
 
 ---
 

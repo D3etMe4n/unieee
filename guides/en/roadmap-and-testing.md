@@ -1,27 +1,21 @@
-# Implementation Roadmap & Testing Strategy
+# Project Roadmap & Testing Strategy
 
 **Language:** **English** | [Tiếng Việt](../vi/roadmap-and-testing.md) | [Documentation Hub](../README.md)
 
-**unieee** is developed incrementally across **12 sequential phases**, where every phase is delivered on a `feat/*` branch and reviewed via Pull Request into `dev`.
+This page provides a high-level overview of **unieee**'s product milestones (`1.0.0` release and future directions), along with the project's testing strategy, coverage policy, automated E2E/load suites, and CI guardrails.
 
 ---
 
-## 1. 12-Phase Roadmap Status
+## 1. Project Roadmap Overview
 
-| Phase | Scope | Status |
+| Milestone / Area | Key Capabilities | Status |
 | :--- | :--- | :--- |
-| **Phase 1** | Monorepo layout, `.gitignore`, `.editorconfig`, root documentation | **Completed** (`dev`) |
-| **Phase 2** | Podman/Docker Compose infrastructure, PostgreSQL, PgBouncer, Redis HA (Sentinels), Keycloak, Reverse Proxy (3 TLS modes), `scripts/unieee.sh` | **Completed** (`dev`) |
-| **Phase 3** | Spring Boot 4.1.3 + Java 25 Virtual Threads foundation, Spring Modulith 2.1.2 Outbox & Cleanup Job, JWT Security, unified RFC 9457 `ProblemDetail`, JaCoCo CI | **Completed** (`dev`) |
-| **Phase 4** | DDD Bounded Contexts (`common`, `catalog`, `account`, `registration`), PostgreSQL schemas (`V002`–`V004`), Keycloak provisioning, credit-weighted GPA, Admin Overrides + Single-Writer Gate Guard | **Completed** (`dev`) |
-| **Phase 5** | Wish Surveys (non-seat-reserving), Registration Windows lifecycle, Multi-University Policy Engine (6 rules), SHA-256 Policy Snapshot Exporter + Redis Read Cache (`V005`) | **Completed** (`dev`) |
-| **Phase 6** | Rust Cargo Workspace (`services/rust-enrollment/`), `unieee-domain` (Bitmask Engine + `proptest`), `unieee-events`, `unieee-cacheline` (`#[repr(align(64))]`) | **Completed** (`dev`) |
-| **Phase 7** | Rust `enrollment-engine` (Axum + Tokio, local JWKS singleflight verify, PostgreSQL preload + disk snapshots, lock-free CAS, Kafka producer, epoch recovery replay & Hot Delta Sync) | **Completed** (`dev`) |
-| **Phase 8** | Rust `enrollment-writer` (Kafka micro-batch consumer, SQL `UNNEST` + `CHECK`, crash-safe at-least-once `unieee.enrollment.outcomes` Kafka producer + duplicate re-emit replacing runtime outbox, Redis cache sync & SSE Pub/Sub) | **Completed** (`dev`) |
-| **Phase 9** | Rust `sse-gateway` (Redis Pub/Sub subscriber with absolute seat counts, `tokio::sync::broadcast`, 150ms coalescing, jittered `retry`/`maxAge` & lag resync) | **Completed** (`dev`) |
-| **Phase 10** | Spring AI 2.0.3 `ai_advisor` module (4 Read-Only `@Tool` functions, anti-IDOR/prompt-injection guardrails, deterministic `BitmaskConflictChecker` & fallback) | **Completed** (`dev`) |
-| **Phase 11** | Operational Lifecycle CLI (`prepare-registration`, `open-registration`, `close-registration` Kafka `commands`+`outcomes` lag=0 drain, 3-way reconciliation & final `warm-cache`), `/api/v1/public/*` cache lock, Nginx `$enrollment_read_upstream` read/write split + `1s` `seats_cache`, `/internal/preload-summary` SHA-256 verification, Active–Standby `/readyz` failover, `core-java` Redis Read-Through Cache, Keycloak link-only brokering & Hot Delta Sync | **Completed** (`dev`) |
-| **Phase 12** | Prometheus + Grafana observability (`UnieeeMetrics` `/actuator/prometheus`, Rust `/metrics`, `compose.monitoring.yml`, dashboards), pipelined Kafka outcome publishing + conflict-free batch chunking, Keycloak 26 Declarative User Profile attributes, 7-scenario automated E2E Regression Suite ([tests/e2e/](../../tests/e2e/run-e2e.sh)), multi-device `k6` Load Benchmark Suite ([tests/load/](../../tests/load/run-benchmarks.sh)), and bilingual **`1.0.0`** release | **Completed** (`1.0.0`) |
+| **Infrastructure & Operations** | Podman/Docker Compose stacks (`core`, `hot-path`, `monitoring`), PostgreSQL 17 + PgBouncer, Redis 7.4 HA (Sentinels), Apache Kafka (KRaft), Keycloak 26.1 (OIDC + link-only SSO brokering), Nginx Reverse Proxy (3 TLS modes, cache lock, read/write split, Active–Standby failover), and `scripts/unieee.sh` lifecycle CLI (`prepare-registration`, `open-registration`, `close-registration`). | **Released (`1.0.0`)** |
+| **Core Academic Platform & Policy Engine** | Spring Boot 4.1.3 + Java 25 Virtual Threads Modular Monolith (`catalog`, `account`, `registration`), PostgreSQL schema-per-bounded-context (`V001`–`V005`), fail-open Redis Read-Through Cache, credit-weighted GPA, non-seat-reserving wish surveys, multi-wave registration windows, configurable 6-rule Policy Engine with SHA-256 snapshots, and Single-Writer Gate Guard. | **Released (`1.0.0`)** |
+| **Rust Hot Path & Live SSE Updates** | In-memory `enrollment-engine` (`#[repr(align(64))]`, 20-week Bitmask, local JWKS verify, zero-PG disk snapshot recovery, Hot Delta Sync), conflict-free chunked `UNNEST` `enrollment-writer` with crash-safe Kafka `unieee.enrollment.outcomes`, and `sse-gateway` real-time seat/outcome streaming. | **Released (`1.0.0`)** |
+| **Read-Only AI Advisor & Observability** | Spring AI 2.0.3 `ai_advisor` (4 read-only `@Tool` functions, anti-IDOR/prompt-injection guardrails, deterministic Bitmask verification & offline fallback), Micrometer `/actuator/prometheus`, Rust `/metrics`, and auto-provisioned Prometheus + Grafana dashboards. | **Released (`1.0.0`)** |
+| **Verification, E2E & Load Benchmarks** | Tiered JaCoCo & `cargo-llvm-cov` CI guardrails, automated 7-scenario E2E regression suite ([tests/e2e/](../../tests/e2e/run-e2e.sh)), and multi-device `k6` load & chaos failover benchmarks ([tests/load/](../../tests/load/run-benchmarks.sh)). | **Released (`1.0.0`)** |
+| **Future Directions** | Dedicated web frontend portals (Student, Lecturer, Academic Admin), multi-host / external managed cluster deployment profiles, and formal security auditing for production readiness. | **Planned** |
 
 ---
 
@@ -69,14 +63,21 @@ Supports hardware-scaled presets (`BENCH_PROFILE=smoke|laptop|workstation|stress
 ./tests/load/run-benchmarks.sh --profile smoke --scenario 04 --chaos engine --bench-nginx --close-after
 ```
 
-**Measured `1.0.0` Benchmark Summary (Single-Host Linux Laptop, 40 VUs `laptop` + Chaos `engine` Drill):**
+**Measured `1.0.0` Reference Benchmark Summary (Single-Host Consumer Laptop):**
+
+> [!NOTE]
+> **Benchmark Environment & Methodology Disclaimer:**
+> - **Consumer Single-Host Hardware:** These figures are reference measurements collected on an ordinary consumer Linux laptop running the entire stack (**20+ containers** — PostgreSQL, PgBouncer, Redis HA with 3 Sentinels, Kafka, Keycloak, Nginx, `core-java`, Rust Hot Path cluster, Prometheus, and Grafana) **alongside the `k6` load generator on the same machine**.
+> - **Why Observed Throughput Is Host-Bound:** On a single host, **Nginx TLS termination** and **co-located `k6` virtual users** consume the majority of CPU cores well before the Rust `enrollment-engine` saturates (internal Prometheus metrics confirm the Rust engine itself continues serving at sub-millisecond `p95` while client-side numbers reflect single-host CPU contention).
+> - **Future Direction for Accurate Capacity Testing:** To measure true cluster ceilings in future evaluations, run `k6` from dedicated external load-generator host(s), isolate Nginx / TLS termination on a separate edge node, and deploy PostgreSQL, Kafka, Redis HA, and the Rust/Java services on dedicated multi-node hardware.
+
 - **Correctness SLOs (Both Steady-State & Chaos Failover):** **`0`** overbooked sections (`0%`), **`0`** 20-week Bitmask schedule conflicts (`0%`), **`0`** duplicate active course enrollments, **`0|0|0`** 3-way reconciliation (`reconcileApiMismatchCount = 0`), and `RAM == PostgreSQL` parity on both `ACTIVE` and `STANDBY` nodes.
-- **Steady-State `laptop` (`bench-laptop-20261126T235326Z`):**
+- **Steady-State Benchmark (`laptop` profile, 40 VUs):**
   - `01-warm-read` (`core-java` + Redis): **`5,347.2 RPS`**, `p50 = 6.39 ms`, `p95 = 17.79 ms`, `p99 = 26.20 ms`, `0.000%` 5xx, Nginx cache hit `99.892%` (Core Java Read-Through Cache hit ratio `99.336%`).
   - `02-hot-read` (Rust Standby RAM + `seats_cache`): **`16,978.3 RPS`**, `p50 = 1.79 ms`, `p95 = 4.84 ms`, `p99 = 7.64 ms`, `0.000%` 5xx, Nginx cache hit `99.924%`.
   - `03-hot-write-contention` (`enrollment-engine` Active + Kafka + Writer): **`7,018.7 RPS`**, `p50 = 4.22 ms`, `p95 = 12.47 ms`, `p99 = 21.24 ms`, `0.009%` unexpected 5xx.
   - `04-mixed-peak-hour` (Reads + Writes + AI + SSE): **`7,105.6 RPS`**, `p95 = 17.09 ms`, `p99 = 31.08 ms`, `0.000%` 5xx; 20 concurrent SSE clients received `75,125` seat updates with **`p95 = 263.48 ms`**, **`p99 = 325.92 ms`** (`< 500 ms` SLO).
-- **Chaos Active-Engine Kill (`bench-smoke-20261126T235655Z`, `5,679.7 RPS`):** Promoted Standby (`epoch=2`) and recovered killed node cleanly as `STANDBY` (no premature auto-failback), `0.000%` unexpected errors (`0.151%` transient promotion `502/503`), and `0|0|0` reconciliation.
+- **Chaos Active-Engine Failover Drill (`smoke` profile, `5,679.7 RPS`):** Promoted Standby (`epoch=2`) and recovered the killed node cleanly as `STANDBY` (no premature auto-failback), `0.000%` unexpected errors (`0.151%` transient promotion `502/503`), and `0|0|0` reconciliation.
 
 ---
 
