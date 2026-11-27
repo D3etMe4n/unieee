@@ -48,9 +48,11 @@ Toàn bộ HTTP API đi qua **Reverse Proxy** (`https://localhost:8443` ở ch�
   }
   ```
 
+- **Rate Limiting theo Từng Service (`429 Too Many Requests`):** Mọi service tương tác người dùng (`core-java`, `enrollment-engine`, `sse-gateway`) đều đính kèm header `X-RateLimit-Limit` và `X-RateLimit-Remaining` khi bật rate limiting, và trả về **`429 Too Many Requests`** (`errorCode = "RATE_LIMIT_EXCEEDED"`, kèm `Retry-After`) khi vượt ngưỡng — xem [Hướng dẫn Rate Limiting & Tích hợp Anti-Bot](./rate-limiting-and-anti-bot.md).
+
 ---
 
-## 2. Warm / Cold Path (`services/core-java` `1.0.0`)
+## 2. Warm / Cold Path (`services/core-java` `1.1.0`)
 
 ### Xác thực & Chẩn đoán (`common`)
 
@@ -272,6 +274,7 @@ Các lệnh ghi & tra cứu status đi qua Nginx `/api/v1/enrollments/*` tới `
 | `404 Not Found` | `STUDENT_NOT_FOUND`, `SECTION_NOT_FOUND` |
 | `409 Conflict` | `SECTION_FULL`, `SECTION_NOT_OPEN`, `ALREADY_ENROLLED_IN_COURSE`, `NOT_ENROLLED_IN_SECTION`, `STALE_EPOCH`, `DUPLICATE_EVENT_ID`, `SEAT_CAPACITY_OVERFLOW`, `DATABASE_CONSTRAINT_VIOLATION` |
 | `422 Unprocessable Entity` | `NO_ACTIVE_WINDOW`, `WINDOW_NOT_ACTIVE`, `WINDOW_OUTSIDE_TIME_RANGE`, `WINDOW_ACTION_NOT_ALLOWED`, `WINDOW_COHORT_NOT_ALLOWED`, `WINDOW_FACULTY_NOT_ALLOWED`, `WINDOW_NOT_ELIGIBLE`, `STUDENT_NOT_ACTIVE`, `ENROLLMENT_BLOCKED`, `TUITION_DEBT_EXCEEDED`, `MISSING_PREREQUISITE`, `MISSING_PRIOR_STUDY`, `MISSING_COREQUISITE`, `COURSE_ALREADY_PASSED_USE_IMPROVE`, `USE_RETAKE_ACTION`, `RETAKE_REQUIRES_PRIOR_ATTEMPT`, `IMPROVE_NOT_ALLOWED`, `IMPROVE_REQUIRES_PASSED_COURSE`, `GRADE_TOO_HIGH_FOR_IMPROVE`, `MAX_IMPROVE_ATTEMPTS_REACHED`, `BELOW_MIN_CREDITS`, `CREDIT_LIMIT_EXCEEDED`, `SCHEDULE_CONFLICT`, `BUFFER_GAP_VIOLATION` |
+| `429 Too Many Requests` | `RATE_LIMIT_EXCEEDED` *(kèm `Retry-After`, `X-RateLimit-Limit`, `X-RateLimit-Remaining`)* |
 | `503 Service Unavailable` | `GATE_CLOSED`, `KAFKA_PUBLISH_FAILED`, `KAFKA_BACKPRESSURE`, `ENGINE_NOT_READY`, `NODE_STANDBY`, `OIDC_JWKS_UNAVAILABLE` |
 
 ---
@@ -311,9 +314,9 @@ Các lệnh ghi & tra cứu status đi qua Nginx `/api/v1/enrollments/*` tới `
 | :--- | :--- | :--- |
 | `reverse-proxy` (`:80`/`:8088`/`:8443`) | `GET /proxy-health` | Trả về `200 OK` (`OK`) kiểm tra sức khỏe Reverse Proxy. |
 | `reverse-proxy` (`:8089` nội bộ) | `GET /stub_status` | Thống kê kết nối/request của Nginx chỉ mở cho `nginx-exporter` trong mạng nội bộ. |
-| `core-java` (`:8080`) | `GET /actuator/prometheus` | Endpoint scrape Prometheus của Micrometer (`unieee_read_cache_*`, `unieee_policy_*`, `unieee_admin_override_*`, `unieee_hot_delta_*`, `unieee_ai_advisor_*`, JVM/Hikari). |
-| `enrollment-engine` (`:8081`) | `GET /healthz`, `GET /readyz`, `GET /metrics` | Liveness, readiness (`state`, `role`, `gateState`, `epoch`, `checkpointSeq`) và Prometheus `/metrics` (`unieee_engine_*`). |
+| `core-java` (`:8080`) | `GET /actuator/info`, `GET /actuator/prometheus` | Endpoint info công khai (gồm `rateLimit.enabled`) và Prometheus Micrometer (`unieee_read_cache_*`, `unieee_rate_limit_*`, `unieee_policy_*`, `unieee_admin_override_*`, `unieee_hot_delta_*`, `unieee_ai_advisor_*`, JVM/Hikari). |
+| `enrollment-engine` (`:8081`) | `GET /healthz`, `GET /readyz`, `GET /metrics` | Liveness, readiness (`state`, `role`, `gateState`, `epoch`, `checkpointSeq`, `rateLimitEnabled`) và Prometheus `/metrics` (`unieee_engine_*`, `unieee_engine_rate_limit_*`). |
 | `enrollment-engine` (`:8081`) | `POST /internal/promote` | Thăng cấp Standby đang `READY` thành `ACTIVE` và tăng fencing `epoch` (`x-internal-ops-token`). |
 | `enrollment-engine` (`:8081`) | `GET /internal/preload-summary` | Trả về `PreloadSummarySnapshot` (`sectionCount`, `studentCount`, `totalMaxCapacity`, `totalEnrolledSeats`, `totalAvailableSeats`, `seatChecksumSha256`) để đối chiếu `RAM == PostgreSQL` (`x-internal-ops-token`). |
 | `enrollment-writer` (`:8082`) | `GET /healthz`, `GET /readyz`, `GET /metrics` | Liveness/readiness probe của Writer kèm Prometheus `/metrics` (`unieee_writer_*`). |
-| `sse-gateway` (`:8083`) | `GET /healthz`, `GET /readyz`, `GET /metrics` | Liveness/readiness probe của SSE Gateway kèm Prometheus `/metrics` (`unieee_sse_*`). |
+| `sse-gateway` (`:8083`) | `GET /healthz`, `GET /readyz`, `GET /metrics` | Liveness/readiness probe (`rateLimitEnabled`) của SSE Gateway kèm Prometheus `/metrics` (`unieee_sse_*`, `unieee_sse_rate_limit_*`). |

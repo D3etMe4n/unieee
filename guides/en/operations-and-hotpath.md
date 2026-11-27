@@ -227,3 +227,12 @@ Start the stack with monitoring enabled at boot (or add `--monitoring` later wit
 - **Loopback-Only UIs:**
   - **Prometheus (`http://127.0.0.1:9090`):** Scrapes `core-java` (`/actuator/prometheus`), Rust services (`/metrics`), and internal exporters (`nginx`, `postgres`, `pgbouncer`, `redis`, `kafka` when `hot-path` is active), and enables `--web.enable-remote-write-receiver` for `k6`.
   - **Grafana (`http://127.0.0.1:3000`):** Auto-provisions the Prometheus datasource and two dashboards — **`unieee — Production Overview`** (`unieee-production-overview`) and **`unieee — k6 Load Benchmark`** (`unieee-k6-benchmark`). Default `GRAFANA_ADMIN_USER=admin` / `GRAFANA_ADMIN_PASSWORD=admin_dev_password` in [.env.example](../../.env.example) **must be rotated in `.env`**.
+
+---
+
+## 7. Per-Service Rate Limiting, Benchmark Isolation & Anti-Bot Readiness
+
+- **Enabled by Default Across Every Layer:** Edge Nginx (`nginx.conf`) plus application-level Token Buckets in `core-java` (`UNIEEE_RATE_LIMIT_ENABLED=true`), `enrollment-engine` (`RATE_LIMIT_ENABLED=true`), and `sse-gateway` (`RATE_LIMIT_ENABLED=true`) protect endpoints per authenticated `student_id`/`sub` (with IP fallback for `/api/v1/public/*`), returning RFC 9457 `429 RATE_LIMIT_EXCEEDED` with `Retry-After`, `X-RateLimit-Limit`, and `X-RateLimit-Remaining`.
+- **Observing Active State:** Inspect `GET /actuator/info` / `GET /actuator/prometheus` (`unieee_rate_limit_enabled`, `unieee_rate_limit_requests_total`) on `core-java`, and `"rateLimitEnabled"` on `/healthz`, `/readyz`, or `unieee_{engine,sse}_rate_limit_enabled` on `/metrics` for Rust services.
+- **Strict Benchmark Isolation (`--disable-rate-limit`):** When running load tests via `./tests/load/run-benchmarks.sh --disable-rate-limit` (optionally combined with `--internal-http` inside `unieee_app`), only [tests/load/compose.bench.yml](../../tests/load/compose.bench.yml) disables rate limiting temporarily, triggers an explicit `SECURITY WARNING` log at service startup, and restores all containers back to `ENABLED=true` automatically on `EXIT`.
+- **Future Anti-Bot Integration (Turnstile & Self-Hosted PoW):** See [Rate Limiting & Anti-Bot Architecture Guide](./rate-limiting-and-anti-bot.md) for the recommended Pre-Registration Gate Ticket pattern for Cloudflare Turnstile and adaptive WebCrypto/ALTCHA Proof-of-Work options.

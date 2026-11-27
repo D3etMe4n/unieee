@@ -27,23 +27,24 @@ Bộ tài liệu công khai dành cho người xem repository, kỹ sư vận h�
 - [Hướng dẫn Khởi chạy & Vận hành Cục bộ](./guides/vi/getting-started.md) — yêu cầu môi trường, dùng `scripts/unieee.sh`, chế độ TLS, lấy JWT Keycloak dev và chạy bộ test/coverage Java + Rust.
 - [Hướng dẫn Sử dụng, Vận hành Mùa Đăng ký & Failover](./guides/vi/operations-and-hotpath.md) — `prepare-registration`, `open-registration` (chuyển đợt 24/7), `close-registration` (drain Kafka & đối soát 3 chiều), Hot Delta Sync, luồng `curl` Hot Path + SSE + Trợ lý AI, cấu hình LLM và Active–Standby failover.
 - [Kiến trúc Hệ thống & Thiết kế CSDL](./guides/vi/architecture.md) — kiến trúc lai Warm/Hot Path, đồ thị 4 Bounded Contexts + `common` (`catalog`, `account`, `registration`, `ai_advisor`), PostgreSQL (`V001`–`V005`), Policy Engine, cụm Rust Hot Path, hệ thống Kafka/Redis và kiến trúc observability.
+- [Hướng dẫn Rate Limiting & Tích hợp Anti-Bot](./guides/vi/rate-limiting-and-anti-bot.md) — Token Bucket rate limiting ở từng service (`student_id` + IP fallback), overlay cô lập benchmark, thiết kế Cloudflare Turnstile Gate Ticket và Proof-of-Work tự host (ALTCHA / Hashcash).
 - [Tài liệu REST API](./guides/vi/api-reference.md) — quy tắc JWT & danh mục công khai, phân quyền RBAC, chuẩn lỗi RFC 9457 thống nhất, toàn bộ API `core-java` (`/api/v1/public/*`, `warm-cache`, `ai_advisor`), Rust `enrollment-engine` & `sse-gateway` và các probe/metrics nội bộ.
-- [Lộ trình Dự án & Chiến lược Kiểm thử](./guides/vi/roadmap-and-testing.md) — lộ trình tổng quan dự án (bản phát hành `1.0.0` & định hướng tiếp theo), chính sách coverage phân tầng JaCoCo & `cargo-llvm-cov` (`>= 90%` core, `>= 65%` tầng biên), bộ E2E 7 kịch bản ([run-e2e.sh](./tests/e2e/run-e2e.sh)), benchmark `k6` đa thiết bị ([run-benchmarks.sh](./tests/load/run-benchmarks.sh)) và 3 job CI guardrails.
+- [Lộ trình Dự án & Chiến lược Kiểm thử](./guides/vi/roadmap-and-testing.md) — lộ trình tổng quan dự án, chính sách coverage phân tầng JaCoCo & `cargo-llvm-cov` (`>= 90%` core, `>= 65%` tầng biên), bộ E2E 7 kịch bản ([run-e2e.sh](./tests/e2e/run-e2e.sh)), benchmark `k6` đa thiết bị ([run-benchmarks.sh](./tests/load/run-benchmarks.sh)) và 3 job CI guardrails.
 - [Tinh chỉnh Keycloak Mùa Đăng ký & Identity Brokering](./infra/keycloak/IDENTITY_BROKERING.md) — refresh jitter (`0.70–0.85`), thuộc tính Declarative User Profile và cấu hình SSO liên kết chỉ đọc với Microsoft Entra ID / Google Workspace.
 
 ---
 
 ## Kiến trúc Tổng quan
 
-- **Warm / Cold Path — Spring Boot 4.1.3 Modular Monolith (`services/core-java/` `1.0.0`):**
-  - Tổ chức thành **4 Bounded Contexts** (`catalog`, `account`, `registration`, `ai_advisor`) trên shared kernel `common` (kèm `RedisReadThroughCache` fail-open về PostgreSQL và `UnieeeMetrics`) với đồ thị phụ thuộc tuyến tính 1 chiều (Spring Modulith verify) và phân tách PostgreSQL Schema-per-Bounded-Context (`V001`–`V005`).
+- **Warm / Cold Path — Spring Boot 4.1.3 Modular Monolith (`services/core-java/` `1.1.0`):**
+  - Tổ chức thành **4 Bounded Contexts** (`catalog`, `account`, `registration`, `ai_advisor`) trên shared kernel `common` (kèm `RedisReadThroughCache` fail-open về PostgreSQL, `UnieeeMetrics` và Token Bucket rate limiting định danh theo user/IP) với đồ thị phụ thuộc tuyến tính 1 chiều (Spring Modulith verify) và phân tách PostgreSQL Schema-per-Bounded-Context (`V001`–`V005`).
   - Quản lý học kỳ, khoa/ngành/chương trình khung, môn học & tiên quyết DFS, lớp học phần với lịch Bitmask 20 tuần, nhóm API **Danh mục Đọc Công khai** (`/api/v1/public/*` bọc bởi Nginx `proxy_cache_lock on`), **Redis Read-Through Cache** (TTL thích ứng `45s`/`20m` cho thời khóa biểu, `1h` cho quy chế kích hoạt, metadata catalog tĩnh trộn sĩ số live từ Redis; luôn bỏ qua cache cho đối soát, roster và audit log), cấp phát tài khoản Keycloak (gắn `student_id`/`lecturer_id` qua Declarative User Profile của Keycloak 26), GPA trọng số tín chỉ, Admin Override có **Single-Writer Gate Guard** (`409 REGISTRATION_GATE_OPEN` khi `REGISTRATION_OPEN`), khảo sát nguyện vọng không giữ ghế, đợt mở cổng, **Policy Engine đa trường** kèm SHA-256 snapshot exporter (`unieee:cache:policy:{termId}:snapshot`), **làm ấm Redis Read Cache** (`warm-cache`), **Hot Delta Sync** (`unieee.enrollment.deltas` khi cổng đang mở), **Trợ lý AI Xếp lịch Read-Only (`ai_advisor`)** trên Spring AI `2.0.3` (4 `@Tool` chỉ đọc, guardrails chống IDOR/prompt injection, kiểm chứng Bitmask & fallback xác định) và metrics Prometheus **`/actuator/prometheus`**.
   - Dùng **Java 25 (Virtual Threads)**, **Spring Modulith 2.1.2** (Event Publication Registry + Cleanup Job), **Spring Data JPA**, **Flyway**, **Spring Security** (Keycloak OIDC 1.0 / OAuth 2.0 / JWT), **MapStruct** và **Spring AI 2.0.3**.
-- **Hot Path — Cụm dịch vụ Rust (`services/rust-enrollment/` `1.0.0`):**
-  - Các shared crate (`unieee-domain`, `unieee-events`, `unieee-cacheline`) cung cấp kiểm tra trùng lịch Bitmask `[u128; 20]` `O(1)` (`proptest`-verified), chuẩn lỗi RFC 9457 `ProblemDetail`, schema Kafka (`EnrollmentCommandEvent`, `EnrollmentOutcomeEvent`, `EnrollmentDeltaEvent`, `DeadLetterEvent`) & Redis Pub/Sub có phiên bản và slot căn lề `#[repr(align(64))]`.
-  - **Enrollment State-Machine (`enrollment-engine`, Axum 0.8 + Tokio):** Giữ state đăng ký trong RAM (`SectionSeatSlot` + `ShardedMap` theo sinh viên), mở thêm 2 endpoint đọc lock-free từ RAM (`/api/v1/enrollments/seats` & `/api/v1/enrollments/me`) bên cạnh `/register`, `/drop`, `/status/{event_id}` và `/metrics` Prometheus, xác thực JWT cục bộ với JWKS singleflight + cache SHA-256, trừ ghế nguyên tử lock-free, đẩy lệnh vào **Kafka (KRaft)**, tiêu thụ kết quả bền vững từ **`unieee.enrollment.outcomes`** trên cả `ACTIVE` & `STANDBY`, gộp `SeatTentativeEvent` (số ghế tuyệt đối) qua Redis pipeline, hỗ trợ RAM-first `RevertEvent` idempotency, Hot Delta Sync, phục hồi không truy vấn PG từ disk snapshot + Kafka replay và Active–Standby failover với `REJOIN_AS_STANDBY_ON_RECOVERY=true` cùng fencing `epoch`.
+- **Hot Path — Cụm dịch vụ Rust (`services/rust-enrollment/` `1.1.0`):**
+  - Các shared crate (`unieee-domain`, `unieee-events`, `unieee-cacheline`) cung cấp kiểm tra trùng lịch Bitmask `[u128; 20]` `O(1)` (`proptest`-verified), chuẩn lỗi RFC 9457 `ProblemDetail`, schema Kafka (`EnrollmentCommandEvent`, `EnrollmentOutcomeEvent`, `EnrollmentDeltaEvent`, `DeadLetterEvent`) & Redis Pub/Sub có phiên bản, slot căn lề `#[repr(align(64))]` và `ShardedTokenBucket` tốc độ cao.
+  - **Enrollment State-Machine (`enrollment-engine`, Axum 0.8 + Tokio):** Giữ state đăng ký trong RAM (`SectionSeatSlot` + `ShardedMap` theo sinh viên), bảo vệ công bằng theo từng sinh viên qua Token Bucket tách biệt luồng đọc/ghi (`429 RATE_LIMIT_EXCEEDED`), mở 2 endpoint đọc lock-free từ RAM (`/api/v1/enrollments/seats` & `/api/v1/enrollments/me`) bên cạnh `/register`, `/drop`, `/status/{event_id}` và `/metrics` Prometheus, xác thực JWT cục bộ với JWKS singleflight + cache SHA-256, trừ ghế nguyên tử lock-free, đẩy lệnh vào **Kafka (KRaft)**, tiêu thụ kết quả bền vững từ **`unieee.enrollment.outcomes`** trên cả `ACTIVE` & `STANDBY`, gộp `SeatTentativeEvent` (số ghế tuyệt đối) qua Redis pipeline, hỗ trợ RAM-first `RevertEvent` idempotency, Hot Delta Sync, phục hồi không truy vấn PG từ disk snapshot + Kafka replay và Active–Standby failover với `REJOIN_AS_STANDBY_ON_RECOVERY=true` cùng fencing `epoch`.
   - **Writer / Commit Service (`enrollment-writer`):** Đọc micro-batch từ `unieee.enrollment.commands`, tách xung đột cùng sinh viên/môn thành chunk liên tiếp không xung đột (`split_into_conflict_free_chunks`) để ghi nhanh qua **PostgreSQL** `UNNEST` + Atomic `UPDATE` + `CHECK` constraint + `enrollment_events` (qua **PgBouncer**) với fallback tuần tự chỉ khi cần, pipeline `acks=all` **`EnrollmentOutcomeEvent`** (`try_join_all`) sang **`unieee.enrollment.outcomes`** TRƯỚC khi commit offset Kafka, cập nhật **Redis HA** Read Cache & Pub/Sub cho SSE và xuất `/metrics` Prometheus.
-  - **SSE Live-Update Service (`sse-gateway`, Axum 0.8 + Tokio):** Đẩy biến động chỗ ngồi (`/api/v1/sse/sections`) và kết quả cá nhân (`/api/v1/sse/me`) thời gian thực kèm gộp 150ms, jitter `retry`/`maxAge`, heartbeat, thông báo `resync_required` và `/metrics` Prometheus.
+  - **SSE Live-Update Service (`sse-gateway`, Axum 0.8 + Tokio):** Đẩy biến động chỗ ngồi (`/api/v1/sse/sections`) và kết quả cá nhân (`/api/v1/sse/me`) thời gian thực kèm Token Bucket giới hạn tần suất mở kết nối theo sinh viên/IP, gộp 150ms, jitter `retry`/`maxAge`, heartbeat, thông báo `resync_required` và `/metrics` Prometheus.
 - **Hạ tầng, Giám sát & Bảo mật (`infra/`, `scripts/`):**
   - Đứng sau **Nginx 1.27 Reverse Proxy** (TLS termination, routing, rate limiting, `proxy_cache_lock on` cho `/api/v1/public/*` và micro-cache `1s` `seats_cache` cho `/api/v1/enrollments/seats`, tách luồng đọc `$enrollment_read_upstream` sang `STANDBY` đang khỏe & giám sát failover Active–Standby qua `/readyz` không tự auto-failback sớm, tắt buffering cho SSE, cùng listener nội bộ `:8089 /stub_status`) và **Keycloak 26.1** (tắt self-registration, `accessTokenLifespan: 1800`, Declarative User Profile, identity brokering dạng link-only).
   - Overlay giám sát ([infra/compose.monitoring.yml](./infra/compose.monitoring.yml)) bổ sung **Prometheus** (`127.0.0.1:9090`, bật `--web.enable-remote-write-receiver` cho `k6`), **Grafana** (`127.0.0.1:3000`, auto-provision dashboard `Production Overview` & `k6 Load Benchmark`) và các exporter nội bộ (`nginx`, `postgres`, `pgbouncer`, `redis`, `kafka`) mà **không mở port nhạy cảm ra public network**.
@@ -51,9 +52,9 @@ Bộ tài liệu công khai dành cho người xem repository, kỹ sư vận h�
 
 ---
 
-## Tổng quan Bản phát hành (`1.0.0`)
+## Tổng quan Bản phát hành (`1.1.0`)
 
-**Bản phát hành `1.0.0` (`core-java` `1.0.0`, `rust-enrollment` `1.0.0`)** hoàn thiện đầy đủ nền tảng đầu cuối — bao gồm hạ tầng container & TLS, nền tảng Spring Boot 4.1.3 Modulith kèm Read-Through Cache fail-open, 4 Bounded Contexts (`V001`–`V005`), cụm Rust Hot Path (`enrollment-engine`, `enrollment-writer`, `sse-gateway`) đồng bộ qua `unieee.enrollment.outcomes` được pipeline hóa, Hot Delta Sync, Nginx read/write split + Active–Standby failover, Keycloak User Profile & brokering, hệ thống Prometheus + Grafana thực chiến, bộ E2E 7 kịch bản (`tests/e2e/`) và bộ benchmark `k6` đa thiết bị (`tests/load/`) chứng minh **`0` overbooking, `0` trùng lịch và `0|0|0` đối soát** trên cả steady-state lẫn chaos failover drill — xem chi tiết tại [Lộ trình Dự án & Chiến lược Kiểm thử](./guides/vi/roadmap-and-testing.md).
+**Bản phát hành `1.1.0` (`core-java` `1.1.0`, `rust-enrollment` `1.1.0`)** mở rộng nền tảng `1.0.0` với Token Bucket Rate Limiting định danh theo người dùng/IP ở từng service (`core-java`, `enrollment-engine`, `sse-gateway`) chống bot spam sau NAT trường học, overlay cô lập benchmark (`tests/load/compose.bench.yml` tự động khôi phục khi thoát), chế độ benchmark nội bộ không TLS trên `unieee_app` (`--internal-http`), và tài liệu hướng dẫn tích hợp Anti-Bot (Cloudflare Turnstile & Proof-of-Work tự host) — vẫn bảo toàn tuyệt đối **`0` overbooking, `0` trùng lịch và `0|0|0` đối soát** trên cả steady-state lẫn chaos failover drill. Xem chi tiết tại [Lộ trình Dự án & Chiến lược Kiểm thử](./guides/vi/roadmap-and-testing.md).
 
 ---
 
@@ -91,8 +92,8 @@ unieee/
 │   ├── en/                      # Tài liệu Tiếng Anh (cài đặt, vận hành, kiến trúc, API, lộ trình)
 │   └── vi/                      # Tài liệu Tiếng Việt
 ├── services/
-│   ├── core-java/               # Spring Boot 4.1.3 Modular Monolith v1.0.0
-│   └── rust-enrollment/         # Rust Cargo Workspace v1.0.0 (crates/ + services/)
+│   ├── core-java/               # Spring Boot 4.1.3 Modular Monolith v1.1.0
+│   └── rust-enrollment/         # Rust Cargo Workspace v1.1.0 (crates/ + services/)
 ├── infra/
 │   ├── compose.base.yml         # Stack cơ bản (core profile)
 │   ├── compose.hotpath.yml      # Stack đăng ký hiệu năng cao (hot-path)
@@ -201,7 +202,9 @@ Trong giờ cao điểm, [scripts/unieee.sh](./scripts/unieee.sh) bật/tắt c�
 
 # 5. Chạy chủ động bộ kiểm thử E2E 7 kịch bản hoặc bộ benchmark k6 đa thiết bị
 ./tests/e2e/run-e2e.sh
-./tests/load/run-benchmarks.sh --profile laptop --scenario all --bench-nginx --close-after
+./tests/load/run-benchmarks.sh --profile laptop --scenario all --disable-rate-limit --close-after
+# Hoặc chạy k6 + SSE probe qua mạng container nội bộ unieee_app (loại bỏ TLS biên):
+./tests/load/run-benchmarks.sh --profile laptop --scenario all --internal-http --disable-rate-limit --close-after
 ```
 
 Xem đầy đủ hướng dẫn vận hành, ví dụ `curl` cho sinh viên, cấu hình Trợ lý AI và cơ chế Active–Standby failover tại [Hướng dẫn Sử dụng, Vận hành Mùa Đăng ký & Failover](./guides/vi/operations-and-hotpath.md).

@@ -227,3 +227,12 @@ Khởi chạy stack kèm Prometheus + Grafana ngay từ đầu (hoặc chạy th
 - **Truy cập Cục bộ (Loopback Only `127.0.0.1`):**
   - **Prometheus (`http://127.0.0.1:9090`):** Tự động scrape `core-java` (`/actuator/prometheus`), 3 dịch vụ Rust (`/metrics`) cùng các exporter nội bộ (`nginx`, `postgres`, `pgbouncer`, `redis`, và `kafka` khi bật `hot-path`), đồng thời bật `--web.enable-remote-write-receiver` nhận luồng metrics thời gian thực từ `k6`.
   - **Grafana (`http://127.0.0.1:3000`):** Tự động cấu hình datasource Prometheus và 2 dashboard sẵn có — **`unieee — Production Overview`** (`unieee-production-overview`) và **`unieee — k6 Load Benchmark`** (`unieee-k6-benchmark`). Hãy luôn đổi mật khẩu mặc định `GRAFANA_ADMIN_PASSWORD` trong `.env` (mẫu tại [.env.example](../../.env.example)).
+
+---
+
+## 7. Rate Limiting theo Service, Cô lập Benchmark & Dọn đường Anti-Bot
+
+- **Mặc định Bật ở Mọi Tầng:** Tầng biên Nginx (`nginx.conf`) cùng Token Bucket ở từng service `core-java` (`UNIEEE_RATE_LIMIT_ENABLED=true`), `enrollment-engine` (`RATE_LIMIT_ENABLED=true`) và `sse-gateway` (`RATE_LIMIT_ENABLED=true`) giới hạn theo `student_id`/`sub` (fallback IP cho `/api/v1/public/*`), trả chuẩn RFC 9457 `429 RATE_LIMIT_EXCEEDED` kèm `Retry-After`, `X-RateLimit-Limit` và `X-RateLimit-Remaining`.
+- **Kiểm tra Trạng thái Vận hành:** Kiểm tra `GET /actuator/info` / `/actuator/prometheus` (`unieee_rate_limit_enabled`, `unieee_rate_limit_requests_total`) trên `core-java`, và trường `"rateLimitEnabled"` trên `/healthz`, `/readyz` hoặc `unieee_{engine,sse}_rate_limit_enabled` trên `/metrics` của cụm Rust.
+- **Cô lập Tuyệt đối Khi Benchmark (`--disable-rate-limit`):** Khi chạy benchmark bằng `./tests/load/run-benchmarks.sh --disable-rate-limit` (có thể kết hợp `--internal-http` chạy trong `unieee_app`), chỉ riêng [tests/load/compose.bench.yml](../../tests/load/compose.bench.yml) tạm tắt rate limiting, các service sẽ in cảnh báo `SECURITY WARNING` lúc khởi động và `trap ... EXIT` tự động khôi phục mọi container về trạng thái `ENABLED=true` ngay khi kết thúc.
+- **Tích hợp Anti-Bot Tương lai (Turnstile & Proof-of-Work Tự host):** Xem chi tiết kiến trúc Enrollment Gate Ticket cho Cloudflare Turnstile và cơ chế PoW độ khó thích ứng ALTCHA / WebCrypto tại [Hướng dẫn Rate Limiting & Tích hợp Anti-Bot](./rate-limiting-and-anti-bot.md).
