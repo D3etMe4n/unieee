@@ -8,6 +8,7 @@ Toàn bộ HTTP API đi qua **Reverse Proxy** (`https://localhost:8443` ở ch�
 
 ## 1. Xác thực, Phân quyền & Chuẩn Lỗi
 
+- **Chỉ mở Allowlist OIDC Công khai tại Biên:** Reverse Proxy chỉ cho phép các đường dẫn OIDC của realm `unieee` (`/auth/realms/unieee/.well-known/openid-configuration`, `.../protocol/openid-connect/*`, `.../login-actions/*`, `/auth/resources/*`, `/auth/js/*`). Toàn bộ Keycloak Admin (`/auth/admin/**`), realm `master` và `/auth/realms/unieee/account/**` trả về `404` qua `:8443` / `:8088`, chỉ truy cập được trên loopback (`127.0.0.1:8180`).
 - **Token Endpoint (Keycloak OIDC):** `POST /auth/realms/unieee/protocol/openid-connect/token` (`client_id=unieee-web`).
 - **Các vai trò (`realm_access.roles`):**
   - `STUDENT` (Sinh viên)
@@ -308,7 +309,7 @@ Các lệnh ghi & tra cứu status đi qua Nginx `/api/v1/enrollments/*` tới `
 ## 5. Endpoint Vận hành Nội bộ & Health Probes (Chỉ Mạng Container)
 
 > [!WARNING]
-> Các endpoint dưới đây **không mở** qua Reverse Proxy công khai và chỉ truy cập được từ bên trong mạng Compose nội bộ (`app`/`data`). Khi `INTERNAL_OPS_TOKEN` được cấu hình, nhóm `/internal/*` bắt buộc truyền header `x-internal-ops-token`.
+> Các endpoint dưới đây **không mở** qua Reverse Proxy công khai (mọi truy cập từ biên tới `/actuator/**`, `/metrics`, `/stub_status`, `/healthz`, `/readyz`, `/internal/**`, `/auth/admin/**` và `/auth/realms/master/**` đều bị chặn bằng `404`) và chỉ truy cập được trong mạng Compose nội bộ (`app`/`data`). Các cổng quản trị cục bộ chỉ bind `127.0.0.1` (`Keycloak Admin: 8180`, `Prometheus: 9090`, `Grafana: 3000`). Khi `INTERNAL_OPS_TOKEN` được cấu hình, nhóm `/internal/*` bắt buộc truyền header `x-internal-ops-token`.
 
 | Service (Cổng) | Phương thức & Đường dẫn | Mục đích |
 | :--- | :--- | :--- |

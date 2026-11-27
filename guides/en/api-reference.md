@@ -8,6 +8,7 @@ All HTTP endpoints are served behind the **Reverse Proxy** (`https://localhost:8
 
 ## 1. Authentication, Roles & Error Format
 
+- **Public OIDC Allowlist Only on Edge:** Reverse Proxy exposes only realm `unieee` OIDC paths (`/auth/realms/unieee/.well-known/openid-configuration`, `.../protocol/openid-connect/*`, `.../login-actions/*`, `/auth/resources/*`, `/auth/js/*`). Keycloak Admin (`/auth/admin/**`), `master` realm, and `/auth/realms/unieee/account/**` return `404` on `:8443` / `:8088` and are reachable only on loopback (`127.0.0.1:8180`).
 - **OIDC Token Endpoint:** `POST /auth/realms/unieee/protocol/openid-connect/token` (`client_id=unieee-web`).
 - **Roles (`realm_access.roles`):**
   - `STUDENT`
@@ -308,7 +309,7 @@ Routed via Nginx `/api/v1/sse/*` (`proxy_buffering off`, `gzip off`, `X-Accel-Bu
 ## 5. Internal Operations & Health Probes (Container Network Only)
 
 > [!WARNING]
-> The endpoints below are **not exposed** on the public Reverse Proxy and are reachable only inside the internal Compose networks (`app`/`data`). When `INTERNAL_OPS_TOKEN` is configured, `/internal/*` endpoints require header `x-internal-ops-token`.
+> The endpoints below are **not exposed** on the public Reverse Proxy (edge requests to `/actuator/**`, `/metrics`, `/stub_status`, `/healthz`, `/readyz`, `/internal/**`, `/auth/admin/**`, and `/auth/realms/master/**` explicitly return `404`) and are reachable only inside internal Compose networks (`app`/`data`). Local operator UIs/APIs bind strictly to `127.0.0.1` (`Keycloak Admin: 8180`, `Prometheus: 9090`, `Grafana: 3000`). When `INTERNAL_OPS_TOKEN` is configured, `/internal/*` endpoints require header `x-internal-ops-token`.
 
 | Service (Port) | Method & Path | Purpose |
 | :--- | :--- | :--- |
