@@ -1,11 +1,14 @@
 package vn.edu.unieee.common.metrics;
 
 import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Duration;
 import java.util.List;
+import java.util.function.BooleanSupplier;
+import java.util.function.IntSupplier;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
@@ -159,6 +162,34 @@ public class UnieeeMetrics {
                 .register(registry)
                 .record(duration);
         }
+    }
+
+    public void recordRateLimit(String service, String bucket, String result) {
+        Counter.builder("unieee_rate_limit_requests_total")
+            .description("Application-level Token Bucket rate limit decisions")
+            .tag("service", sanitizeTag(service))
+            .tag("bucket", sanitizeTag(bucket))
+            .tag("result", sanitizeTag(result))
+            .register(registry)
+            .increment();
+    }
+
+    public void registerRateLimitGauges(
+        String service,
+        BooleanSupplier enabledSupplier,
+        IntSupplier activeBucketsSupplier
+    ) {
+        String safeService = sanitizeTag(service);
+        Gauge.builder("unieee_rate_limit_enabled", enabledSupplier, s -> s.getAsBoolean() ? 1.0 : 0.0)
+            .description("Whether application-level Token Bucket rate limiting is enabled (1=on, 0=off)")
+            .tag("service", safeService)
+            .strongReference(true)
+            .register(registry);
+        Gauge.builder("unieee_rate_limit_active_buckets", activeBucketsSupplier, s -> (double) s.getAsInt())
+            .description("Active in-memory Token Bucket entries")
+            .tag("service", safeService)
+            .strongReference(true)
+            .register(registry);
     }
 
     private static String sanitizeTag(String value) {

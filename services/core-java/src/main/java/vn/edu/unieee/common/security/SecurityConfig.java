@@ -4,6 +4,7 @@ import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpMethod;
@@ -14,8 +15,10 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.oauth2.server.resource.web.authentication.BearerTokenAuthenticationFilter;
 import org.springframework.security.web.AuthenticationEntryPoint;
 import org.springframework.security.web.SecurityFilterChain;
+import vn.edu.unieee.common.ratelimit.TokenBucketRateLimitFilter;
 
 @Configuration
 @EnableWebSecurity
@@ -23,9 +26,14 @@ import org.springframework.security.web.SecurityFilterChain;
 public class SecurityConfig {
 
     private final KeycloakJwtAuthenticationConverter jwtAuthenticationConverter;
+    private final ObjectProvider<TokenBucketRateLimitFilter> rateLimitFilterProvider;
 
-    public SecurityConfig(KeycloakJwtAuthenticationConverter jwtAuthenticationConverter) {
+    public SecurityConfig(
+        KeycloakJwtAuthenticationConverter jwtAuthenticationConverter,
+        ObjectProvider<TokenBucketRateLimitFilter> rateLimitFilterProvider
+    ) {
         this.jwtAuthenticationConverter = jwtAuthenticationConverter;
+        this.rateLimitFilterProvider = rateLimitFilterProvider;
     }
 
     @Bean
@@ -39,7 +47,7 @@ public class SecurityConfig {
                 request.getRequestURI()
             );
 
-        return http
+        http
             .csrf(AbstractHttpConfigurer::disable)
             .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
             .authorizeHttpRequests(auth -> auth
@@ -63,8 +71,14 @@ public class SecurityConfig {
                         request.getRequestURI()
                     )
                 )
-            )
-            .build();
+            );
+
+        TokenBucketRateLimitFilter rateLimitFilter = rateLimitFilterProvider.getIfAvailable();
+        if (rateLimitFilter != null) {
+            http.addFilterAfter(rateLimitFilter, BearerTokenAuthenticationFilter.class);
+        }
+
+        return http.build();
     }
 
     private static void writeProblemDetail(

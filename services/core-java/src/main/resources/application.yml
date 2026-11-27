@@ -144,3 +144,22 @@ unieee:
     max-options: ${AI_ADVISOR_MAX_OPTIONS:3}
     redis-seat-cache:
       enabled: ${AI_ADVISOR_REDIS_SEAT_CACHE_ENABLED:true}
+  rate-limit:
+    enabled: ${UNIEEE_RATE_LIMIT_ENABLED:true}
+    idle-ttl: ${UNIEEE_RATE_LIMIT_IDLE_TTL:10m}
+    sweep-interval: ${UNIEEE_RATE_LIMIT_SWEEP_INTERVAL:2m}
+    max-buckets: ${UNIEEE_RATE_LIMIT_MAX_BUCKETS:100000}
+    public-catalog:
+      capacity: ${UNIEEE_RATE_LIMIT_PUBLIC_CAPACITY:60}
+      refill-per-second: ${UNIEEE_RATE_LIMIT_PUBLIC_REFILL_PER_SEC:20.0}
+    general-api:
+      capacity: ${UNIEEE_RATE_LIMIT_GENERAL_CAPACITY:120}
+      refill-per-second: ${UNIEEE_RATE_LIMIT_GENERAL_REFILL_PER_SEC:40.0}
+    ai-advisor:
+      capacity: ${UNIEEE_RATE_LIMIT_AI_CAPACITY:6}
+      refill-per-second: ${UNIEEE_RATE_LIMIT_AI_REFILL_PER_SEC:0.2}
+    anti-bot:
+      enabled: ${UNIEEE_ANTI_BOT_ENABLED:false}
+      provider: ${UNIEEE_ANTI_BOT_PROVIDER:none}
+      turnstile-header: ${UNIEEE_ANTI_BOT_TURNSTILE_HEADER:X-Turnstile-Token}
+      pow-header: ${UNIEEE_ANTI_BOT_POW_HEADER:X-PoW-Solution}
