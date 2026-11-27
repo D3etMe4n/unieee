@@ -53,3 +53,5 @@ __pycache__/
 tests/e2e/results/
 tests/load/results/
 tests/load/.work/
+tests/load-rust/results/
+tests/load-rust/.work/
