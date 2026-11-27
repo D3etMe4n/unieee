@@ -151,7 +151,7 @@ Toàn bộ HTTP API đi qua **Reverse Proxy** (`https://localhost:8443` ở ch�
 | `POST` / `GET` | `/api/v1/admin/policies/terms/{termId}/export-snapshot`, `.../snapshot` | `ACADEMIC_ADMIN` | Biên dịch & lưu snapshot SHA-256 (đồng bộ lên Redis) hoặc đọc snapshot mới nhất. |
 | `GET` | `/api/v1/policies/terms/{termId}/active` | `STUDENT`, `LECTURER`, `ACADEMIC_ADMIN` | Xem bộ quy chế đang kích hoạt của học kỳ *(Redis Read-Through Cache fail-open `1h`, tự xóa cache khi update hoặc activate policy)*. |
 
-### Trợ lý AI Xếp lịch Read-Only (`ai_advisor`, Phase 10)
+### Trợ lý AI Xếp lịch Read-Only (`ai_advisor`)
 
 | Phương thức | Đường dẫn | Quyền truy cập | Mô tả |
 | :--- | :--- | :--- | :--- |
@@ -212,7 +212,7 @@ Toàn bộ HTTP API đi qua **Reverse Proxy** (`https://localhost:8443` ở ch�
 
 ---
 
-## 3. Hot Path — Rust Enrollment Engine (`enrollment-engine`, Phases 7 & 11)
+## 3. Hot Path — Rust Enrollment Engine (`enrollment-engine`)
 
 Các lệnh ghi & tra cứu status đi qua Nginx `/api/v1/enrollments/*` tới `$enrollment_primary` (rate limit `enroll_limit` + Active–Standby failover), còn 2 endpoint đọc nhanh từ RAM (`/seats` & `/me`) được Nginx tách sang `$enrollment_read_upstream` (`STANDBY` khi khỏe mạnh):
 
@@ -276,7 +276,7 @@ Các lệnh ghi & tra cứu status đi qua Nginx `/api/v1/enrollments/*` tới `
 
 ---
 
-## 4. Hot Path — Rust SSE Live-Update Gateway (`sse-gateway`, Phase 9)
+## 4. Hot Path — Rust SSE Live-Update Gateway (`sse-gateway`)
 
 Đi qua Nginx `/api/v1/sse/*` (`proxy_buffering off`, `gzip off`, `X-Accel-Buffering: no`, `Cache-Control: no-cache, no-transform`, kèm header `X-SSE-Connection-Id`):
 

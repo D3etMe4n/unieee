@@ -58,7 +58,7 @@ Useful lifecycle commands:
 ./scripts/unieee.sh down --volumes
 ```
 
-For full **registration-season lifecycle commands** (`prepare-registration`, `open-registration`, `close-registration`) and monitoring dashboards, see [Registration-Season Usage, Operations & Failover Guide](./operations-and-hotpath.md). For **Let's Encrypt** (`--tls-mode letsencrypt`) and **Cloudflare Tunnel** (`--tls-mode cloudflared`), see the [Root README](../../README.md). For running the **7-scenario E2E suite** (`./tests/e2e/run-e2e.sh`) and **k6 benchmarks** (`./tests/load/run-benchmarks.sh`), see [Implementation Roadmap & Testing](./roadmap-and-testing.md).
+For full **registration-season lifecycle commands** (`prepare-registration`, `open-registration`, `close-registration`) and monitoring dashboards, see [Registration-Season Usage, Operations & Failover Guide](./operations-and-hotpath.md). For **Let's Encrypt** (`--tls-mode letsencrypt`) and **Cloudflare Tunnel** (`--tls-mode cloudflared`), see the [Root README](../../README.md). For running the **7-scenario E2E suite** (`./tests/e2e/run-e2e.sh`) and **k6 benchmarks** (`./tests/load/run-benchmarks.sh`), see [Project Roadmap & Testing](./roadmap-and-testing.md).
 
 ---
 

@@ -151,7 +151,7 @@ All HTTP endpoints are served behind the **Reverse Proxy** (`https://localhost:8
 | `POST` / `GET` | `/api/v1/admin/policies/terms/{termId}/export-snapshot`, `.../snapshot` | `ACADEMIC_ADMIN` | Compile & persist SHA-256 snapshot (caches to Redis) or fetch latest snapshot. |
 | `GET` | `/api/v1/policies/terms/{termId}/active` | `STUDENT`, `LECTURER`, `ACADEMIC_ADMIN` | Read the currently active registration policy for a term *(fail-open Redis Read-Through Cache `1h`, invalidated on policy update or activate)*. |
 
-### Read-Only AI Schedule Advisor (`ai_advisor`, Phase 10)
+### Read-Only AI Schedule Advisor (`ai_advisor`)
 
 | Method | Path | Allowed Roles | Description |
 | :--- | :--- | :--- | :--- |
@@ -212,7 +212,7 @@ All HTTP endpoints are served behind the **Reverse Proxy** (`https://localhost:8
 
 ---
 
-## 3. Hot Path — Rust Enrollment Engine (`enrollment-engine`, Phases 7 & 11)
+## 3. Hot Path — Rust Enrollment Engine (`enrollment-engine`)
 
 Write & status requests route via Nginx `/api/v1/enrollments/*` to `$enrollment_primary` (`enroll_limit` rate limiting + Active–Standby automatic failover), while lock-free RAM reads (`/seats` & `/me`) split via `$enrollment_read_upstream` to `STANDBY` when healthy:
 
@@ -276,7 +276,7 @@ Write & status requests route via Nginx `/api/v1/enrollments/*` to `$enrollment_
 
 ---
 
-## 4. Hot Path — Rust SSE Live-Update Gateway (`sse-gateway`, Phase 9)
+## 4. Hot Path — Rust SSE Live-Update Gateway (`sse-gateway`)
 
 Routed via Nginx `/api/v1/sse/*` (`proxy_buffering off`, `gzip off`, `X-Accel-Buffering: no`, `Cache-Control: no-cache, no-transform`, plus response header `X-SSE-Connection-Id`):
 

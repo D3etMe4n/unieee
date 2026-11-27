@@ -58,7 +58,7 @@ Các lệnh vận hành thường dùng:
 ./scripts/unieee.sh down --volumes
 ```
 
-Để vận hành trọn vẹn **vòng đời mùa đăng ký** (`prepare-registration`, `open-registration`, `close-registration`) và dashboard giám sát, xem [Hướng dẫn Sử dụng, Vận hành Mùa Đăng ký & Failover](./operations-and-hotpath.md). Để cấu hình **Let's Encrypt** hoặc **Cloudflare Tunnel**, xem [README gốc](../../README.vi.md). Để chạy **bộ kiểm thử E2E 7 kịch bản** (`./tests/e2e/run-e2e.sh`) và **benchmark k6** (`./tests/load/run-benchmarks.sh`), xem [Lộ trình 12 Phases & Chiến lược Kiểm thử](./roadmap-and-testing.md).
+Để vận hành trọn vẹn **vòng đời mùa đăng ký** (`prepare-registration`, `open-registration`, `close-registration`) và dashboard giám sát, xem [Hướng dẫn Sử dụng, Vận hành Mùa Đăng ký & Failover](./operations-and-hotpath.md). Để cấu hình **Let's Encrypt** hoặc **Cloudflare Tunnel**, xem [README gốc](../../README.vi.md). Để chạy **bộ kiểm thử E2E 7 kịch bản** (`./tests/e2e/run-e2e.sh`) và **benchmark k6** (`./tests/load/run-benchmarks.sh`), xem [Lộ trình Dự án & Chiến lược Kiểm thử](./roadmap-and-testing.md).
 
 ---
 
