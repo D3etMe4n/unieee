@@ -80,6 +80,8 @@ class UnieeeMetricsTest {
         metrics.recordAdminOverride("add", "success");
         metrics.recordHotDeltaPublish("section_capacity", "success", Duration.ofMillis(12));
         metrics.recordAiAdvisorRequest("fallback", "no_provider", 2, Duration.ofMillis(25));
+        metrics.recordRateLimit("core-java", "general_api", "allowed");
+        metrics.registerRateLimitGauges("core-java", () -> true, () -> 3);
 
         assertThat(registry.get("unieee_read_cache_requests_total")
             .tag("cache", "active_policy").tag("outcome", "hit").counter().count()).isEqualTo(1.0);
@@ -103,6 +105,13 @@ class UnieeeMetricsTest {
         assertThat(registry.get("unieee_ai_advisor_filtered_options_total").counter().count()).isEqualTo(2.0);
         assertThat(registry.get("unieee_ai_advisor_request_duration_seconds")
             .tag("mode", "fallback").timer().count()).isEqualTo(1L);
+        assertThat(registry.get("unieee_rate_limit_requests_total")
+            .tag("service", "core-java").tag("bucket", "general_api").tag("result", "allowed")
+            .counter().count()).isEqualTo(1.0);
+        assertThat(registry.get("unieee_rate_limit_enabled")
+            .tag("service", "core-java").gauge().value()).isEqualTo(1.0);
+        assertThat(registry.get("unieee_rate_limit_active_buckets")
+            .tag("service", "core-java").gauge().value()).isEqualTo(3.0);
     }
 
     @Test

@@ -14,8 +14,9 @@ Trang này cung cấp cái nhìn tổng quan về các cột mốc của dự á
 | **Nền tảng Học vụ & Policy Engine** | Spring Boot 4.1.3 + Java 25 Virtual Threads Modular Monolith (`catalog`, `account`, `registration`), phân tách PostgreSQL schema-per-bounded-context (`V001`–`V005`), Redis Read-Through Cache fail-open, GPA trọng số tín chỉ, khảo sát nguyện vọng không giữ ghế, đợt mở cổng nhiều giai đoạn, Policy Engine 6 quy tắc cấu hình đa trường kèm SHA-256 snapshot và Single-Writer Gate Guard. | **Đã phát hành (`1.0.0`)** |
 | **Cụm Rust Hot Path & Cập nhật SSE** | `enrollment-engine` xử lý trong RAM (`#[repr(align(64))]`, Bitmask 20 tuần, xác thực JWKS cục bộ, phục hồi disk snapshot không truy vấn PG, Hot Delta Sync), `enrollment-writer` ghi lô `UNNEST` chia chunk không xung đột kèm Kafka `unieee.enrollment.outcomes` an toàn khi crash, và `sse-gateway` phát biến động sĩ số/kết quả thời gian thực. | **Đã phát hành (`1.0.0`)** |
 | **Trợ lý AI Read-Only & Giám sát** | Spring AI 2.0.3 `ai_advisor` (4 `@Tool` chỉ đọc, guardrails chống IDOR/prompt injection, kiểm chứng Bitmask xác định & fallback offline), Micrometer `/actuator/prometheus`, Rust `/metrics` và Prometheus + Grafana auto-provision dashboard. | **Đã phát hành (`1.0.0`)** |
-| **Kiểm thử E2E & Benchmark Chịu tải** | Kiểm soát coverage phân tầng JaCoCo & `cargo-llvm-cov` trên CI, bộ E2E & Regression 7 kịch bản tự động ([tests/e2e/](../../tests/e2e/run-e2e.sh)) và bộ benchmark chịu tải + diễn tập chaos failover bằng `k6` đa thiết bị ([tests/load/](../../tests/load/run-benchmarks.sh)). | **Đã phát hành (`1.0.0`)** |
-| **Định hướng Tương lai** | Giao diện web frontend riêng cho Sinh viên, Giảng viên và Phòng Đào tạo; cấu hình triển khai đa máy chủ / hạ tầng managed bên ngoài; kiểm toán bảo mật độc lập trước khi áp dụng vào production. | **Dự kiến** |
+| **Kiểm thử E2E & Benchmark Chịu tải** | Kiểm soát coverage phân tầng JaCoCo & `cargo-llvm-cov` trên CI, bộ E2E & Regression 7 kịch bản tự động ([tests/e2e/](../../tests/e2e/run-e2e.sh)) và bộ benchmark `k6` + diễn tập chaos failover ([tests/load/](../../tests/load/run-benchmarks.sh)) hỗ trợ cả `host-tls` biên lẫn HTTP nội bộ `unieee_app` (`--internal-http`). | **Đã phát hành (`1.1.0`)** |
+| **Fairness, Rate Limiting & Anti-Bot** | Token Bucket rate limiting theo danh tính ở từng service (`core-java`, `enrollment-engine`, `sse-gateway`), lỗi RFC 9457 `429`, overlay cô lập [compose.bench.yml](../../tests/load/compose.bench.yml) tự khôi phục khi thoát, và tài liệu song ngữ [Rate Limiting & Anti-Bot](./rate-limiting-and-anti-bot.md). | **Đã phát hành (`1.1.0`)** |
+| **Định hướng Tương lai** | Giao diện web frontend cho Sinh viên, Giảng viên và Phòng Đào tạo; triển khai thực tế Cloudflare Turnstile Gate Ticket & PoW ALTCHA thích ứng; cấu hình đa máy chủ / managed infra; và kiểm toán bảo mật độc lập. | **Dự kiến** |
 
 ---
 
@@ -50,17 +51,23 @@ Chạy tự động toàn stack bằng Python 3 stdlib ([e2e_suite.py](../../tes
 
 ### 3.2 Bộ Benchmark `k6` Đa thiết bị & Đa kịch bản ([tests/load/run-benchmarks.sh](../../tests/load/run-benchmarks.sh))
 
-Hỗ trợ các preset cấu hình (`BENCH_PROFILE=smoke|laptop|workstation|stress`), biến môi trường tùy biến (`VUS`, `DURATION`, `TARGET_RPS`, `HOT_SECTIONS`, `HOT_SECTION_CAP`, `STUDENT_COUNT`), chạy qua `k6` cài sẵn hoặc container `grafana/k6` (`--runner local|container`), overlay mở trần rate-limit cục bộ (`--bench-nginx`), đẩy metrics live sang Prometheus (`--prometheus-rw`), kiểm chứng bất biến `0|0|0` + Bitmask 20 tuần ([verify_invariants.py](../../tests/load/verify_invariants.py)) và tổng hợp báo cáo SLO ([collect_report.py](../../tests/load/collect_report.py)):
+Hỗ trợ các preset cấu hình (`BENCH_PROFILE=smoke|laptop|workstation|stress`), biến môi trường tùy biến (`VUS`, `DURATION`, `TARGET_RPS`, `HOT_SECTIONS`, `HOT_SECTION_CAP`, `STUDENT_COUNT`), chạy qua `k6` cài sẵn hoặc container `grafana/k6` (`--runner local|container`), hai chế độ mạng (`--network-mode host-tls|internal-http` hoặc viết tắt `--internal-http`), chọn vị trí chạy `sse_probe.py` (`--sse-mode auto|host|internal`), overlay cô lập tạm tắt rate limit ([compose.bench.yml](../../tests/load/compose.bench.yml) qua `--disable-rate-limit` / alias cũ `--bench-nginx` kèm tự khôi phục trong `EXIT`), đẩy metrics live sang Prometheus (`--prometheus-rw`), kiểm chứng bất biến `0|0|0` + Bitmask 20 tuần ([verify_invariants.py](../../tests/load/verify_invariants.py)) và tổng hợp báo cáo SLO ([collect_report.py](../../tests/load/collect_report.py)):
+
+- **`host-tls` (Mặc định):** Đẩy tải vào `https://127.0.0.1:${UNIEEE_HTTPS_PORT:-8443}` để đo thông lượng đi qua lớp TLS biên.
+- **`--internal-http` (`--network-mode internal-http`):** Gắn container `grafana/k6` và container `python:3.12-alpine` (`sse_probe.py`) trực tiếp vào mạng nội bộ `unieee_app`, trỏ `BASE_URL=http://reverse-proxy:8088` (không TLS) và đẩy remote-write trực tiếp tới `http://prometheus:9090/api/v1/write`, hoàn toàn không mở thêm port HTTP trần ra host.
 
 ```bash
 # Bật kèm stack giám sát loopback-only (Prometheus :9090 + Grafana :3000)
 ./scripts/unieee.sh up --monitoring
 
-# Chạy trọn bộ benchmark steady-state (Warm Read, Hot Read, Hot Write Contention, Mixed Peak-Hour + SSE probe)
-./tests/load/run-benchmarks.sh --profile laptop --scenario all --bench-nginx --close-after
+# Chạy benchmark qua TLS biên (tự động tắt & khôi phục rate limit ở Nginx và từng service)
+./tests/load/run-benchmarks.sh --profile laptop --scenario all --disable-rate-limit --close-after
+
+# Chạy benchmark HTTP nội bộ trong mạng container unieee_app (loại bỏ nút thắt TLS termination)
+./tests/load/run-benchmarks.sh --profile laptop --scenario all --internal-http --disable-rate-limit --close-after
 
 # Kịch bản diễn tập chaos: giết nóng Active Engine giữa lúc Mixed Peak-Hour đang tải cao
-./tests/load/run-benchmarks.sh --profile smoke --scenario 04 --chaos engine --bench-nginx --close-after
+./tests/load/run-benchmarks.sh --profile smoke --scenario 04 --chaos engine --disable-rate-limit --close-after
 ```
 
 **Kết quả Benchmark Tham khảo Bản `1.0.0` (Chạy Single-Host trên Laptop Cá nhân):**
@@ -88,7 +95,7 @@ Mọi Pull Request vào `dev` hoặc `main` đều phải vượt qua **3 job t�
    - Chặn tuyệt đối nếu phát hiện file secret (`.env`, `*.pem`, `*.key`, `*.crt`, `*.p12`) hoặc tệp chỉ lưu cục bộ lọt vào Git.
    - Kiểm tra syntax toàn bộ script shell (`bash -n` / `sh -n`), bao gồm `20-enrollment-healthcheck.sh`, `tests/e2e/run-e2e.sh` và `tests/load/run-benchmarks.sh` *(tuyệt đối không chạy `k6` trong CI)*.
    - Xác thực realm Keycloak (`registrationAllowed == false`, `accessTokenLifespan` in `1800..3600s`, đủ 3 role, flow `unieee-first-broker-login-link-only` và `UserProfileProvider` khai báo `student_id` & `lecturer_id` chỉ Admin sửa được), cấu hình Nginx (`:8089 /stub_status`, `catalog_cache`, `seats_cache`, `proxy_cache_lock on`, `$enrollment_read_upstream`), file dashboard JSON Grafana và `compose.hotpath.yml` (`unieee.enrollment.outcomes`).
-   - Xác thực toàn bộ tổ hợp Compose (`compose.base.yml`, `compose.hotpath.yml`, `compose.monitoring.yml` độc lập & kèm `--profile hot-path`, `compose.letsencrypt.yml`, `compose.cloudflared.yml` quick & named).
+   - Xác thực toàn bộ tổ hợp Compose (`compose.base.yml`, `compose.hotpath.yml`, `compose.monitoring.yml` độc lập & kèm `--profile hot-path`, `compose.letsencrypt.yml`, `compose.cloudflared.yml` quick & named, và `tests/load/compose.bench.yml`).
    - Kiểm tra toàn bộ liên kết tương đối trong `README.md` và `README.vi.md`.
 2. **Spring Boot 4.1.3 Core & Modulith:**
    - Chạy `./gradlew check --no-daemon` trên Java 25 với PostgreSQL Testcontainers thật, cưỡng chế `ModularityVerificationTest` và ngưỡng JaCoCo phân tầng.

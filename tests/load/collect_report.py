@@ -130,6 +130,8 @@ def main() -> int:
     parser.add_argument("--prom-url", default="http://127.0.0.1:9090")
     parser.add_argument("--runtime", default="podman")
     parser.add_argument("--chaos", default="none")
+    parser.add_argument("--network-mode", default="host-tls")
+    parser.add_argument("--rate-limit-disabled", default="false")
     args = parser.parse_args()
 
     res_dir = Path(args.results_dir)
@@ -166,6 +168,10 @@ def main() -> int:
         "writerPgCommitP95Ms": (prom_scalar(args.prom_url, "histogram_quantile(0.95, sum(rate(unieee_writer_pg_commit_duration_seconds_bucket[2m])) by (le))") or 0.0) * 1000.0,
         "sseBroadcastTotal": prom_scalar(args.prom_url, "sum(unieee_sse_seat_updates_broadcast_total)"),
         "sseSlowConsumerDrops": prom_scalar(args.prom_url, "sum(unieee_sse_slow_consumer_lagged_events_total)"),
+        "rateLimitRejectedTotal": prom_scalar(
+            args.prom_url,
+            'sum(unieee_rate_limit_requests_total{result="rejected"} or unieee_engine_rate_limit_total{result="rejected"} or unieee_sse_rate_limit_total{result="rejected"})',
+        ),
         "k6RemoteWriteSeriesCount": prom_scalar(args.prom_url, 'count({__name__=~"k6_.*"})'),
     }
 
@@ -175,6 +181,8 @@ def main() -> int:
         "runId": args.run_id,
         "generatedAt": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "profile": args.profile,
+        "networkMode": args.network_mode,
+        "rateLimitDisabled": str(args.rate_limit_disabled).lower() == "true",
         "chaos": chaos_info or {"mode": args.chaos},
         "scenarios": scenarios,
         "invariants": invariants,
@@ -190,7 +198,7 @@ def main() -> int:
     lines = [
         f"# unieee k6 Load Benchmark & SLO Report (`{args.run_id}`)",
         "",
-        f"- **Profile:** `{args.profile}` | **Chaos:** `{args.chaos}` | **Generated:** `{report['generatedAt']}`",
+        f"- **Profile:** `{args.profile}` | **Network Mode:** `{args.network_mode}` | **Rate Limit Disabled:** `{report['rateLimitDisabled']}` | **Chaos:** `{args.chaos}` | **Generated:** `{report['generatedAt']}`",
         "",
         "## 1. SLO & Invariant Verification",
         "",

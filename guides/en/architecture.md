@@ -2,7 +2,7 @@
 
 **Language:** **English** | [Tiếng Việt](../vi/architecture.md) | [Documentation Hub](../README.md)
 
-**unieee** combines a **Spring Boot 4.1.3 Modular Monolith** (Warm/Cold Path running 24/7, **`1.0.0`**) with a **Rust Hot Path** (**`1.0.0`**, toggled on cyclically during peak registration windows), unified around **PostgreSQL 17** as the single Source of Truth and **Redis 7.4 HA** strictly as a Read Cache & SSE Pub/Sub backbone.
+**unieee** combines a **Spring Boot 4.1.3 Modular Monolith** (Warm/Cold Path running 24/7, **`1.1.0`**) with a **Rust Hot Path** (**`1.1.0`**, toggled on cyclically during peak registration windows), unified around **PostgreSQL 17** as the single Source of Truth and **Redis 7.4 HA** strictly as a Read Cache & SSE Pub/Sub backbone.
 
 ---
 
@@ -95,7 +95,7 @@ Before opening registration, `PolicySnapshotExporter` compiles the active policy
 ### Shared Workspace Crates (`crates/`)
 - **`unieee-domain`:** Strongly typed domain IDs (`TermId`, `StudentId`, `CourseId`, `SectionId`, `EventId`, `WindowId`), `RuleErrorCode`, unified RFC 9457 `ProblemDetail`, and `ScheduleBitmask` (`[u128; 20]` — 20 weeks x 112 bits) supporting `O(1)` bitwise overlap and buffer-gap checks verified against an interval oracle via `proptest`.
 - **`unieee-events`:** Versioned JSON codecs (`EVENT_SCHEMA_VERSION_V1`) for Kafka messages (`EnrollmentCommandEvent`, `EnrollmentOutcomeEvent`, `EnrollmentDeltaEvent`, `DeadLetterEvent`) and Redis Pub/Sub payloads (`SeatTentativeEvent`, `SeatConfirmedEvent`, `RevertEvent`, `GateControlEvent`), plus canonical topic and key helpers.
-- **`unieee-cacheline`:** `#[repr(align(64))]` cache-line aligned `SectionSeatSlot` (compile-time & test verified `align_of::<SectionSeatSlot>() == 64` to prevent false sharing) and lock-free sharded student state (`ShardedMap`).
+- **`unieee-cacheline`:** `#[repr(align(64))]` cache-line aligned `SectionSeatSlot` (compile-time & test verified `align_of::<SectionSeatSlot>() == 64` to prevent false sharing), lock-free sharded student state (`ShardedMap`), and sharded `ShardedTokenBucket` rate limiters.
 
 ### Hot Path Dataflow, Kafka Outcomes Sync & Read/Write Split
 
@@ -120,7 +120,7 @@ flowchart LR
 ### Resilience, Read/Write Split & Crash-Safe Outcome Delivery
 - **Crash-Safe At-Least-Once Outcomes & Chunked `UNNEST` Writes (`enrollment-writer` -> Kafka):** `enrollment-writer` splits mixed same-student/course churn chronologically into contiguous conflict-free waves (`split_into_conflict_free_chunks`) so PostgreSQL `UNNEST` fast-batch stays high-throughput (falling back per chunk only on constraint/missing-section conflicts), pipelines `acks=all` `EnrollmentOutcomeEvent` (`CONFIRMED` / `REVERTED`) produces to `unieee.enrollment.outcomes` concurrently via `try_join_all`, and commits `unieee.enrollment.commands` offsets ONLY after both PostgreSQL and outcome produce succeed. On crash-recovery encountering a duplicate `event_id`, it reloads the persisted outcome from `registration.enrollment_events` and re-emits `EnrollmentOutcomeEvent`.
 - **Dynamic Nginx Read/Write Split & `1s` `seats_cache`:** `/api/v1/enrollments/seats` and `/api/v1/enrollments/me` route to `$enrollment_read_upstream` (`STANDBY` when healthy & `READY`), offloading read traffic from the write primary. On primary crash or while a recovered Standby is `SYNCING` (`/readyz = 503`), reads transparently route to the surviving `ACTIVE` node protected by a `1s` `seats_cache` (`proxy_cache_lock on`, bypassing cache when `Authorization` is empty). Once Standby completes Kafka replay, reads automatically split back while writes stay pinned with zero auto-failback.
-- **Non-Blocking Auth & Coalesced Pub/Sub:** `enrollment-engine` and `sse-gateway` verify Keycloak JWTs locally via singleflight JWKS refresh (`JWKS_REFRESH_INTERVAL_SECS=300`) + SHA-256 token cache (`JWT_CACHE_TTL_SECS=30`). `SeatTentativeEvent` and `SeatConfirmedEvent` always carry absolute `availableSeats` / `maxCapacity` so SSE clients self-heal if a Pub/Sub frame drops.
+- **Non-Blocking Auth, Per-Identity Rate Limiting & Coalesced Pub/Sub:** `enrollment-engine` and `sse-gateway` verify Keycloak JWTs locally via singleflight JWKS refresh (`JWKS_REFRESH_INTERVAL_SECS=300`) + SHA-256 token cache (`JWT_CACHE_TTL_SECS=30`), and enforce sharded `student_id`-keyed Token Bucket rate limits (`write`, `read`, `connect`, complemented by `core-java` `TokenBucketRateLimitFilter` for `public_catalog`, `general_api`, `ai_advisor`) to preserve fairness behind shared campus NAT IPs. See [Rate Limiting & Anti-Bot Architecture](./rate-limiting-and-anti-bot.md). `SeatTentativeEvent` and `SeatConfirmedEvent` always carry absolute `availableSeats` / `maxCapacity` so SSE clients self-heal if a Pub/Sub frame drops.
 - **Zero-PG Snapshot Recovery & RAM-First Revert Idempotency:** Engines persist atomic disk snapshots (`SNAPSHOT_DIR`, SHA-256 + `checkpoint_seq`) and recover via snapshot + Kafka replay (`commands` + `deltas` + `outcomes`) with zero PostgreSQL queries, handling out-of-order `commands`/`outcomes` partitions idempotently in RAM (`processed_event_ids` / `reverted_event_ids`).
 
 ---

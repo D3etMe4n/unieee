@@ -144,6 +144,8 @@ def main() -> int:
 
     lats = sorted(stats["latenciesMs"])
     summary = {
+        "transport": parsed.scheme,
+        "baseUrl": args.base_url,
         "clientsRequested": stats["clientsRequested"],
         "clientsConnected": stats["clientsConnected"],
         "connectionErrors": stats["connectionErrors"],

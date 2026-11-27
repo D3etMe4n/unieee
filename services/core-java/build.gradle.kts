@@ -6,7 +6,7 @@ plugins {
 }
 
 group = "vn.edu.unieee"
-version = "1.0.0"
+version = "1.1.0"
 
 java {
     toolchain {
@@ -93,6 +93,7 @@ val jacocoExclusions = listOf(
 
 val criticalCorePackages = listOf(
     "vn.edu.unieee.common.security",
+    "vn.edu.unieee.common.ratelimit",
     "vn.edu.unieee.*.internal.domain*",
     "vn.edu.unieee.registration.internal.service.policy*",
     "vn.edu.unieee.ai_advisor.internal.guardrail*",

@@ -17,7 +17,7 @@ use enrollment_writer::core::{
     WriterProcessorConfig, WriterReadiness, WriterRepository,
 };
 use rust_decimal::Decimal;
-use sse_gateway::core::{JitterPolicy, SseHub, SseHubConfig, SseReadiness};
+use sse_gateway::core::{JitterPolicy, SseHub, SseHubConfig, SseRateLimiter, SseReadiness};
 use sse_gateway::http::build_router;
 use sse_gateway::http::handlers::SseAppState;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -471,6 +471,7 @@ async fn end_to_end_register_confirm_drop_and_revert_reach_sse_clients() {
     let app = build_router(SseAppState {
         hub: Arc::clone(&hub),
         verifier,
+        rate_limiter: Arc::new(SseRateLimiter::default()),
         shutdown_rx,
     });
     let exp = now.timestamp() + 300;
@@ -905,6 +906,7 @@ async fn slow_consumer_lag_emits_resync_required_and_upstream_reconnect_notifies
     let app = build_router(SseAppState {
         hub: Arc::clone(&hub),
         verifier,
+        rate_limiter: Arc::new(SseRateLimiter::default()),
         shutdown_rx: sd_rx,
     });
     let tok = keypair.sign_jwt(
@@ -1019,6 +1021,7 @@ async fn jitter_policy_max_age_soft_close_and_heartbeat_work_cleanly() {
     let app = build_router(SseAppState {
         hub: Arc::clone(&hub),
         verifier,
+        rate_limiter: Arc::new(SseRateLimiter::default()),
         shutdown_rx: sd_rx,
     });
     let tok = keypair.sign_jwt(
